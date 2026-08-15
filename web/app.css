@@ -373,3 +373,11 @@ input:focus, textarea:focus { outline: 2px solid var(--accent-line); outline-off
   #new-btn, #logout-btn { padding: 6px 8px; font-size: 13px; }
   .search input { min-width: 0; }
 }
+
+/* cross-reference to another category, from a [[name]] in the source */
+.md a.xref {
+  font-family: var(--mono); font-size: .9em;
+  background: var(--accent-bg); border: 1px solid var(--accent-line);
+  border-radius: 5px; padding: 0 5px; text-decoration: none;
+}
+.md a.xref:hover { filter: brightness(1.06); text-decoration: underline; }

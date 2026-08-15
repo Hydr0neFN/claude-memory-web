@@ -52,6 +52,13 @@ window.MD = (function () {
       return '\u0000' + (codes.length - 1) + '\u0000';
     });
 
+    // [[category]] -> in-app link. The store is full of these as cross-references
+    // and they used to render as literal brackets. Only a valid category name is
+    // linked, so ordinary double brackets in prose are left alone.
+    out = out.replace(/\[\[([a-z][a-z0-9-]*)\]\]/g, function (m, cat) {
+      return '<a href="#/c/' + cat + '" class="xref">' + cat + '</a>';
+    });
+
     out = out.replace(/\[([^\]]*)\]\(([^)\s]+)\)/g, function (m, t, u) { return link(u, t || u); });
     out = out.replace(/(^|[\s(])((?:https?:\/\/)[^\s<>()\[\]]+)/g, function (m, pre, u) {
       return pre + link(u, u);
