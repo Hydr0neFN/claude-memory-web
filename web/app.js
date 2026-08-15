@@ -230,7 +230,10 @@
       var kids = visible ? nd.kids.filter(function (k) { return visible[k]; }) : nd.kids;
 
       html.push(
-        '<div class="catrow" style="padding-left:' + (nd.depth * 13) + 'px">' +
+        // indent is capped: nesting is unbounded by design (the tree is derived
+        // from names, not stored), but past a few levels the indent would eat
+        // the 272px sidebar and the name would wrap to nothing
+        '<div class="catrow" style="padding-left:' + (Math.min(nd.depth, 5) * 13) + 'px">' +
         (kids.length
           ? '<button class="caret" data-toggle="' + e(name) + '" title="' +
             (open ? 'Collapse' : 'Expand') + '">' + (open ? '▾' : '▸') + '</button>'
