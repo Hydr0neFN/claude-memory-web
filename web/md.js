@@ -1,0 +1,257 @@
+/* Minimal markdown renderer for the memory store.
+ *
+ * Deliberately not a general-purpose library. The store is machine-written in
+ * a narrow style, so a small renderer covers it, and writing it here buys two
+ * things a dependency would not:
+ *   - escape-by-default. Nothing in a memory file can ever become live HTML.
+ *   - `<!-- verified: DATE -->` renders as a staleness badge on the heading
+ *     above it instead of disappearing like a normal comment.
+ *
+ * Notably absent: `_underscore_` emphasis. The corpus is full of snake_case
+ * identifiers and mangling them would be worse than lacking a second italic.
+ */
+window.MD = (function () {
+  'use strict';
+
+  var VERIFIED = /^\s*<!--\s*verified:\s*(\d{4}-\d{2}-\d{2})\s*-->\s*$/;
+  var COMMENT = /^\s*<!--[\s\S]*?-->\s*$/;
+  var HEADING = /^(#{1,6})\s+(.*?)\s*#*\s*$/;
+  var BULLET = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/;
+  var FENCE = /^\s*(```|~~~)(.*)$/;
+  var HR = /^\s*(-{3,}|\*{3,}|_{3,})\s*$/;
+  var TABLE_SEP = /^\s*\|?[\s:|-]+\|[\s:|-]*$/;
+  var SAFE_URL = /^(https?:\/\/|mailto:|#|\/)/i;
+
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  function slug(s, n) {
+    var base = String(s).toLowerCase().replace(/[^\w一-鿿]+/g, '-').replace(/^-|-$/g, '');
+    return 'h-' + n + (base ? '-' + base.slice(0, 40) : '');
+  }
+
+  function link(url, text) {
+    // url is already escaped; unescape the ampersands only to test the scheme
+    var probe = url.replace(/&amp;/g, '&');
+    if (!SAFE_URL.test(probe)) return text;
+    var ext = /^https?:/i.test(probe) ? ' target="_blank" rel="noopener noreferrer"' : '';
+    return '<a href="' + url + '"' + ext + '>' + text + '</a>';
+  }
+
+  /* inline ---------------------------------------------------------------- */
+  function inline(src) {
+    var out = esc(src);
+
+    // pull code spans out first so nothing below rewrites their contents
+    var codes = [];
+    out = out.replace(/`([^`]+)`/g, function (_, c) {
+      codes.push(c);
+      return '\u0000' + (codes.length - 1) + '\u0000';
+    });
+
+    out = out.replace(/\[([^\]]*)\]\(([^)\s]+)\)/g, function (m, t, u) { return link(u, t || u); });
+    out = out.replace(/(^|[\s(])((?:https?:\/\/)[^\s<>()\[\]]+)/g, function (m, pre, u) {
+      return pre + link(u, u);
+    });
+    out = out.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    out = out.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+    out = out.replace(/~~([^~]+)~~/g, '<del>$1</del>');
+
+    return out.replace(/\u0000(\d+)\u0000/g, function (_, i) {
+      return '<code>' + codes[i] + '</code>';
+    });
+  }
+
+  /* section list (also used for the outline) ------------------------------ */
+  function sections(text) {
+    var lines = String(text).split('\n');
+    var out = [];
+    for (var i = 0; i < lines.length; i++) {
+      var m = /^##\s+(.*?)\s*$/.exec(lines[i]);
+      if (!m) continue;
+      var verified = null;
+      for (var j = i + 1; j < Math.min(i + 3, lines.length); j++) {
+        var v = VERIFIED.exec(lines[j]);
+        if (v) { verified = v[1]; break; }
+      }
+      out.push({ name: m[1], verified: verified, line: i + 1, id: slug(m[1], i + 1) });
+    }
+    return out;
+  }
+
+  function daysSince(iso) {
+    var t = Date.parse(iso + 'T00:00:00Z');
+    if (isNaN(t)) return null;
+    return Math.floor((Date.now() - t) / 86400000);
+  }
+
+  function badge(date, staleDays) {
+    var d = daysSince(date);
+    var cls = d !== null && d > staleDays ? 'pill stale' : 'pill';
+    return ' <span class="vbadge ' + cls + '">verified ' + esc(date) + '</span>';
+  }
+
+  /* blocks ---------------------------------------------------------------- */
+  function render(text, opts) {
+    opts = opts || {};
+    var staleDays = opts.staleDays || 90;
+    var lines = String(text).replace(/\u0000/g, '').replace(/\r\n?/g, '\n').split('\n');
+    var html = [];
+    var para = [];
+    var paraLine = 0;
+    var listStack = [];   // [{indent, tag}]
+    var lastHeading = -1; // index in html[] of the heading tag still open to a badge
+    var lastHeadingLine = -1;
+    var i;
+
+    function flushPara() {
+      if (!para.length) return;
+      html.push('<p data-line="' + paraLine + '">' + inline(para.join(' ')) + '</p>');
+      para = [];
+    }
+
+    function closeLists(toIndent) {
+      while (listStack.length && listStack[listStack.length - 1].indent >= toIndent) {
+        html.push('</li></' + listStack.pop().tag + '>');
+      }
+    }
+
+    function flushAll() { flushPara(); closeLists(0); }
+
+    for (i = 0; i < lines.length; i++) {
+      var raw = lines[i];
+      var line = raw.replace(/\s+$/, '');
+      var n = i + 1;
+      var m;
+
+      // fenced code
+      if ((m = FENCE.exec(line))) {
+        flushAll();
+        var fence = m[1];
+        var lang = (m[2] || '').trim().split(/\s+/)[0];
+        var buf = [];
+        for (i++; i < lines.length; i++) {
+          if (lines[i].trim().indexOf(fence) === 0) break;
+          buf.push(lines[i]);
+        }
+        html.push('<pre data-line="' + n + '"><code' +
+          (lang ? ' class="lang-' + esc(lang) + '"' : '') + '>' +
+          esc(buf.join('\n')) + '</code></pre>');
+        continue;
+      }
+
+      // verified marker attaches to the heading directly above it
+      if ((m = VERIFIED.exec(line))) {
+        if (lastHeading >= 0 && n - lastHeadingLine <= 2) {
+          html[lastHeading] = html[lastHeading].replace(/<\/h(\d)>$/, badge(m[1], staleDays) + '</h$1>');
+        }
+        continue;
+      }
+      if (COMMENT.test(line)) continue;
+
+      if (!line.trim()) { flushPara(); continue; }
+
+      // heading
+      if ((m = HEADING.exec(line))) {
+        flushAll();
+        var lvl = Math.min(m[1].length, 4);
+        html.push('<h' + lvl + ' id="' + slug(m[2], n) + '" data-line="' + n + '">' +
+          inline(m[2]) + '</h' + lvl + '>');
+        lastHeading = html.length - 1;
+        lastHeadingLine = n;
+        continue;
+      }
+
+      if (HR.test(line)) { flushAll(); html.push('<hr data-line="' + n + '">'); continue; }
+
+      // blockquote (consecutive '>' lines)
+      if (/^\s*>\s?/.test(line)) {
+        flushAll();
+        var quote = [];
+        for (; i < lines.length && /^\s*>\s?/.test(lines[i]); i++) {
+          quote.push(lines[i].replace(/^\s*>\s?/, ''));
+        }
+        i--;
+        html.push('<blockquote data-line="' + n + '">' + inline(quote.join(' ')) + '</blockquote>');
+        continue;
+      }
+
+      // table: a pipe row followed by a separator row
+      if (line.indexOf('|') === 0 && i + 1 < lines.length && TABLE_SEP.test(lines[i + 1])) {
+        flushAll();
+        var cells = function (row) {
+          return row.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map(function (c) {
+            return inline(c.trim());
+          });
+        };
+        var t = ['<table data-line="' + n + '"><thead><tr>'];
+        cells(line).forEach(function (c) { t.push('<th>' + c + '</th>'); });
+        t.push('</tr></thead><tbody>');
+        for (i += 2; i < lines.length && lines[i].trim().indexOf('|') === 0; i++) {
+          t.push('<tr>');
+          cells(lines[i]).forEach(function (c) { t.push('<td>' + c + '</td>'); });
+          t.push('</tr>');
+        }
+        i--;
+        t.push('</tbody></table>');
+        html.push(t.join(''));
+        continue;
+      }
+
+      // list item
+      if ((m = BULLET.exec(line))) {
+        flushPara();
+        var indent = m[1].replace(/\t/g, '  ').length;
+        var tag = /^\d/.test(m[2]) ? 'ol' : 'ul';
+        var top = listStack[listStack.length - 1];
+
+        // every item carries its own line: these lists run to dozens of entries
+        // between headings, and the editor/preview scroll sync interpolates
+        // between data-line anchors -- sparse anchors mean visible drift.
+        if (!top || indent > top.indent) {
+          listStack.push({ indent: indent, tag: tag });
+          html.push('<' + tag + ' data-line="' + n + '"><li data-line="' + n + '">');
+        } else {
+          while (listStack.length > 1 && listStack[listStack.length - 1].indent > indent) {
+            html.push('</li></' + listStack.pop().tag + '>');
+          }
+          html.push('</li><li data-line="' + n + '">');
+        }
+        html.push(inline(m[3]));
+        continue;
+      }
+
+      // indented continuation of the current list item
+      if (listStack.length && /^\s{2,}/.test(raw)) {
+        html.push(' ' + inline(line.trim()));
+        continue;
+      }
+
+      closeLists(0);
+      if (!para.length) paraLine = n;
+      para.push(line.trim());
+    }
+
+    flushAll();
+    var out = html.join('\n');
+    if (opts.highlight && opts.highlight.length) out = highlight(out, opts.highlight);
+    return out;
+  }
+
+  /* highlight search terms in already-rendered html, skipping tags --------- */
+  function highlight(html, terms) {
+    var safe = terms.filter(Boolean).map(function (t) {
+      return esc(t).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    });
+    if (!safe.length) return html;
+    var re = new RegExp('(' + safe.join('|') + ')', 'gi');
+    return html.replace(/>([^<]+)</g, function (m, text) {
+      return '>' + text.replace(re, '<mark>$1</mark>') + '<';
+    });
+  }
+
+  return { render: render, sections: sections, escape: esc, inline: inline, daysSince: daysSince };
+})();

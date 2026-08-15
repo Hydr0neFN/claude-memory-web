@@ -1,0 +1,111 @@
+/* Node harness: exercise md.js + diff.js against real memory content. */
+const fs = require('fs');
+const vm = require('vm');
+
+const ctx = { window: {}, console, Date, Math, RegExp, JSON, String, Array, Number, Uint32Array, setTimeout };
+ctx.globalThis = ctx;
+vm.createContext(ctx);
+for (const f of ['md.js', 'diff.js']) {
+  vm.runInContext(fs.readFileSync('C:/Users/Ruanyouyi/Rpi4/claude-memory-web/web/' + f, 'utf8'), ctx, f);
+}
+const FIX = __dirname + '/';
+const MD = ctx.window.MD, Diff = ctx.window.Diff;
+
+let pass = 0, fail = 0;
+function check(desc, cond, extra) {
+  if (cond) { pass++; console.log('PASS: ' + desc); }
+  else { fail++; console.log('FAIL: ' + desc + (extra ? '  -> ' + extra : '')); }
+}
+
+/* --- XSS / escaping ---------------------------------------------------- */
+const nasty = [
+  '# <script>alert(1)</script>',
+  '',
+  'text with <img src=x onerror=alert(2)> inline',
+  '',
+  '- [click](javascript:alert(3))',
+  '- [ok](https://example.com/a?b=1&c=2)',
+  '',
+  '`<b>code</b>` and **<i>bold</i>**',
+  '',
+  '> quote with <svg onload=alert(4)>',
+  '',
+  '| a | <b>b</b> |',
+  '| --- | --- |',
+  '| <x> | y |'
+].join('\n');
+const out = MD.render(nasty);
+check('no <script> survives', !/<script/i.test(out), out.match(/.{0,40}<script.{0,40}/i));
+// the payloads must survive only as inert escaped text, never as live tags
+check('<img> neutered', !/<img/i.test(out) && /&lt;img/.test(out), out.match(/.{0,30}img.{0,30}/i));
+check('<svg> neutered', !/<svg/i.test(out) && /&lt;svg/.test(out), out.match(/.{0,30}svg.{0,30}/i));
+check('no javascript: href', !/href="javascript:/i.test(out));
+check('safe https link kept', /href="https:\/\/example\.com\/a\?b=1&amp;c=2"/.test(out), out.match(/.{0,60}example.{0,60}/));
+check('code span content escaped', /<code>&lt;b&gt;code&lt;\/b&gt;<\/code>/.test(out), out.match(/.{0,60}code.{0,60}/));
+check('table rendered', /<table/.test(out) && /<td>&lt;x&gt;<\/td>/.test(out));
+
+/* --- code spans are not re-processed ----------------------------------- */
+const cs = MD.render('use `a **b** c` and `x*y*z` here');
+check('no bold inside code span', /<code>a \*\*b\*\* c<\/code>/.test(cs), cs);
+check('no em inside code span', /<code>x\*y\*z<\/code>/.test(cs), cs);
+check('placeholder sentinel gone', cs.indexOf('\u0000') === -1);
+
+/* --- snake_case must not become emphasis -------------------------------- */
+const snake = MD.render('call git_commit and check_write_auth now');
+check('snake_case untouched', /git_commit/.test(snake) && !/<em>/.test(snake), snake);
+
+/* --- verified badge ----------------------------------------------------- */
+const ver = MD.render('## Endpoint\n<!-- verified: 2026-07-27 -->\n\nbody\n\n## Old\n<!-- verified: 2020-01-01 -->\n\nx');
+check('fresh verified badge', /verified 2026-07-27<\/span><\/h2>/.test(ver), ver);
+check('stale verified badge marked', /pill stale">verified 2020-01-01/.test(ver), ver);
+check('other comments dropped', MD.render('<!-- hi -->\ntext').indexOf('hi') === -1);
+
+/* --- structure balance on documents -------------------------------------
+ * fixtures/ is the committed synthetic corpus. Real categories dropped beside
+ * this file are picked up too when present, but are gitignored -- the tests
+ * must never depend on personal notes being in the repository. */
+const CORPUS = fs.readdirSync(FIX + 'fixtures').filter(f => f.endsWith('.md')).map(f => FIX + 'fixtures/' + f)
+  .concat(fs.readdirSync(FIX).filter(f => f.endsWith('.md') && f !== 'README.md').map(f => FIX + f));
+
+for (const f of CORPUS) {
+  const src = fs.readFileSync(f, 'utf8');
+  const html = MD.render(src);
+  const name = f.split('/').pop();
+  const count = (s, re) => (s.match(re) || []).length;
+  check(name + ': renders non-empty', html.length > src.length / 2);
+  check(name + ': ul balanced', count(html, /<ul[ >]/g) === count(html, /<\/ul>/g),
+    count(html, /<ul[ >]/g) + ' vs ' + count(html, /<\/ul>/g));
+  check(name + ': ol balanced', count(html, /<ol[ >]/g) === count(html, /<\/ol>/g),
+    count(html, /<ol[ >]/g) + ' vs ' + count(html, /<\/ol>/g));
+  check(name + ': li balanced', count(html, /<li[ >]/g) === count(html, /<\/li>/g),
+    count(html, /<li[ >]/g) + ' vs ' + count(html, /<\/li>/g));
+  check(name + ': no raw < from source', !/<(?!\/?(h[1-6]|p|ul|ol|li|code|pre|em|strong|del|a|blockquote|hr|table|thead|tbody|tr|th|td|span|mark)[ >/])/.test(html),
+    (html.match(/<(?!\/?(h[1-6]|p|ul|ol|li|code|pre|em|strong|del|a|blockquote|hr|table|thead|tbody|tr|th|td|span|mark)[ >/])[^>]{0,40}/g) || []).slice(0, 3).join(' | '));
+  const secs = MD.sections(src);
+  const rawSecs = src.split('\n').filter(l => /^##\s+\S/.test(l)).length;
+  check(name + ': section count matches ' + rawSecs, secs.length === rawSecs, secs.length);
+  check(name + ': every section has an id in html', secs.every(s => html.indexOf('id="' + s.id + '"') >= 0));
+  check(name + ': data-line present', /data-line="\d+"/.test(html));
+}
+
+/* --- diff --------------------------------------------------------------- */
+const a = fs.readFileSync(CORPUS[0], 'utf8');
+const b = a.replace('## Endpoint', '## Endpoints').replace(/\n/, '\nEXTRA LINE\n');
+const d = Diff.render(a, b, 3);
+check('diff finds changes', d.stats.added > 0 && d.stats.removed > 0, JSON.stringify(d.stats));
+check('diff collapses context', /unchanged lines/.test(d.html));
+check('diff of identical is empty', Diff.render(a, a, 3).stats.added === 0 &&
+  /identical/.test(Diff.render(a, a, 3).html));
+const dl = Diff.diffLines('x\ny\nz', 'x\nQ\nz');
+check('diff line ops correct', JSON.stringify(dl) ===
+  JSON.stringify([{op:' ',text:'x'},{op:'-',text:'y'},{op:'+',text:'Q'},{op:' ',text:'z'}]), JSON.stringify(dl));
+check('diff escapes html', /&lt;script/.test(Diff.render('a', '<script>', 3).html));
+
+/* --- perf sanity -------------------------------------------------------- */
+const t0 = Date.now();
+for (let i = 0; i < 20; i++) MD.render(a);
+check('20 renders under 1s', Date.now() - t0 < 1000, (Date.now() - t0) + 'ms');
+
+console.log('----');
+console.log('PASS=' + pass + ' FAIL=' + fail);
+process.exit(fail ? 1 : 0);

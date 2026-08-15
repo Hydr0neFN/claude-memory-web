@@ -1,0 +1,9 @@
+# Real memory categories dropped here as extra render-test input. They are
+# personal notes, not test data -- fixtures/ holds the synthetic corpus the
+# tests actually ship with. Anything at the top level except README stays out.
+/*.md
+!/README.md
+
+__pycache__/
+*.pyc
+.DS_Store

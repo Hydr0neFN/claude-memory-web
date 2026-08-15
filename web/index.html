@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="robots" content="noindex, nofollow">
+<title>Memory</title>
+<link rel="stylesheet" href="/app.css?v=6">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='78' font-size='78'>🧠</text></svg>">
+</head>
+<body>
+
+<!-- login ---------------------------------------------------------------->
+<section id="login" class="login hidden">
+  <form id="login-form" class="login-card" autocomplete="off">
+    <h1>Memory</h1>
+    <p class="muted small">Paste the API token once. It is exchanged for a
+      session cookie that scripts on this page cannot read.</p>
+    <input id="login-token" type="password" placeholder="API token" autocomplete="off" spellcheck="false">
+    <button type="submit" class="btn primary">Sign in</button>
+    <p id="login-error" class="error small hidden"></p>
+  </form>
+</section>
+
+<!-- app ------------------------------------------------------------------>
+<div id="app" class="app hidden">
+
+  <header class="topbar">
+    <button id="menu-btn" class="btn icon" title="Categories" aria-label="Categories">☰</button>
+    <a class="brand" href="#/">🧠 <span>Memory</span></a>
+    <form id="search-form" class="search">
+      <input id="search-input" type="search" placeholder="Search all categories…" spellcheck="false">
+    </form>
+    <button id="new-btn" class="btn" title="New category">+ New</button>
+    <button id="logout-btn" class="btn ghost" title="Sign out">Sign out</button>
+  </header>
+
+  <div id="scrim" class="scrim hidden"></div>
+
+  <aside id="sidebar" class="sidebar">
+    <input id="filter" class="filter" type="search" placeholder="Filter categories…" spellcheck="false">
+    <nav id="catlist" class="catlist"></nav>
+    <div id="store-stats" class="store-stats small muted"></div>
+  </aside>
+
+  <main id="main" class="main"></main>
+</div>
+
+<div id="modal-root"></div>
+<div id="toast" class="toast hidden"></div>
+
+<script src="/md.js?v=6"></script>
+<script src="/diff.js?v=6"></script>
+<script src="/app.js?v=6"></script>
+</body>
+</html>
