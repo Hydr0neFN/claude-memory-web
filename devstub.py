@@ -10,8 +10,8 @@ import re
 import time
 import urllib.parse
 
-WEB = r"C:\Users\Ruanyouyi\Rpi4\claude-memory-web\web"
 FIX = os.path.dirname(os.path.abspath(__file__))
+WEB = os.path.join(FIX, "web")
 SECTION_RE = re.compile(r"^##\s+(.*?)\s*$")
 VERIFIED_RE = re.compile(r"<!--\s*verified:\s*(\d{4}-\d{2}-\d{2})\s*-->")
 

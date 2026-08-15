@@ -81,6 +81,12 @@ a { color: var(--accent-ink); }
 .btn.primary { background: var(--accent-ink); border-color: var(--accent-ink); color: #fff; }
 .btn.primary:hover { filter: brightness(1.08); }
 .btn.danger { color: var(--no-ink); border-color: var(--no-line); background: var(--no-bg); }
+/* the settled state of the Save button; disabled but deliberately not dimmed,
+   because it is showing you a fact rather than refusing a click */
+.btn.saved, .btn.saved:disabled {
+  background: var(--ok-bg); border-color: var(--ok-line); color: var(--ok-ink);
+  opacity: 1; cursor: default;
+}
 .btn.ghost { background: transparent; border-color: transparent; color: var(--ink-2); }
 .btn.ghost:hover { border-color: var(--line); }
 .btn.icon { padding: 6px 10px; display: none; }

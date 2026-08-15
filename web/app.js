@@ -671,10 +671,23 @@
     };
   }
 
+  /* The Save button doubles as the save indicator. A toast is gone in three
+   * seconds and cannot answer "did that actually go through?" a minute later;
+   * a button reading "Saved" until the next keystroke can. */
+  function setSaveState(saved) {
+    var b = $('save');
+    if (!b) return;
+    b.textContent = saved ? 'Saved ✓' : 'Save';
+    b.classList.toggle('saved', !!saved);
+    b.classList.toggle('primary', !saved);
+    b.disabled = !!saved;
+  }
+
   function setDirty(v) {
     state.dirty = v;
     var d = $('dirty');
     if (d) d.classList.toggle('hidden', !v);
+    if (v) setSaveState(false);          // edited again -> back to an armed Save
   }
 
   function viewEdit(cat) {
@@ -725,6 +738,7 @@
         state.etag = (res.headers.get('ETag') || '').replace(/"/g, '');
         state.body = text;
         setDirty(false);
+        setSaveState(true);
         dropDraft(isNew ? null : cat);
         toast('Saved');
         // Stay in the editor: Ctrl+S mid-edit must not throw away the caret,

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Memory API + web UI test suite. Run from /opt/claude-memory as root.
 #   ./test-web.sh                      -> test the local app on 127.0.0.1:8787
-#   ./test-web.sh https://memory...de  -> also assert the Secure cookie flag
+#   ./test-web.sh https://your.host   -> also assert the Secure cookie flag
 #
 # Restarts the service first so the in-memory login throttle starts empty,
 # which is what makes the run repeatable.

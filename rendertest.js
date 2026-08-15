@@ -6,7 +6,7 @@ const ctx = { window: {}, console, Date, Math, RegExp, JSON, String, Array, Numb
 ctx.globalThis = ctx;
 vm.createContext(ctx);
 for (const f of ['md.js', 'diff.js']) {
-  vm.runInContext(fs.readFileSync('C:/Users/Ruanyouyi/Rpi4/claude-memory-web/web/' + f, 'utf8'), ctx, f);
+  vm.runInContext(fs.readFileSync(__dirname + '/web/' + f, 'utf8'), ctx, f);
 }
 const FIX = __dirname + '/';
 const MD = ctx.window.MD, Diff = ctx.window.Diff;

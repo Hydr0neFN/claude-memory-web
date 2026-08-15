@@ -1,33 +1,69 @@
 # claude-memory-web
 
-Browser UI for the Claude Memory API, served by the same FastAPI app at
-`https://memory.hydr0negnetwork.de/`.
+Browser UI for a personal [Claude Memory API](#what-the-api-is) — a small
+FastAPI service that stores categorised Markdown notes so Claude sessions share
+long-term memory across machines. This repo adds a front end served by that same
+app at `/`, so there is no CORS, no second host and no build step.
 
-This directory is the source of truth for the code. The Pi has no git repo for
-it (only `data/` is versioned), so edit here and deploy up.
+Vanilla JS, no npm, no CDN, no dependencies. It runs off a Raspberry Pi 4.
+
+![no build step](https://img.shields.io/badge/build-none-informational)
+
+## What the API is
+
+The backend stores one Markdown file per category, guarded by a single bearer
+token, and git-commits every write so any edit is recoverable. Reads are
+`GET /memory/{category}`; writes need `If-Match` with the ETag you read, which
+is the git blob SHA of the body. `main.py` and `webauth.py` here are the whole
+server.
+
+## What the UI does
+
+- **Sidebar tree** — the store is flat (names match `^[a-z0-9-]+$`) but the
+  convention is `<parent>-<sub>`, so the hierarchy is recovered by longest-prefix
+  match: `infra-pc-tuning` nests under `infra-pc`, not `infra`. Collapse state
+  persists; filtering and navigation force ancestors open without overwriting it.
+- **Read view** — rendered Markdown with a section outline and staleness badges
+  driven by `<!-- verified: YYYY-MM-DD -->` markers.
+- **Editor** — live preview with scroll sync. A hidden mirror element measures
+  where each soft-wrapped source line actually sits, and both scroll extremes are
+  pinned, so the panes stay aligned even though rendered blocks and source lines
+  have different heights.
+- **Concurrency** — saves carry the ETag the document was loaded at. A `409`
+  opens a diff offering *load theirs*, *overwrite with mine*, or *keep editing*.
+  Nothing is ever silently clobbered.
+- **Drafts** — the text is mirrored to `localStorage` as you type, so a killed
+  tab does not lose it.
+- **History** — git revisions, per-revision view, diff against current, and
+  restore-as-a-forward-commit (never a rewrite).
+- **Search** across the whole corpus, with jump-to-line.
+
+## Auth
+
+Agents keep using the bearer token — unchanged. Browsers `POST /auth/login`
+once with the token and get an HttpOnly cookie signed with a key derived from
+the token itself, so rotating the token logs every browser out and there is no
+second secret to manage.
+
+Cookie-authorized writes must also send `X-Memory-Actor`; a cross-site request
+cannot set a custom header, and the cookie is `SameSite=strict` on top of that.
+The header doubles as the author in the git commit (`PUT infra via memory-web`).
+
+Login is throttled per client IP, and `/docs`, `/redoc` and `/openapi.json` are
+disabled — on a public hostname the schema was the only thing readable without
+auth.
 
 ## Files
 
 | Path | Deployed to | What |
 |---|---|---|
-| `main.py` | `/opt/claude-memory/main.py` | the API, plus `/auth/*` and the static mount |
-| `webauth.py` | `/opt/claude-memory/webauth.py` | HMAC cookie sessions + login throttle |
-| `web/` | `/opt/claude-memory/web/` | `index.html`, `app.css`, `app.js`, `md.js`, `diff.js` |
-| `test-web.sh` | `/opt/claude-memory/test-web.sh` | 31-check suite, run on the box |
+| `main.py` | `$APP_DIR/main.py` | the API, plus `/auth/*` and the static mount |
+| `webauth.py` | `$APP_DIR/webauth.py` | HMAC cookie sessions + login throttle |
+| `web/` | `$APP_DIR/web/` | `index.html`, `app.css`, `app.js`, `md.js`, `diff.js` |
+| `test-web.sh` | `$APP_DIR/test-web.sh` | 31-check suite, run on the box |
 | `devstub.py` | — | fake backend for local UI work, dev only |
-| `rendertest.js` | — | 36 checks over `md.js` / `diff.js`, dev only |
-| `protocol.md`, `projects-web.md` | — | real categories used as test fixtures |
-
-## Auth
-
-Agents keep using the bearer token (`memapi.py`, claude.ai) — unchanged.
-Browsers `POST /auth/login` once with the token and get an HttpOnly cookie
-signed with a key derived from the token itself, so rotating the token logs
-every browser out and there is no second secret to manage.
-
-Cookie-authorized writes must also send `X-Memory-Actor`; a cross-site request
-cannot set a custom header, and the cookie is `SameSite=strict` on top of that.
-The header doubles as the name in the git commit (`PUT infra via memory-web`).
+| `rendertest.js` | — | 28 checks over `md.js` / `diff.js`, dev only |
+| `fixtures/` | — | synthetic corpus the render tests run against |
 
 ## Develop
 
@@ -36,27 +72,51 @@ python devstub.py     # serves web/ on :8123 with a fake API, no token needed
 node rendertest.js    # markdown + diff checks
 ```
 
-The stub is also registered in `.claude/launch.json` as `memory-web-stub`.
+`devstub.py` fakes the whole API from in-memory fixtures, including a category
+whose writes always `409`, so the conflict UI can be exercised without a server.
+
+Real categories dropped at the top level are picked up as extra render-test
+input and are gitignored — they are personal notes, not test data.
 
 ## Deploy
 
+No packaging step; it is scp and a restart. Set these to your own values:
+
 ```bash
-scp main.py webauth.py test-web.sh root@192.168.1.10:/tmp/memweb/
-scp web/* root@192.168.1.10:/tmp/memweb/web/
-ssh root@192.168.1.10 'cd /opt/claude-memory && cp -a main.py main.py.bak-$(date +%F) && install -o claudemem -g claudemem -m 644 /tmp/memweb/main.py . && install -o claudemem -g claudemem -m 644 /tmp/memweb/web/* web/ && systemctl restart claude-memory && ./test-web.sh'
+PI_HOST=root@your-pi.local          # wherever the service runs
+APP_DIR=/opt/claude-memory          # its install directory
+SVC_USER=claudemem                  # the unprivileged user it runs as
+
+ssh $PI_HOST "mkdir -p /tmp/memweb/web"
+scp main.py webauth.py test-web.sh $PI_HOST:/tmp/memweb/
+scp web/* $PI_HOST:/tmp/memweb/web/
+ssh $PI_HOST "cd $APP_DIR \
+  && cp -a main.py main.py.bak-\$(date +%F) \
+  && install -o \$SVC_USER -g \$SVC_USER -m 644 /tmp/memweb/main.py . \
+  && install -o \$SVC_USER -g \$SVC_USER -m 644 /tmp/memweb/webauth.py . \
+  && install -o \$SVC_USER -g \$SVC_USER -m 644 /tmp/memweb/web/* web/ \
+  && systemctl restart claude-memory && ./test-web.sh"
 ```
 
 Rollback is `cp -a main.py.bak-<date> main.py && systemctl restart claude-memory`.
 Category writes are git-committed in `data/`, so a bad edit is recoverable via
 `/memory/{cat}/history` and `?rev=<sha>`.
 
+Bump the `?v=` query on the `<script>`/`<link>` tags in `index.html` when
+shipping JS or CSS, or browsers will keep serving the old copy.
+
 ## Notes
 
 - The static mount must stay the **last** statement in `main.py`. Starlette
   matches routes in declaration order; a mount at `/` added earlier would
   swallow `/memory/*`.
-- `md.js` is a deliberate subset renderer: it escapes everything first, has no
-  `_underscore_` emphasis (the corpus is full of `snake_case`), and turns
-  `<!-- verified: DATE -->` into a staleness badge.
+- `md.js` is a deliberate subset renderer, not a Markdown library: it escapes
+  everything first so no note can become live HTML, has no `_underscore_`
+  emphasis (the corpus is full of `snake_case` identifiers), and turns
+  `<!-- verified: DATE -->` into a staleness badge instead of dropping it.
 - `test-web.sh` restarts the service before running so the in-memory login
   throttle starts empty; the throttle test is last because it burns the window.
+
+## Licence
+
+MIT.
