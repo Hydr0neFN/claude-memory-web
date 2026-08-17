@@ -18,13 +18,20 @@
 
   var state = {
     index: [],
-    cat: null,
+    docs: [],
+    cat: null,     // active category name, when kind === 'c'
+    doc: null,     // active doc slug, when kind === 'd'
+    kind: null,    // 'c' | 'd' | null (home/search/new)
     body: '',
     etag: null,
     dirty: false,
     editing: false,
     suppressRoute: false
   };
+
+  // one basePath per namespace -- everything else (etag flow, editor,
+  // history, diff) is identical between the two, so this is the seam.
+  function basePath(kind) { return kind === 'd' ? '/docs/' : '/memory/'; }
 
   /* ---------------------------------------------------------------- utils */
 
@@ -94,8 +101,8 @@
     try { return JSON.parse(text).detail || ('HTTP ' + status); } catch (_) { return 'HTTP ' + status; }
   }
 
-  function getCategory(cat, rev) {
-    var url = '/memory/' + encodeURIComponent(cat) + (rev ? '?rev=' + encodeURIComponent(rev) : '');
+  function getItem(kind, name, rev) {
+    var url = basePath(kind) + encodeURIComponent(name) + (rev ? '?rev=' + encodeURIComponent(rev) : '');
     return api(url).then(function (res) {
       if (!res.ok) return res.text().then(function (t) { throw new Error(detail(t, res.status)); });
       return res.text().then(function (body) {
@@ -103,6 +110,9 @@
       });
     });
   }
+
+  function getCategory(cat, rev) { return getItem('c', cat, rev); }
+  function getDoc(slug, rev) { return getItem('d', slug, rev); }
 
   /* ----------------------------------------------------------------- auth */
 
@@ -115,7 +125,7 @@
   function showApp() {
     $('login').classList.add('hidden');
     $('app').classList.remove('hidden');
-    return loadIndex().then(route);
+    return refreshIndexes().then(route);
   }
 
   $('login-form').addEventListener('submit', function (ev) {
@@ -160,6 +170,25 @@
     }).catch(function (err) { toast(err.message, true); });
   }
 
+  function loadDocs() {
+    return apiJSON('/docs/index').then(function (idx) {
+      state.docs = idx;
+      renderSidebar();
+    }).catch(function (err) { toast(err.message, true); });
+  }
+
+  // wherever the category index is refreshed, the doc index is too -- the
+  // sidebar renders both groups from the same renderSidebar() call.
+  function refreshIndexes() { return Promise.all([loadIndex(), loadDocs()]); }
+
+  // buildTree keys off `.category`; docs carry `.doc` instead, so present
+  // them through the same shape rather than forking the tree algorithm.
+  function docsAsCategories(docs) {
+    return docs.map(function (d) {
+      return { category: d.doc, bytes: d.bytes, mtime: d.mtime, sections: d.sections, title: d.title };
+    });
+  }
+
   /* The store is flat -- names must match ^[a-z0-9-]+$ -- but the convention is
    * `<parent>-<sub>`, so the hierarchy is recoverable from the names alone.
    * Parent = the LONGEST existing category that is a prefix of this one, which
@@ -192,19 +221,16 @@
     try { localStorage.setItem('mem.collapsed', JSON.stringify(list)); } catch (_) { /* private mode */ }
   }
 
-  function renderSidebar() {
-    var filter = ($('filter').value || '').toLowerCase().trim();
-    var tree = buildTree(state.index);
+  // shared by both sidebar groups: which rows a caret toggle affects, ancestor
+  // force-open for the currently active row, and the filter's visible set.
+  // Collapse state is stored as "kind:name" so a category and a doc sharing a
+  // name don't share a collapsed/expanded flag too.
+  function treeOpenState(tree, kind, activeName, filter) {
     var collapsed = collapsedSet();
-
-    // ancestors of the open category are forced open, without editing the
-    // stored preference -- the user's collapse survives navigating into a sub
     var forced = {};
-    for (var p = state.cat && tree.node[state.cat] ? tree.node[state.cat].parent : null; p; p = tree.node[p].parent) {
+    for (var p = activeName && tree.node[activeName] ? tree.node[activeName].parent : null; p; p = tree.node[p].parent) {
       forced[p] = true;
     }
-
-    // filtering: keep matches plus every ancestor, and open everything shown
     var visible = null;
     if (filter) {
       visible = {};
@@ -214,20 +240,36 @@
         for (var a = tree.node[n].parent; a; a = tree.node[a].parent) visible[a] = true;
       });
     }
+    return {
+      visible: visible,
+      isOpen: function (n) { return !!filter || forced[n] || collapsed.indexOf(kind + ':' + n) < 0; }
+    };
+  }
 
-    function isOpen(n) {
-      return !!filter || forced[n] || collapsed.indexOf(n) < 0;
-    }
-
-    var html = [];
+  // Renders one sidebar group (categories or docs) into `html`. Categories
+  // carry a size bar and a section count; doc rows carry neither -- a doc has
+  // no soft cap and "## sections" don't summarize a handoff the way they
+  // summarize a fact category.
+  function renderTree(html, tree, kind, activeName, filter, withMeta) {
+    var st = treeOpenState(tree, kind, activeName, filter);
     function walk(name) {
-      if (visible && !visible[name]) return;
+      if (st.visible && !st.visible[name]) return;
       var nd = tree.node[name], c = nd.cat;
-      var pct = Math.min(100, Math.round(c.bytes / CAP_BYTES * 100));
-      var cls = c.bytes >= CAP_BYTES ? ' over' : c.bytes >= WARN_BYTES ? ' warn' : '';
       var shown = nd.parent ? name.slice(nd.parent.length + 1) : name;
-      var open = isOpen(name);
-      var kids = visible ? nd.kids.filter(function (k) { return visible[k]; }) : nd.kids;
+      var open = st.isOpen(name);
+      var kids = st.visible ? nd.kids.filter(function (k) { return st.visible[k]; }) : nd.kids;
+
+      var meta = '';
+      if (withMeta) {
+        var pct = Math.min(100, Math.round(c.bytes / CAP_BYTES * 100));
+        var cls = c.bytes >= CAP_BYTES ? ' over' : c.bytes >= WARN_BYTES ? ' warn' : '';
+        meta = '<div class="bar' + cls + '"><i style="width:' + pct + '%"></i></div>' +
+          '<div class="cat-meta"><span>' + fmtBytes(c.bytes) + ' · ' + c.sections.length + ' §</span>' +
+          '<span>' + fmtAgo(c.mtime) + '</span></div>';
+      } else {
+        meta = '<div class="cat-meta"><span>' + fmtBytes(c.bytes) + '</span>' +
+          '<span>' + fmtAgo(c.mtime) + '</span></div>';
+      }
 
       html.push(
         // indent is capped: nesting is unbounded by design (the tree is derived
@@ -235,20 +277,29 @@
         // the 272px sidebar and the name would wrap to nothing
         '<div class="catrow" style="padding-left:' + (Math.min(nd.depth, 5) * 13) + 'px">' +
         (kids.length
-          ? '<button class="caret" data-toggle="' + e(name) + '" title="' +
+          ? '<button class="caret" data-toggle="' + kind + ':' + e(name) + '" title="' +
             (open ? 'Collapse' : 'Expand') + '">' + (open ? '▾' : '▸') + '</button>'
           : '<span class="caret ghost">·</span>') +
-        '<a class="cat' + (name === state.cat ? ' active' : '') + '" href="#/c/' +
+        '<a class="cat' + (name === activeName ? ' active' : '') + '" href="#/' + kind + '/' +
         encodeURIComponent(name) + '" title="' + e(name) + '">' +
         '<div class="cat-name">' + e(shown) +
         (kids.length && !open ? ' <span class="pill sub">' + kids.length + '</span>' : '') + '</div>' +
-        '<div class="bar' + cls + '"><i style="width:' + pct + '%"></i></div>' +
-        '<div class="cat-meta"><span>' + fmtBytes(c.bytes) + ' · ' + c.sections.length + ' §</span>' +
-        '<span>' + fmtAgo(c.mtime) + '</span></div></a></div>'
+        meta + '</a></div>'
       );
       if (open) kids.forEach(walk);
     }
     tree.roots.forEach(walk);
+  }
+
+  function renderSidebar() {
+    var filter = ($('filter').value || '').toLowerCase().trim();
+    var tree = buildTree(state.index);
+    var docTree = buildTree(docsAsCategories(state.docs));
+
+    var html = [];
+    renderTree(html, tree, 'c', state.cat, filter, true);
+    html.push('<div class="group-head">Docs<a href="#/newdoc" title="New doc">+</a></div>');
+    renderTree(html, docTree, 'd', state.doc, filter, false);
 
     $('catlist').innerHTML = html.join('') ||
       '<p class="small muted" style="padding:8px">No match.</p>';
@@ -256,7 +307,8 @@
     var total = state.index.reduce(function (a, c) { return a + c.bytes; }, 0);
     var over = state.index.filter(function (c) { return c.bytes >= WARN_BYTES; }).length;
     $('store-stats').innerHTML = state.index.length + ' categories · ' + fmtBytes(total) +
-      (over ? ' · <span class="pill warn">' + over + ' near cap</span>' : '');
+      (over ? ' · <span class="pill warn">' + over + ' near cap</span>' : '') +
+      (state.docs.length ? ' · ' + state.docs.length + ' docs' : '');
   }
 
   $('catlist').addEventListener('click', function (ev) {
@@ -323,6 +375,8 @@
 
   function viewHome() {
     state.cat = null;
+    state.doc = null;
+    state.kind = null;
     renderSidebar();
     var total = state.index.reduce(function (a, c) { return a + c.bytes; }, 0);
     var big = state.index.slice().sort(function (a, b) { return b.bytes - a.bytes; }).slice(0, 5);
@@ -370,6 +424,7 @@
 
   function viewCategory(cat, line) {
     state.cat = cat;
+    state.kind = 'c';
     state.editing = false;
     renderSidebar();
     loading();
@@ -407,24 +462,72 @@
     });
   }
 
+  /* ------------------------------------------------------------ doc read view */
+
+  function viewDoc(slug, line) {
+    state.doc = slug;
+    state.kind = 'd';
+    state.editing = false;
+    renderSidebar();
+    loading();
+    getDoc(slug).then(function (r) {
+      state.body = r.body;
+      state.etag = r.etag;
+      var meta = state.docs.filter(function (d) { return d.doc === slug; })[0];
+      var size = meta ? meta.bytes : r.body.length;
+      var title = meta ? meta.title : slug;
+
+      main(
+        '<div class="vhead"><h1>' + e(title) +
+        (title !== slug ? ' <span class="muted small">' + e(slug) + '</span>' : '') + '</h1>' +
+        '<span class="spacer"></span><div class="actions">' +
+        '<button class="btn" data-act="edit">Edit</button>' +
+        '<a class="btn" href="#/d/' + encodeURIComponent(slug) + '/history">History</a>' +
+        '<button class="btn danger" data-act="delete">Delete</button>' +
+        '</div></div>' +
+        '<p class="vsub">' + fmtBytes(size) + ' · etag ' +
+        '<code>' + e(r.etag.slice(0, 8)) + '</code>' +
+        (meta ? ' · changed ' + fmtAgo(meta.mtime) : '') + '</p>' +
+        '<div class="reading"><article class="md">' +
+        MD.render(r.body, { staleDays: STALE_DAYS }) + '</article>' + outlineHTML(r.body) + '</div>'
+      );
+
+      $('main').querySelector('[data-act="edit"]').onclick = function () {
+        location.hash = '#/d/' + encodeURIComponent(slug) + '/edit';
+      };
+      $('main').querySelector('[data-act="delete"]').onclick = function () { askDelete(slug, 'd'); };
+
+      if (line) setTimeout(function () { scrollToLine(line); }, 30);
+    }).catch(function (err) {
+      main('<div class="banner bad">' + e(err.message) + '</div>');
+    });
+  }
+
   /* ------------------------------------------------------------ edit view */
 
   var TEMPLATE = '## Overview\n<!-- verified: DATE -->\n\n- \n';
+  var DOC_TEMPLATE = '# <slug>\n\n## Where things stand\n\n## Next step\n\n## Open questions\n';
 
-  function editorHTML(cat, body, isNew) {
-    return '<div class="vhead"><h1>' + (isNew ? 'New category' : e(cat)) +
+  function editorHTML(kind, cat, body, isNew) {
+    var label = kind === 'd' ? 'doc' : 'category';
+    return '<div class="vhead"><h1>' + (isNew ? 'New ' + label : e(cat)) +
       '<span class="dot hidden" id="dirty"> ●</span></h1>' +
       '<span class="spacer"></span><div class="actions">' +
       '<div class="seg" id="seg" role="tablist">' +
       '<button data-p="ed" class="on" role="tab">Edit</button>' +
       '<button data-p="pv" role="tab">Preview</button></div>' +
+      (kind === 'd'
+        ? '<input id="note" class="small" placeholder="note for this save (optional)" ' +
+          'maxlength="60" spellcheck="false" style="width:220px">'
+        : '') +
       '<button class="btn primary" id="save">Save</button>' +
       '<button class="btn" id="close">Close</button></div></div>' +
       (isNew
-        ? '<p class="vsub">Name must match <code>^[a-z0-9-]+$</code>. Sub-categories are named ' +
+        ? '<p class="vsub">Name must match <code>^[a-z0-9-]+$</code>. ' +
+          (kind === 'd' ? 'Related docs share a prefix, e.g. ' : 'Sub-categories are named ') +
           '<code>&lt;parent&gt;-&lt;sub&gt;</code>.</p>' +
-          '<p><input id="newname" placeholder="category-name" spellcheck="false" ' +
-          'aria-label="New category name" style="width:100%;max-width:340px"></p>'
+          '<p><input id="newname" placeholder="' + (kind === 'd' ? 'doc-name' : 'category-name') +
+          '" spellcheck="false" aria-label="New ' + label + ' name" style="width:100%;max-width:340px"></p>'
         : '<p class="vsub">Ctrl/Cmd+S saves and keeps you here. The save carries the etag this was ' +
           'loaded at, so a change made elsewhere in the meantime is caught, not overwritten. ' +
           'The two panes scroll together.</p>') +
@@ -579,20 +682,20 @@
    * background tabs without firing beforeunload, and a failed PUT over a flaky
    * link leaves nothing but a toast. So mirror the text into localStorage as it
    * is typed, and offer it back if it differs from what the server returns. */
-  function draftKey(cat) { return 'mem.draft.' + (cat || '__new__'); }
+  function draftKey(kind, cat) { return 'mem.draft.' + (kind === 'd' ? 'doc.' : '') + (cat || '__new__'); }
 
-  function saveDraft(cat, text) {
-    try { localStorage.setItem(draftKey(cat), JSON.stringify({ t: text, at: Date.now() })); }
+  function saveDraft(kind, cat, text) {
+    try { localStorage.setItem(draftKey(kind, cat), JSON.stringify({ t: text, at: Date.now() })); }
     catch (_) { /* quota or private mode: the net is a bonus, not a dependency */ }
   }
-  function readDraft(cat) {
-    try { return JSON.parse(localStorage.getItem(draftKey(cat)) || 'null'); } catch (_) { return null; }
+  function readDraft(kind, cat) {
+    try { return JSON.parse(localStorage.getItem(draftKey(kind, cat)) || 'null'); } catch (_) { return null; }
   }
-  function dropDraft(cat) {
-    try { localStorage.removeItem(draftKey(cat)); } catch (_) { /* nothing to clean */ }
+  function dropDraft(kind, cat) {
+    try { localStorage.removeItem(draftKey(kind, cat)); } catch (_) { /* nothing to clean */ }
   }
 
-  function wireEditor(cat, isNew) {
+  function wireEditor(kind, cat, isNew) {
     var ed = $('ed'), pv = $('pv'), timer;
 
     function preview() {
@@ -606,7 +709,7 @@
     ed.addEventListener('input', function () {
       setDirty(true);
       clearTimeout(timer);
-      timer = setTimeout(function () { preview(); saveDraft(cat, ed.value); }, 140);
+      timer = setTimeout(function () { preview(); saveDraft(kind, cat, ed.value); }, 140);
     });
 
     ed.addEventListener('keydown', function (ev) {
@@ -623,7 +726,7 @@
       }
       if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 's') {
         ev.preventDefault();
-        doSave(cat, isNew);
+        doSave(kind, cat, isNew);
       }
     });
 
@@ -637,20 +740,20 @@
       if (b.getAttribute('data-p') === 'pv') preview();
     });
 
-    $('save').onclick = function () { doSave(cat, isNew); };
+    $('save').onclick = function () { doSave(kind, cat, isNew); };
     $('close').onclick = function () {
       if (state.dirty && !confirm('Discard unsaved changes?')) return;
-      dropDraft(cat);
+      dropDraft(kind, cat);
       setDirty(false);
-      location.hash = isNew ? '#/' : '#/c/' + encodeURIComponent(cat);
+      location.hash = isNew ? '#/' : '#/' + kind + '/' + encodeURIComponent(cat);
     };
     setTimeout(function () { ed.focus(); }, 30);
   }
 
   /* Offer a recovered draft rather than silently overwriting either side. */
-  function offerDraft(cat, serverBody) {
-    var d = readDraft(cat);
-    if (!d || typeof d.t !== 'string' || d.t === serverBody) { dropDraft(cat); return; }
+  function offerDraft(kind, cat, serverBody) {
+    var d = readDraft(kind, cat);
+    if (!d || typeof d.t !== 'string' || d.t === serverBody) { dropDraft(kind, cat); return; }
 
     var bar = document.createElement('div');
     bar.className = 'banner warn';
@@ -669,7 +772,7 @@
       toast('Draft restored — not saved yet');
     };
     $('draft-drop').onclick = function () {
-      dropDraft(cat);
+      dropDraft(kind, cat);
       bar.parentNode.removeChild(bar);
     };
   }
@@ -695,16 +798,35 @@
 
   function viewEdit(cat) {
     state.cat = cat;
+    state.kind = 'c';
     state.editing = true;
     renderSidebar();
     loading();
     getCategory(cat).then(function (r) {
       state.body = r.body;
       state.etag = r.etag;
-      mainEdit(editorHTML(cat, r.body, false));
-      wireEditor(cat, false);
+      mainEdit(editorHTML('c', cat, r.body, false));
+      wireEditor('c', cat, false);
       setDirty(false);
-      offerDraft(cat, r.body);
+      offerDraft('c', cat, r.body);
+    }).catch(function (err) {
+      main('<div class="banner bad">' + e(err.message) + '</div>');
+    });
+  }
+
+  function viewDocEdit(slug) {
+    state.doc = slug;
+    state.kind = 'd';
+    state.editing = true;
+    renderSidebar();
+    loading();
+    getDoc(slug).then(function (r) {
+      state.body = r.body;
+      state.etag = r.etag;
+      mainEdit(editorHTML('d', slug, r.body, false));
+      wireEditor('d', slug, false);
+      setDirty(false);
+      offerDraft('d', slug, r.body);
     }).catch(function (err) {
       main('<div class="banner bad">' + e(err.message) + '</div>');
     });
@@ -712,17 +834,31 @@
 
   function viewNew() {
     state.cat = null;
+    state.kind = 'c';
     state.editing = true;
     state.etag = null;
     renderSidebar();
     var seed = TEMPLATE.replace('DATE', new Date().toISOString().slice(0, 10));
-    mainEdit(editorHTML('', seed, true));
-    wireEditor(null, true);
+    mainEdit(editorHTML('c', '', seed, true));
+    wireEditor('c', null, true);
     setDirty(false);
-    offerDraft(null, seed);
+    offerDraft('c', null, seed);
   }
 
-  function doSave(cat, isNew) {
+  function viewNewDoc() {
+    state.doc = null;
+    state.kind = 'd';
+    state.editing = true;
+    state.etag = null;
+    renderSidebar();
+    var seed = DOC_TEMPLATE;
+    mainEdit(editorHTML('d', '', seed, true));
+    wireEditor('d', null, true);
+    setDirty(false);
+    offerDraft('d', null, seed);
+  }
+
+  function doSave(kind, cat, isNew) {
     var text = $('ed').value;
     if (isNew) {
       cat = ($('newname').value || '').trim();
@@ -731,28 +867,33 @@
     var headers = { 'Content-Type': 'text/plain; charset=utf-8' };
     if (isNew) headers['If-None-Match'] = '*';
     else headers['If-Match'] = state.etag;
+    if (kind === 'd') {
+      var noteEl = $('note');
+      var noteVal = noteEl ? (noteEl.value || '').trim() : '';
+      if (noteVal) headers['X-Memory-Note'] = noteVal;
+    }
 
     $('save').disabled = true;
-    api('/memory/' + encodeURIComponent(cat), { method: 'PUT', headers: headers, body: text })
+    api(basePath(kind) + encodeURIComponent(cat), { method: 'PUT', headers: headers, body: text })
       .then(function (res) {
         $('save').disabled = false;
-        if (res.status === 409) return res.text().then(function () { showConflict(cat, text); });
+        if (res.status === 409) return res.text().then(function () { showConflict(kind, cat, text); });
         if (!res.ok) return res.text().then(function (t) { toast(detail(t, res.status), true); });
         state.etag = (res.headers.get('ETag') || '').replace(/"/g, '');
         state.body = text;
         setDirty(false);
         setSaveState(true);
-        dropDraft(isNew ? null : cat);
+        dropDraft(kind, isNew ? null : cat);
         toast('Saved');
         // Stay in the editor: Ctrl+S mid-edit must not throw away the caret,
         // the scroll position and the pane split. "Close" is how you leave.
-        return loadIndex().then(function () {
+        return refreshIndexes().then(function () {
           if (isNew) {
             state.suppressRoute = true;
-            location.hash = '#/c/' + encodeURIComponent(cat);
-            state.cat = cat;
-            mainEdit(editorHTML(cat, text, false));
-            wireEditor(cat, false);
+            location.hash = '#/' + kind + '/' + encodeURIComponent(cat);
+            if (kind === 'd') state.doc = cat; else state.cat = cat;
+            mainEdit(editorHTML(kind, cat, text, false));
+            wireEditor(kind, cat, false);
             setDirty(false);
           }
           renderSidebar();
@@ -763,8 +904,8 @@
 
   /* -------------------------------------------------------- conflict view */
 
-  function showConflict(cat, mine) {
-    getCategory(cat).then(function (theirs) {
+  function showConflict(kind, cat, mine) {
+    getItem(kind, cat).then(function (theirs) {
       var d = Diff.render(theirs.body, mine, 3);
       var m = modal(
         '<h3>Someone else changed <code>' + e(cat) + '</code></h3>' +
@@ -787,7 +928,7 @@
       };
       m.q('#c-force').onclick = function () {
         m.close();
-        api('/memory/' + encodeURIComponent(cat), {
+        api(basePath(kind) + encodeURIComponent(cat), {
           method: 'PUT',
           headers: { 'Content-Type': 'text/plain; charset=utf-8', 'If-Match': '*' },
           body: mine
@@ -796,7 +937,7 @@
           state.etag = (res.headers.get('ETag') || '').replace(/"/g, '');
           setDirty(false);
           toast('Overwritten. Their version is still in git history.');
-          return loadIndex();
+          return refreshIndexes();
         });
       };
     }).catch(function (err) { toast(err.message, true); });
@@ -804,9 +945,11 @@
 
   /* ---------------------------------------------------------- delete flow */
 
-  function askDelete(cat) {
+  function askDelete(cat, kind) {
+    kind = kind || 'c';
+    var label = kind === 'd' ? 'doc' : 'category';
     var m = modal(
-      '<h3>Delete <code>' + e(cat) + '</code>?</h3>' +
+      '<h3>Delete ' + label + ' <code>' + e(cat) + '</code>?</h3>' +
       '<p>The file is removed but the deletion is committed, so the content stays ' +
       'recoverable from history. Type the name to confirm.</p>' +
       '<input id="d-name" placeholder="' + e(cat) + '" spellcheck="false">' +
@@ -817,14 +960,14 @@
     input.addEventListener('input', function () { go.disabled = input.value.trim() !== cat; });
     m.q('#d-cancel').onclick = m.close;
     go.onclick = function () {
-      api('/memory/' + encodeURIComponent(cat), {
+      api(basePath(kind) + encodeURIComponent(cat), {
         method: 'DELETE',
         headers: { 'If-Match': state.etag }
       }).then(function (res) {
         m.close();
         if (!res.ok) return res.text().then(function (t) { toast(detail(t, res.status), true); });
         toast('Deleted ' + cat);
-        return loadIndex().then(function () { location.hash = '#/'; viewHome(); });
+        return refreshIndexes().then(function () { location.hash = '#/'; viewHome(); });
       }).catch(function (err) { toast(err.message, true); });
     };
     setTimeout(function () { input.focus(); }, 30);
@@ -832,20 +975,22 @@
 
   /* --------------------------------------------------------- history view */
 
-  function viewHistory(cat) {
-    state.cat = cat;
+  function viewHistory(kind, cat) {
+    if (kind === 'd') { state.doc = cat; } else { state.cat = cat; }
+    state.kind = kind;
     state.editing = false;
     renderSidebar();
     loading();
-    apiJSON('/memory/' + encodeURIComponent(cat) + '/history?limit=100').then(function (revs) {
+    var label = kind === 'd' ? 'doc' : 'category';
+    apiJSON(basePath(kind) + encodeURIComponent(cat) + '/history?limit=100').then(function (revs) {
       main(
         '<div class="vhead"><h1>' + e(cat) + ' <span class="muted">history</span></h1>' +
         '<span class="spacer"></span><div class="actions">' +
-        '<a class="btn" href="#/c/' + encodeURIComponent(cat) + '">Back to category</a></div></div>' +
+        '<a class="btn" href="#/' + kind + '/' + encodeURIComponent(cat) + '">Back to ' + label + '</a></div></div>' +
         '<p class="vsub">' + revs.length + ' revisions. The newest is the live file.</p>' +
         '<div class="revs">' + revs.map(function (r, i) {
           return '<div class="rev' + (i === 0 ? ' current' : '') + '">' +
-            '<a class="sha" href="#/c/' + encodeURIComponent(cat) + '/rev/' + e(r.sha) + '">' + e(r.short) + '</a>' +
+            '<a class="sha" href="#/' + kind + '/' + encodeURIComponent(cat) + '/rev/' + e(r.sha) + '">' + e(r.short) + '</a>' +
             '<span class="msg">' + e(r.message) + '</span>' +
             '<span class="when">' + fmtBytes(r.bytes) + '</span>' +
             '<span class="when" title="' + e(r.date) + '">' + fmtAgo(r.date) + '</span>' +
@@ -857,12 +1002,13 @@
     });
   }
 
-  function viewRev(cat, sha) {
-    state.cat = cat;
+  function viewRev(kind, cat, sha) {
+    if (kind === 'd') { state.doc = cat; } else { state.cat = cat; }
+    state.kind = kind;
     state.editing = false;
     renderSidebar();
     loading();
-    Promise.all([getCategory(cat, sha), getCategory(cat).catch(function () { return null; })])
+    Promise.all([getItem(kind, cat, sha), getItem(kind, cat).catch(function () { return null; })])
       .then(function (r) {
         var old = r[0], cur = r[1];
         var d = cur ? Diff.render(old.body, cur.body, 3) : null;
@@ -871,7 +1017,7 @@
           '<span class="spacer"></span><div class="actions">' +
           '<button class="btn" id="r-diff">Toggle diff</button>' +
           '<button class="btn" id="r-load">Load into editor</button>' +
-          '<a class="btn" href="#/c/' + encodeURIComponent(cat) + '/history">Back to history</a>' +
+          '<a class="btn" href="#/' + kind + '/' + encodeURIComponent(cat) + '/history">Back to history</a>' +
           '</div></div>' +
           '<div class="banner">Read-only snapshot from git.' +
           (d ? ' Against the live file: +' + d.stats.added + ' / −' + d.stats.removed + '.' : '') +
@@ -890,11 +1036,11 @@
           // etag, so saving commits a new revision instead of rewriting history.
           state.etag = cur ? cur.etag : null;
           state.editing = true;
-          mainEdit(editorHTML(cat, old.body, false));
-          wireEditor(cat, false);
+          mainEdit(editorHTML(kind, cat, old.body, false));
+          wireEditor(kind, cat, false);
           setDirty(true);
           state.suppressRoute = true;
-          location.hash = '#/c/' + encodeURIComponent(cat) + '/edit';
+          location.hash = '#/' + kind + '/' + encodeURIComponent(cat) + '/edit';
           toast('Loaded ' + sha.slice(0, 8) + ' into the editor — save to restore it');
         };
       }).catch(function (err) {
@@ -906,6 +1052,8 @@
 
   function viewSearch(q) {
     state.cat = null;
+    state.doc = null;
+    state.kind = null;
     state.editing = false;
     renderSidebar();
     $('search-input').value = q;
@@ -969,16 +1117,26 @@
     if (!parts.length) return viewHome();
 
     if (parts[0] === 'new') return viewNew();
+    if (parts[0] === 'newdoc') return viewNewDoc();
 
     if (parts[0] === 'search') return viewSearch(decodeURIComponent(parts.slice(1).join('/')));
 
     if (parts[0] === 'c' && parts[1]) {
       var cat = decodeURIComponent(parts[1]);
       if (parts[2] === 'edit') return viewEdit(cat);
-      if (parts[2] === 'history') return viewHistory(cat);
-      if (parts[2] === 'rev' && parts[3]) return viewRev(cat, parts[3]);
+      if (parts[2] === 'history') return viewHistory('c', cat);
+      if (parts[2] === 'rev' && parts[3]) return viewRev('c', cat, parts[3]);
       if (parts[2] === 'l' && parts[3]) return viewCategory(cat, parseInt(parts[3], 10));
       return viewCategory(cat);
+    }
+
+    if (parts[0] === 'd' && parts[1]) {
+      var slug = decodeURIComponent(parts[1]);
+      if (parts[2] === 'edit') return viewDocEdit(slug);
+      if (parts[2] === 'history') return viewHistory('d', slug);
+      if (parts[2] === 'rev' && parts[3]) return viewRev('d', slug, parts[3]);
+      if (parts[2] === 'l' && parts[3]) return viewDoc(slug, parseInt(parts[3], 10));
+      return viewDoc(slug);
     }
     return viewHome();
   }

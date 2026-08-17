@@ -54,6 +54,12 @@ check('placeholder sentinel gone', cs.indexOf('\u0000') === -1);
 const snake = MD.render('call git_commit and check_write_auth now');
 check('snake_case untouched', /git_commit/.test(snake) && !/<em>/.test(snake), snake);
 
+/* --- [[doc:slug]] cross-reference, and [[category]] still works --------- */
+const xrefs = MD.render('see [[doc:tourplan-handoff]] and [[protocol]] for details');
+check('[[doc:slug]] renders a doc link', /href="#\/d\/tourplan-handoff" class="xref">doc:tourplan-handoff<\/a>/.test(xrefs), xrefs);
+check('[[category]] still renders a category link', /href="#\/c\/protocol" class="xref">protocol<\/a>/.test(xrefs), xrefs);
+check('doc link uses #/d/, not #/c/', !/#\/c\/tourplan-handoff/.test(xrefs), xrefs);
+
 /* --- verified badge ----------------------------------------------------- */
 const ver = MD.render('## Endpoint\n<!-- verified: 2026-07-27 -->\n\nbody\n\n## Old\n<!-- verified: 2020-01-01 -->\n\nx');
 check('fresh verified badge', /verified 2026-07-27<\/span><\/h2>/.test(ver), ver);

@@ -52,6 +52,14 @@ window.MD = (function () {
       return '\u0000' + (codes.length - 1) + '\u0000';
     });
 
+    // [[doc:slug]] -> in-app link to a working document. Checked first so
+    // 'doc:' is consumed here rather than falling through to the plain
+    // [[category]] rule below (which would otherwise treat 'doc' as a scheme
+    // prefix baked into an invalid category name and leave it unlinked).
+    out = out.replace(/\[\[doc:([a-z][a-z0-9-]*)\]\]/g, function (m, slug) {
+      return '<a href="#/d/' + slug + '" class="xref">doc:' + slug + '</a>';
+    });
+
     // [[category]] -> in-app link. The store is full of these as cross-references
     // and they used to render as literal brackets. Only a valid category name is
     // linked, so ordinary double brackets in prose are left alone.

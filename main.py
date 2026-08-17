@@ -17,16 +17,23 @@ load_dotenv()
 
 TOKEN = os.environ["CLAUDE_MEMORY_TOKEN"]
 DATA_DIR = Path(__file__).parent / "data"
+DOCS_DIR = DATA_DIR / "docs"
 WEB_DIR = Path(__file__).parent / "web"
 CATEGORY_RE = re.compile(r"^[a-z0-9-]+$")
 REV_RE = re.compile(r"^[0-9a-f]{4,40}$")
 SECTION_RE = re.compile(r"^##\s+(.*?)\s*$")
+TITLE_RE = re.compile(r"^#(?!#)\s+(.*?)\s*$")
 VERIFIED_RE = re.compile(r"<!--\s*verified:\s*(\d{4}-\d{2}-\d{2})\s*-->")
 ACTOR_RE = re.compile(r"^[\w./ -]{1,40}$")
+NOTE_CTRL_RE = re.compile(r"[\x00-\x1f]")
 
 SEARCH_LIMIT_DEFAULT = 20
 SEARCH_LIMIT_MAX = 100
 SNIPPET_CHARS = 240
+NOTE_MAX = 60
+SEARCH_SCOPES = ("memory", "docs", "all")
+
+DOCS_DIR.mkdir(parents=True, exist_ok=True)
 
 # No /docs, /redoc or /openapi.json: this app is on a public hostname and the
 # schema is the one thing here that needs no auth to be interesting.
@@ -75,6 +82,12 @@ def validate_category(category: str) -> Path:
     if not CATEGORY_RE.match(category):
         raise HTTPException(status_code=400, detail="invalid category name")
     return DATA_DIR / f"{category}.md"
+
+
+def validate_doc(slug: str) -> Path:
+    if not CATEGORY_RE.match(slug):
+        raise HTTPException(status_code=400, detail="invalid doc slug")
+    return DOCS_DIR / f"{slug}.md"
 
 
 # --------------------------------------------------------------------------
@@ -181,6 +194,24 @@ def actor(request: Request) -> str:
     if ACTOR_RE.match(named):
         return named
     return (request.headers.get("user-agent") or "unknown")[:80]
+
+
+def note(request: Request) -> str:
+    """Short caption for a commit, from X-Memory-Note. Empty if none sent.
+
+    Stripped of control characters and collapsed whitespace, then truncated --
+    it only ever becomes git commit text, never anything structural.
+    """
+    raw = NOTE_CTRL_RE.sub("", request.headers.get("x-memory-note") or "")
+    return " ".join(raw.split())[:NOTE_MAX]
+
+
+def commit_subject(verb: str, target: str, request: Request) -> str:
+    subject = "%s %s via %s" % (verb, target, actor(request))
+    n = note(request)
+    if n:
+        subject += " — %s" % n
+    return subject
 
 
 # --------------------------------------------------------------------------
@@ -311,41 +342,61 @@ def index(request: Request):
 
 
 @app.get("/memory/search")
-def search(request: Request, q: str = "", limit: int = SEARCH_LIMIT_DEFAULT, full: int = 0):
-    """AND-match over space-separated terms, case-insensitive, whole corpus."""
+def search(
+    request: Request,
+    q: str = "",
+    limit: int = SEARCH_LIMIT_DEFAULT,
+    full: int = 0,
+    scope: str = "memory",
+):
+    """AND-match over space-separated terms, case-insensitive.
+
+    scope=memory (default) searches only /memory, byte-identical to the
+    response shape from before docs existed -- no 'kind' key, no doc hits.
+    scope=docs searches only /docs; scope=all searches both, memory first.
+    """
     check_auth(request)
+    if scope not in SEARCH_SCOPES:
+        raise HTTPException(status_code=400, detail="invalid scope")
     terms = [t.lower() for t in q.split() if t]
     if not terms:
         raise HTTPException(status_code=400, detail="q is required")
     limit = max(1, min(limit, SEARCH_LIMIT_MAX))
 
     hits = []
-    for path in sorted(DATA_DIR.glob("*.md")):
-        lines = path.read_text(encoding="utf-8").splitlines()
-        for i, line in enumerate(lines):
-            low = line.lower()
-            if not all(t in low for t in terms):
-                continue
-            hit = {
-                "category": path.stem,
-                "section": section_at(lines, i),
-                "line": i + 1,
-            }
-            if full:
-                hit["body"] = section_body(lines, i)
-            else:
-                hit["snippet"] = line.strip()[:SNIPPET_CHARS]
-            hits.append(hit)
-            if len(hits) >= limit:
-                return JSONResponse(hits)
+
+    def scan(paths, kind):
+        for path in paths:
+            lines = path.read_text(encoding="utf-8").splitlines()
+            for i, line in enumerate(lines):
+                low = line.lower()
+                if not all(t in low for t in terms):
+                    continue
+                if kind == "memory":
+                    hit = {"category": path.stem, "section": section_at(lines, i), "line": i + 1}
+                else:
+                    hit = {"doc": path.stem, "section": section_at(lines, i), "line": i + 1}
+                if scope != "memory":
+                    hit["kind"] = kind
+                if full:
+                    hit["body"] = section_body(lines, i)
+                else:
+                    hit["snippet"] = line.strip()[:SNIPPET_CHARS]
+                hits.append(hit)
+                if len(hits) >= limit:
+                    return True
+        return False
+
+    if scope in ("memory", "all"):
+        if scan(sorted(DATA_DIR.glob("*.md")), "memory"):
+            return JSONResponse(hits)
+    if scope in ("docs", "all"):
+        if scan(sorted(DOCS_DIR.glob("*.md")), "doc"):
+            return JSONResponse(hits)
     return JSONResponse(hits)
 
 
-@app.get("/memory/{category}/history")
-def history(category: str, request: Request, limit: int = 50):
-    check_auth(request)
-    path = validate_category(category)
-    rel = path.name
+def history_of(rel: str, path: Path, limit: int) -> list:
     try:
         log = git(
             "log",
@@ -372,7 +423,14 @@ def history(category: str, request: Request, limit: int = 50):
         )
     if not out and not path.exists():
         raise HTTPException(status_code=404, detail="not found")
-    return JSONResponse(out)
+    return out
+
+
+@app.get("/memory/{category}/history")
+def history(category: str, request: Request, limit: int = 50):
+    check_auth(request)
+    path = validate_category(category)
+    return JSONResponse(history_of(path.name, path, limit))
 
 
 @app.get("/memory/{category}")
@@ -407,7 +465,7 @@ async def put_category(category: str, request: Request):
     body = await request.body()
     existed = path.exists()
     path.write_text(body.decode("utf-8"), encoding="utf-8")
-    git_commit("%s %s via %s" % ("PUT" if existed else "CREATE", category, actor(request)))
+    git_commit(commit_subject("PUT" if existed else "CREATE", category, request))
 
     return PlainTextResponse("OK", headers={"ETag": '"%s"' % blob_sha(body)})
 
@@ -421,7 +479,107 @@ def delete_category(category: str, request: Request):
     require_precondition(path, request)
 
     path.unlink()
-    git_commit("DELETE %s via %s" % (category, actor(request)))
+    git_commit(commit_subject("DELETE", category, request))
+    return PlainTextResponse("OK")
+
+
+# --------------------------------------------------------------------------
+# /docs — working documents (handoffs, specs): same primitives as /memory
+# (blob_sha / require_precondition / git_commit / actor), a separate
+# directory so every /memory endpoint's non-recursive glob stays blind to it.
+# Declared above the static mount; /docs/index MUST precede /docs/{slug}, or
+# "index" is parsed as a slug.
+# --------------------------------------------------------------------------
+
+
+@app.get("/docs")
+def list_docs(request: Request):
+    check_auth(request)
+    return JSONResponse(sorted(p.stem for p in DOCS_DIR.glob("*.md")))
+
+
+@app.get("/docs/index")
+def doc_index(request: Request):
+    check_auth(request)
+    out = []
+    for path in sorted(DOCS_DIR.glob("*.md")):
+        text = path.read_text(encoding="utf-8")
+        stat = path.stat()
+        title = path.stem
+        for line in text.splitlines():
+            m = TITLE_RE.match(line)
+            if m:
+                title = m.group(1)
+                break
+        out.append(
+            {
+                "doc": path.stem,
+                "bytes": stat.st_size,
+                "mtime": datetime.fromtimestamp(stat.st_mtime, timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "etag": blob_sha(text.encode("utf-8")),
+                "title": title,
+                "sections": sections_of(text),
+            }
+        )
+    return JSONResponse(out)
+
+
+@app.get("/docs/{slug}/history")
+def doc_history(slug: str, request: Request, limit: int = 50):
+    check_auth(request)
+    path = validate_doc(slug)
+    return JSONResponse(history_of("docs/%s.md" % slug, path, limit))
+
+
+@app.get("/docs/{slug}")
+def get_doc(slug: str, request: Request, rev: str = ""):
+    check_auth(request)
+    path = validate_doc(slug)
+
+    if rev:
+        if not REV_RE.match(rev):
+            raise HTTPException(status_code=400, detail="invalid rev")
+        show = git("show", "%s:docs/%s.md" % (rev, slug), check=False)
+        if show.returncode != 0:
+            raise HTTPException(status_code=404, detail="rev or path not found")
+        return PlainTextResponse(
+            show.stdout,
+            headers={"ETag": '"%s"' % blob_sha(show.stdout.encode("utf-8")),
+                     "X-Memory-Rev": rev},
+        )
+
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="not found")
+    body = path.read_text(encoding="utf-8")
+    return PlainTextResponse(body, headers={"ETag": '"%s"' % blob_sha(body.encode("utf-8"))})
+
+
+@app.put("/docs/{slug}")
+async def put_doc(slug: str, request: Request):
+    check_write_auth(request)
+    path = validate_doc(slug)
+    require_precondition(path, request)
+
+    body = await request.body()
+    existed = path.exists()
+    path.write_text(body.decode("utf-8"), encoding="utf-8")
+    git_commit(commit_subject("PUT" if existed else "CREATE", "doc %s" % slug, request))
+
+    return PlainTextResponse("OK", headers={"ETag": '"%s"' % blob_sha(body)})
+
+
+@app.delete("/docs/{slug}")
+def delete_doc(slug: str, request: Request):
+    check_write_auth(request)
+    path = validate_doc(slug)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="not found")
+    require_precondition(path, request)
+
+    path.unlink()
+    git_commit(commit_subject("DELETE", "doc %s" % slug, request))
     return PlainTextResponse("OK")
 
 

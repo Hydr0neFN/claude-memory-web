@@ -13,6 +13,7 @@ import urllib.parse
 FIX = os.path.dirname(os.path.abspath(__file__))
 WEB = os.path.join(FIX, "web")
 SECTION_RE = re.compile(r"^##\s+(.*?)\s*$")
+TITLE_RE = re.compile(r"^#(?!#)\s+(.*?)\s*$")
 VERIFIED_RE = re.compile(r"<!--\s*verified:\s*(\d{4}-\d{2}-\d{2})\s*-->")
 
 # category -> markdown, seeded from the real fixtures
@@ -48,6 +49,24 @@ HISTORY = [
      "message": "PUT protocol via memory-web"},
     {"sha": "b" * 40, "short": "bbbbbbbb", "date": "2026-08-01T18:30:00+02:00", "bytes": 8100,
      "message": "PUT protocol via claude-code-memapi/2.0"},
+]
+
+# slug -> markdown. Two share a prefix (so the sidebar tree groups them under
+# a synthetic parent the way infra-pc-tuning groups under infra-pc), plus one
+# standalone doc.
+DOCS = {
+    "tourplan-handoff": "# tourplan handoff\n\n## Where things stand\n\n- deployed to the shared Pi\n"
+                         "- [[tourplan]] has the fact-level notes\n\n## Next step\n\n- wire up SSE\n\n"
+                         "## Open questions\n\n- none\n",
+    "tourplan-spec": "# tourplan spec\n\n## Scope\n\n- scheduling webapp, see [[doc:tourplan-handoff]]\n",
+    "kk-sr6-live-shim-notes": "# KK SR6 live shim notes\n\n## Where things stand\n\n- shim runs\n"
+                              "\n## Next step\n\n- test axis mapping\n",
+}
+DOC_HISTORY = [
+    {"sha": "c" * 40, "short": "cccccccc", "date": "2026-08-16T21:10:00+02:00", "bytes": 400,
+     "message": "PUT doc tourplan-handoff via claude-code — wired SSE"},
+    {"sha": "d" * 40, "short": "dddddddd", "date": "2026-08-15T10:00:00+02:00", "bytes": 340,
+     "message": "CREATE doc tourplan-handoff via claude-code"},
 ]
 
 
@@ -151,6 +170,39 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 return self._json({"detail": "not found"}, 404)
             return self._text(STORE[cat], headers={"ETag": '"%s"' % blob_sha(STORE[cat])})
 
+        if p == "/docs":
+            return self._json(sorted(DOCS))
+
+        if p == "/docs/index":
+            out = []
+            for slug, text in sorted(DOCS.items()):
+                title = slug
+                for line in text.splitlines():
+                    m2 = TITLE_RE.match(line)
+                    if m2:
+                        title = m2.group(1)
+                        break
+                out.append({
+                    "doc": slug, "bytes": len(text.encode("utf-8")),
+                    "mtime": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 1800)),
+                    "etag": blob_sha(text), "title": title, "sections": sections_of(text),
+                })
+            return self._json(out)
+
+        m = re.match(r"^/docs/([a-z0-9-]+)/history$", p)
+        if m:
+            return self._json(DOC_HISTORY if m.group(1) in DOCS else [])
+
+        m = re.match(r"^/docs/([a-z0-9-]+)$", p)
+        if m:
+            slug = m.group(1)
+            if q.get("rev"):
+                body = DOCS.get(slug, "") + "\n\n## Removed in a later revision\n\n- old note\n"
+                return self._text(body, headers={"ETag": '"%s"' % blob_sha(body)})
+            if slug not in DOCS:
+                return self._json({"detail": "not found"}, 404)
+            return self._text(DOCS[slug], headers={"ETag": '"%s"' % blob_sha(DOCS[slug])})
+
         return super().do_GET()
 
     def do_POST(self):
@@ -159,28 +211,39 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         return self._json({"detail": "not found"}, 404)
 
     def do_PUT(self):
-        m = re.match(r"^/memory/([a-z0-9-]+)$", urllib.parse.urlparse(self.path).path)
-        if not m:
-            return self._json({"detail": "invalid category name"}, 400)
-        cat = m.group(1)
+        path = urllib.parse.urlparse(self.path).path
+        m = re.match(r"^/memory/([a-z0-9-]+)$", path)
+        if m:
+            return self._put(m.group(1), STORE)
+        m = re.match(r"^/docs/([a-z0-9-]+)$", path)
+        if m:
+            return self._put(m.group(1), DOCS)
+        return self._json({"detail": "invalid name"}, 400)
+
+    def _put(self, name, store):
         if not self.headers.get("x-memory-actor"):
             return self._json({"detail": "X-Memory-Actor required"}, 403)
         body = self.rfile.read(int(self.headers.get("content-length", 0))).decode("utf-8")
 
-        if cat == "conflict-me":                       # forced 409, to exercise the conflict UI
-            STORE.setdefault(cat, "## Theirs\n\n- their line\n- shared\n")
+        if name == "conflict-me":                       # forced 409, to exercise the conflict UI
+            store.setdefault(name, "## Theirs\n\n- their line\n- shared\n")
             return self._json({"detail": "etag mismatch"}, 409)
 
         if_match = self.headers.get("if-match")
-        if cat in STORE and if_match and if_match.strip('"') not in ("*", blob_sha(STORE[cat])):
+        if name in store and if_match and if_match.strip('"') not in ("*", blob_sha(store[name])):
             return self._json({"detail": "etag mismatch"}, 409)
-        STORE[cat] = body
+        store[name] = body
         return self._text("OK", headers={"ETag": '"%s"' % blob_sha(body)})
 
     def do_DELETE(self):
-        m = re.match(r"^/memory/([a-z0-9-]+)$", urllib.parse.urlparse(self.path).path)
+        path = urllib.parse.urlparse(self.path).path
+        m = re.match(r"^/memory/([a-z0-9-]+)$", path)
         if m and m.group(1) in STORE:
             del STORE[m.group(1)]
+            return self._text("OK")
+        m = re.match(r"^/docs/([a-z0-9-]+)$", path)
+        if m and m.group(1) in DOCS:
+            del DOCS[m.group(1)]
             return self._text("OK")
         return self._json({"detail": "not found"}, 404)
 
