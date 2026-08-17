@@ -60,6 +60,29 @@ check('[[doc:slug]] renders a doc link', /href="#\/d\/tourplan-handoff" class="x
 check('[[category]] still renders a category link', /href="#\/c\/protocol" class="xref">protocol<\/a>/.test(xrefs), xrefs);
 check('doc link uses #/d/, not #/c/', !/#\/c\/tourplan-handoff/.test(xrefs), xrefs);
 
+/* --- opts.known: dead xref handling -------------------------------------
+ * Absent -> today's behaviour (always link), for every caller that does not
+ * pass it. Present -> a name missing from the known set renders inert. */
+const xrefsNoKnown = MD.render('see [[doc:ghost-doc]] and [[ghost-cat]] here');
+check('opts.known absent: [[doc:slug]] still links', /href="#\/d\/ghost-doc" class="xref">doc:ghost-doc<\/a>/.test(xrefsNoKnown), xrefsNoKnown);
+check('opts.known absent: [[category]] still links', /href="#\/c\/ghost-cat" class="xref">ghost-cat<\/a>/.test(xrefsNoKnown), xrefsNoKnown);
+
+const known = { cats: ['protocol'], docs: ['tourplan-handoff'] };
+const xrefsKnownLive = MD.render('see [[doc:tourplan-handoff]] and [[protocol]] here', { known });
+check('opts.known present: known doc still links', /href="#\/d\/tourplan-handoff" class="xref">doc:tourplan-handoff<\/a>/.test(xrefsKnownLive), xrefsKnownLive);
+check('opts.known present: known category still links', /href="#\/c\/protocol" class="xref">protocol<\/a>/.test(xrefsKnownLive), xrefsKnownLive);
+
+const xrefsKnownDead = MD.render('see [[doc:ghost-doc]] and [[ghost-cat]] here', { known });
+check('opts.known present: unknown doc renders dead span, not a link', /<span class="xref dead" title="no such document">doc:ghost-doc<\/span>/.test(xrefsKnownDead) && !/href="#\/d\/ghost-doc"/.test(xrefsKnownDead), xrefsKnownDead);
+check('opts.known present: unknown category renders dead span, not a link', /<span class="xref dead" title="no such category">ghost-cat<\/span>/.test(xrefsKnownDead) && !/href="#\/c\/ghost-cat"/.test(xrefsKnownDead), xrefsKnownDead);
+
+// Set instances must work identically to plain arrays for known.cats/docs
+const xrefsKnownSet = MD.render('see [[doc:tourplan-handoff]] and [[ghost-cat]] here', {
+  known: { cats: new Set(['protocol']), docs: new Set(['tourplan-handoff']) }
+});
+check('opts.known accepts a Set: known doc links', /href="#\/d\/tourplan-handoff"/.test(xrefsKnownSet), xrefsKnownSet);
+check('opts.known accepts a Set: unknown category is dead', /class="xref dead"/.test(xrefsKnownSet), xrefsKnownSet);
+
 /* --- verified badge ----------------------------------------------------- */
 const ver = MD.render('## Endpoint\n<!-- verified: 2026-07-27 -->\n\nbody\n\n## Old\n<!-- verified: 2020-01-01 -->\n\nx');
 check('fresh verified badge', /verified 2026-07-27<\/span><\/h2>/.test(ver), ver);

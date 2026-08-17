@@ -24,6 +24,7 @@ REV_RE = re.compile(r"^[0-9a-f]{4,40}$")
 SECTION_RE = re.compile(r"^##\s+(.*?)\s*$")
 TITLE_RE = re.compile(r"^#(?!#)\s+(.*?)\s*$")
 VERIFIED_RE = re.compile(r"<!--\s*verified:\s*(\d{4}-\d{2}-\d{2})\s*-->")
+DOC_REF_RE = re.compile(r"\[\[doc:([a-z][a-z0-9-]*)\]\]")
 ACTOR_RE = re.compile(r"^[\w./ -]{1,40}$")
 NOTE_CTRL_RE = re.compile(r"[\x00-\x1f]")
 
@@ -246,6 +247,19 @@ def section_at(lines: list, idx: int) -> str:
     return ""
 
 
+def doc_refs_of(text: str) -> list:
+    """[[doc:<slug>]] references in a category body, deduplicated, in
+    first-appearance order."""
+    out = []
+    seen = set()
+    for m in DOC_REF_RE.finditer(text):
+        slug = m.group(1)
+        if slug not in seen:
+            seen.add(slug)
+            out.append(slug)
+    return out
+
+
 def section_body(lines: list, idx: int) -> str:
     """Full text of the '## ' section containing line idx."""
     start = 0
@@ -336,6 +350,7 @@ def index(request: Request):
                 .replace("+00:00", "Z"),
                 "etag": blob_sha(text.encode("utf-8")),
                 "sections": sections_of(text),
+                "docs": doc_refs_of(text),
             }
         )
     return JSONResponse(out)

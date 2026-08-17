@@ -317,6 +317,30 @@ input:focus, textarea:focus { outline: 2px solid var(--accent-line); outline-off
 .hit .snip { font-size: 13.5px; overflow-wrap: anywhere; }
 .hit mark { background: var(--mark); color: inherit; }
 
+/* doc hits in search: visually distinct from category hits, not just a
+   different heading -- an accent rail down the left edge of the group. */
+.doc-hits { border-left: 3px solid var(--accent-line); padding-left: 12px; }
+
+/* docs attached to a category, shown near the top of the read view */
+.cat-docs { margin: 0 0 16px; display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
+.pill.doclink { text-decoration: none; }
+.pill.doclink:hover { border-color: var(--accent-line); color: var(--accent-ink); }
+
+/* "+ New" topbar control: a button that opens a two-item dropdown, since one
+   button now creates either a category or a doc. */
+.newmenu { position: relative; }
+.dropdown {
+  position: absolute; right: 0; top: calc(100% + 4px);
+  background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+  box-shadow: var(--shadow); padding: 4px; min-width: 140px; z-index: 40;
+  display: grid; gap: 2px;
+}
+.dropdown a {
+  display: block; text-decoration: none; color: var(--ink);
+  font-size: 14px; padding: 7px 10px; border-radius: 7px;
+}
+.dropdown a:hover { background: var(--line-2); }
+
 /* modal + toast ---------------------------------------------------------- */
 .modal-bg { position: fixed; inset: 0; background: rgba(0, 0, 0, .45); display: grid; place-items: center; padding: 20px; z-index: 50; }
 .modal {
@@ -392,3 +416,13 @@ input:focus, textarea:focus { outline: 2px solid var(--accent-line); outline-off
   border-radius: 5px; padding: 0 5px; text-decoration: none;
 }
 .md a.xref:hover { filter: brightness(1.06); text-decoration: underline; }
+
+/* dead cross-reference: a [[name]] whose target does not exist. A stale
+   pointer, not an error -- muted, not alarming red. */
+.md span.xref.dead {
+  font-family: var(--mono); font-size: .9em;
+  background: var(--line-2); color: var(--ink-2);
+  border: 1px dotted var(--ink-3);
+  border-radius: 5px; padding: 0 5px;
+  cursor: help;
+}

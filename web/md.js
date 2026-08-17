@@ -41,8 +41,17 @@ window.MD = (function () {
     return '<a href="' + url + '"' + ext + '>' + text + '</a>';
   }
 
+  // known.cats / known.docs may be an Array or a Set -- either works as a
+  // membership check without forcing every caller to build a Set.
+  function has(set, name) {
+    if (!set) return false;
+    if (typeof set.has === 'function') return set.has(name);
+    for (var i = 0; i < set.length; i++) if (set[i] === name) return true;
+    return false;
+  }
+
   /* inline ---------------------------------------------------------------- */
-  function inline(src) {
+  function inline(src, known) {
     var out = esc(src);
 
     // pull code spans out first so nothing below rewrites their contents
@@ -56,14 +65,23 @@ window.MD = (function () {
     // 'doc:' is consumed here rather than falling through to the plain
     // [[category]] rule below (which would otherwise treat 'doc' as a scheme
     // prefix baked into an invalid category name and leave it unlinked).
+    // When `known` is supplied, a slug not in known.docs renders as inert
+    // text instead of a link to a document that does not exist.
     out = out.replace(/\[\[doc:([a-z][a-z0-9-]*)\]\]/g, function (m, slug) {
+      if (known && !has(known.docs, slug)) {
+        return '<span class="xref dead" title="no such document">doc:' + slug + '</span>';
+      }
       return '<a href="#/d/' + slug + '" class="xref">doc:' + slug + '</a>';
     });
 
     // [[category]] -> in-app link. The store is full of these as cross-references
     // and they used to render as literal brackets. Only a valid category name is
-    // linked, so ordinary double brackets in prose are left alone.
+    // linked, so ordinary double brackets in prose are left alone. Same dead-ref
+    // handling as [[doc:slug]] above, against known.cats.
     out = out.replace(/\[\[([a-z][a-z0-9-]*)\]\]/g, function (m, cat) {
+      if (known && !has(known.cats, cat)) {
+        return '<span class="xref dead" title="no such category">' + cat + '</span>';
+      }
       return '<a href="#/c/' + cat + '" class="xref">' + cat + '</a>';
     });
 
@@ -113,6 +131,7 @@ window.MD = (function () {
   function render(text, opts) {
     opts = opts || {};
     var staleDays = opts.staleDays || 90;
+    var known = opts.known;
     var lines = String(text).replace(/\u0000/g, '').replace(/\r\n?/g, '\n').split('\n');
     var html = [];
     var para = [];
@@ -124,7 +143,7 @@ window.MD = (function () {
 
     function flushPara() {
       if (!para.length) return;
-      html.push('<p data-line="' + paraLine + '">' + inline(para.join(' ')) + '</p>');
+      html.push('<p data-line="' + paraLine + '">' + inline(para.join(' '), known) + '</p>');
       para = [];
     }
 
@@ -174,7 +193,7 @@ window.MD = (function () {
         flushAll();
         var lvl = Math.min(m[1].length, 4);
         html.push('<h' + lvl + ' id="' + slug(m[2], n) + '" data-line="' + n + '">' +
-          inline(m[2]) + '</h' + lvl + '>');
+          inline(m[2], known) + '</h' + lvl + '>');
         lastHeading = html.length - 1;
         lastHeadingLine = n;
         continue;
@@ -190,7 +209,7 @@ window.MD = (function () {
           quote.push(lines[i].replace(/^\s*>\s?/, ''));
         }
         i--;
-        html.push('<blockquote data-line="' + n + '">' + inline(quote.join(' ')) + '</blockquote>');
+        html.push('<blockquote data-line="' + n + '">' + inline(quote.join(' '), known) + '</blockquote>');
         continue;
       }
 
@@ -199,7 +218,7 @@ window.MD = (function () {
         flushAll();
         var cells = function (row) {
           return row.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map(function (c) {
-            return inline(c.trim());
+            return inline(c.trim(), known);
           });
         };
         var t = ['<table data-line="' + n + '"><thead><tr>'];
@@ -235,13 +254,13 @@ window.MD = (function () {
           }
           html.push('</li><li data-line="' + n + '">');
         }
-        html.push(inline(m[3]));
+        html.push(inline(m[3], known));
         continue;
       }
 
       // indented continuation of the current list item
       if (listStack.length && /^\s{2,}/.test(raw)) {
-        html.push(' ' + inline(line.trim()));
+        html.push(' ' + inline(line.trim(), known));
         continue;
       }
 

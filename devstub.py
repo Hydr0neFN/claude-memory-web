@@ -15,6 +15,7 @@ WEB = os.path.join(FIX, "web")
 SECTION_RE = re.compile(r"^##\s+(.*?)\s*$")
 TITLE_RE = re.compile(r"^#(?!#)\s+(.*?)\s*$")
 VERIFIED_RE = re.compile(r"<!--\s*verified:\s*(\d{4}-\d{2}-\d{2})\s*-->")
+DOC_REF_RE = re.compile(r"\[\[doc:([a-z][a-z0-9-]*)\]\]")
 
 # category -> markdown, seeded from the real fixtures
 STORE = {}
@@ -43,6 +44,17 @@ for _name, _kb in [
     _head = "## %s\n<!-- verified: 2026-08-0%d -->\n\n" % (_name.replace("-", " ").title(), len(_name) % 9 + 1)
     _line = "- filler fact for %s\n" % _name
     STORE[_name] = _head + _line * max(1, int(_kb * 1024 - len(_head)) // len(_line))
+
+# [[doc:slug]] refs on a couple of categories, so the sidebar badge, home
+# Docs list, category-read doc list and dead-ref rendering all have something
+# real to exercise. "trading" carries two, in a fixed order, to prove the
+# index preserves first-appearance order rather than sorting; "conflict-me"
+# carries one that does not exist, to exercise a dead ref.
+STORE["projects-trading"] += (
+    "\n\n## Related docs\n\n"
+    "- see [[doc:tourplan-handoff]] and [[doc:kk-sr6-live-shim-notes]]\n"
+)
+STORE["conflict-me"] += "\n\n## See also\n\n- [[doc:no-such-doc]]\n"
 
 HISTORY = [
     {"sha": "a" * 40, "short": "aaaaaaaa", "date": "2026-08-09T09:00:00+02:00", "bytes": 8600,
@@ -76,6 +88,16 @@ def blob_sha(text):
     h.update(b"blob %d\0" % len(data))
     h.update(data)
     return h.hexdigest()
+
+
+def doc_refs_of(text):
+    out, seen = [], set()
+    for m in DOC_REF_RE.finditer(text):
+        slug = m.group(1)
+        if slug not in seen:
+            seen.add(slug)
+            out.append(slug)
+    return out
 
 
 def sections_of(text):
@@ -135,25 +157,43 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._json([
                 {"category": c, "bytes": len(t.encode("utf-8")),
                  "mtime": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 3600 * i)),
-                 "etag": blob_sha(t), "sections": sections_of(t)}
+                 "etag": blob_sha(t), "sections": sections_of(t), "docs": doc_refs_of(t)}
                 for i, (c, t) in enumerate(sorted(STORE.items()))
             ])
 
         if p == "/memory/search":
+            scope = (q.get("scope", ["memory"])[0])
             terms = [t.lower() for t in (q.get("q", [""])[0]).split() if t]
             hits = []
-            for cat in sorted(STORE):
-                lines = STORE[cat].splitlines()
-                for i, line in enumerate(lines):
-                    if terms and all(t in line.lower() for t in terms):
-                        sec = ""
-                        for j in range(i, -1, -1):
-                            m = SECTION_RE.match(lines[j])
-                            if m:
-                                sec = m.group(1)
-                                break
-                        hits.append({"category": cat, "section": sec, "line": i + 1,
-                                     "snippet": line.strip()[:240]})
+            if scope in ("memory", "all"):
+                for cat in sorted(STORE):
+                    lines = STORE[cat].splitlines()
+                    for i, line in enumerate(lines):
+                        if terms and all(t in line.lower() for t in terms):
+                            sec = ""
+                            for j in range(i, -1, -1):
+                                m = SECTION_RE.match(lines[j])
+                                if m:
+                                    sec = m.group(1)
+                                    break
+                            hit = {"category": cat, "section": sec, "line": i + 1,
+                                   "snippet": line.strip()[:240]}
+                            if scope != "memory":
+                                hit["kind"] = "memory"
+                            hits.append(hit)
+            if scope in ("docs", "all"):
+                for slug in sorted(DOCS):
+                    lines = DOCS[slug].splitlines()
+                    for i, line in enumerate(lines):
+                        if terms and all(t in line.lower() for t in terms):
+                            sec = ""
+                            for j in range(i, -1, -1):
+                                m = SECTION_RE.match(lines[j])
+                                if m:
+                                    sec = m.group(1)
+                                    break
+                            hits.append({"doc": slug, "section": sec, "line": i + 1, "kind": "doc",
+                                         "snippet": line.strip()[:240]})
             return self._json(hits[:100])
 
         m = re.match(r"^/memory/([a-z0-9-]+)/history$", p)

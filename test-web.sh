@@ -196,6 +196,33 @@ contains "scope=docs finds the scratch doc" "\"doc\":\"$DOC\"" "$scoped"
 code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$BASE/memory/search?q=x&scope=bogus")
 check "invalid scope rejected" 400 "$code"
 
+echo "=== 7b. /memory/index docs key ==="
+idx=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/index")
+case "$idx" in *'"docs"'*) echo "PASS: /memory/index entries carry a docs key"; PASS=$((PASS+1)) ;;
+  *) echo "FAIL: /memory/index missing a docs key"; FAIL=$((FAIL+1)) ;; esac
+
+audit=$(echo "$idx" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+e = [c for c in d if c["category"] == "projects-trading-audit"]
+print(",".join(e[0]["docs"]) if e else "MISSING")
+')
+check "projects-trading-audit lists its 6 doc slugs in order" \
+  "trading-audit-trader-perf,trading-audit-dowtrade-perf,trading-audit-slot-analysis,trading-audit-confidence-calibration,trading-audit-d7-sweep,trading-audit-risk-budget" \
+  "$audit"
+
+empty=$(echo "$idx" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+e = [c for c in d if c["category"] == "protocol"]
+print(repr(e[0]["docs"]) if e else "MISSING")
+')
+check "a category with no doc refs reports []" "[]" "$empty"
+
+case "$idx" in *'"category": "handoff-index"'*|*'"category":"handoff-index"'*)
+    echo "FAIL: /memory/index lists a doc as a top-level category entry"; FAIL=$((FAIL+1)) ;;
+  *) echo "PASS: no doc appears as its own top-level index entry"; PASS=$((PASS+1)) ;; esac
+
 code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Bearer $TOKEN" \
   -H "If-Match: *" "$BASE/docs/$DOC")
 check "scratch doc deleted" 200 "$code"

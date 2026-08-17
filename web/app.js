@@ -33,6 +33,16 @@
   // history, diff) is identical between the two, so this is the seam.
   function basePath(kind) { return kind === 'd' ? '/docs/' : '/memory/'; }
 
+  // the full set of category and doc names, for MD.render's opts.known --
+  // whatever a [[name]] / [[doc:slug]] points to that does not exist here
+  // renders as a dead ref instead of a link into a 404.
+  function knownRefs() {
+    return {
+      cats: state.index.map(function (c) { return c.category; }),
+      docs: state.docs.map(function (d) { return d.doc; })
+    };
+  }
+
   /* ---------------------------------------------------------------- utils */
 
   function fmtBytes(n) {
@@ -283,7 +293,10 @@
         '<a class="cat' + (name === activeName ? ' active' : '') + '" href="#/' + kind + '/' +
         encodeURIComponent(name) + '" title="' + e(name) + '">' +
         '<div class="cat-name">' + e(shown) +
-        (kids.length && !open ? ' <span class="pill sub">' + kids.length + '</span>' : '') + '</div>' +
+        (kids.length && !open ? ' <span class="pill sub">' + kids.length + '</span>' : '') +
+        (kind === 'c' && c.docs && c.docs.length
+          ? ' <span class="pill" title="' + e(c.docs.join(', ')) + '">' + c.docs.length + ' docs</span>'
+          : '') + '</div>' +
         meta + '</a></div>'
       );
       if (open) kids.forEach(walk);
@@ -409,6 +422,12 @@
           : c.bytes >= WARN_BYTES ? ' <span class="pill warn">near cap</span>' : '');
       }) +
       '<h3 style="margin-top:22px">Recently changed</h3>' + rows(recent, function (c) { return fmtAgo(c.mtime); }) +
+      (state.docs.length
+        ? '<h3 style="margin-top:22px">Docs</h3><div class="revs">' + state.docs.map(function (d) {
+            return '<div class="rev"><a class="msg" href="#/d/' + encodeURIComponent(d.doc) + '">' +
+              e(d.title) + '</a><span class="when">' + fmtBytes(d.bytes) + '</span></div>';
+          }).join('') + '</div>'
+        : '') +
       (stale.length
         ? '<h3 style="margin-top:22px">Sections unverified for over ' + STALE_DAYS + ' days</h3>' +
           '<div class="revs">' + stale.slice(0, 12).map(function (s) {
@@ -447,8 +466,14 @@
         '<p class="vsub">' + fmtBytes(size) + ' · ' + MD.sections(r.body).length + ' sections · etag ' +
         '<code>' + e(r.etag.slice(0, 8)) + '</code>' +
         (meta ? ' · changed ' + fmtAgo(meta.mtime) : '') + '</p>' +
+        (meta && meta.docs && meta.docs.length
+          ? '<div class="cat-docs"><span class="muted small">Docs:</span>' +
+            meta.docs.map(function (d) {
+              return '<a class="pill doclink" href="#/d/' + encodeURIComponent(d) + '">' + e(d) + '</a>';
+            }).join('') + '</div>'
+          : '') +
         '<div class="reading"><article class="md">' +
-        MD.render(r.body, { staleDays: STALE_DAYS }) + '</article>' + outlineHTML(r.body) + '</div>'
+        MD.render(r.body, { staleDays: STALE_DAYS, known: knownRefs() }) + '</article>' + outlineHTML(r.body) + '</div>'
       );
 
       $('main').querySelector('[data-act="edit"]').onclick = function () {
@@ -489,7 +514,7 @@
         '<code>' + e(r.etag.slice(0, 8)) + '</code>' +
         (meta ? ' · changed ' + fmtAgo(meta.mtime) : '') + '</p>' +
         '<div class="reading"><article class="md">' +
-        MD.render(r.body, { staleDays: STALE_DAYS }) + '</article>' + outlineHTML(r.body) + '</div>'
+        MD.render(r.body, { staleDays: STALE_DAYS, known: knownRefs() }) + '</article>' + outlineHTML(r.body) + '</div>'
       );
 
       $('main').querySelector('[data-act="edit"]').onclick = function () {
@@ -699,7 +724,7 @@
     var ed = $('ed'), pv = $('pv'), timer;
 
     function preview() {
-      pv.innerHTML = MD.render(ed.value, { staleDays: STALE_DAYS });
+      pv.innerHTML = MD.render(ed.value, { staleDays: STALE_DAYS, known: knownRefs() });
       if (editorSync) editorSync.resync();
     }
     editorSync = null;          // build after the first render, so marks exist
@@ -1023,7 +1048,7 @@
           (d ? ' Against the live file: +' + d.stats.added + ' / −' + d.stats.removed + '.' : '') +
           '</div>' +
           (d ? '<div class="diff hidden" id="r-diffbox">' + d.html + '</div>' : '') +
-          '<article class="md" id="r-body">' + MD.render(old.body, { staleDays: STALE_DAYS }) + '</article>'
+          '<article class="md" id="r-body">' + MD.render(old.body, { staleDays: STALE_DAYS, known: knownRefs() }) + '</article>'
         );
         $('r-diff').onclick = function () {
           var box = $('r-diffbox');
@@ -1059,25 +1084,42 @@
     $('search-input').value = q;
     loading();
     var terms = q.split(/\s+/).filter(Boolean);
-    apiJSON('/memory/search?limit=100&q=' + encodeURIComponent(q)).then(function (hits) {
+    apiJSON('/memory/search?limit=100&scope=all&q=' + encodeURIComponent(q)).then(function (hits) {
       if (!hits.length) {
         main('<div class="vhead"><h1>No hits</h1></div><p class="vsub">All terms must appear on the ' +
           'same line — try fewer words.</p>');
         return;
       }
-      var groups = {};
-      hits.forEach(function (h) { (groups[h.category] = groups[h.category] || []).push(h); });
 
-      main('<div class="vhead"><h1>' + hits.length + ' hits</h1></div>' +
-        '<p class="vsub">for <code>' + e(q) + '</code> across ' + Object.keys(groups).length + ' categories</p>' +
-        Object.keys(groups).map(function (cat) {
-          return '<div class="hitgroup"><h3><a href="#/c/' + encodeURIComponent(cat) + '">' + e(cat) + '</a></h3>' +
-            groups[cat].map(function (h) {
-              return '<a class="hit" href="#/c/' + encodeURIComponent(cat) + '/l/' + h.line + '">' +
+      function renderGroups(list, kind, key) {
+        var groups = {};
+        list.forEach(function (h) { (groups[h[key]] = groups[h[key]] || []).push(h); });
+        return Object.keys(groups).map(function (name) {
+          return '<div class="hitgroup"><h3><a href="#/' + kind + '/' + encodeURIComponent(name) + '">' +
+            e(name) + '</a></h3>' +
+            groups[name].map(function (h) {
+              return '<a class="hit" href="#/' + kind + '/' + encodeURIComponent(name) + '/l/' + h.line + '">' +
                 '<div class="where">' + (h.section ? e(h.section) + ' · ' : '') + 'line ' + h.line + '</div>' +
                 '<div class="snip">' + hl(e(h.snippet || ''), terms) + '</div></a>';
             }).join('') + '</div>';
-        }).join(''));
+        }).join('');
+      }
+
+      // scope=all tags every hit with .kind ('memory' or 'doc'); memory hits
+      // key off .category, doc hits off .doc -- grouped and headed separately
+      // so a handoff never looks like it lives in the same list as a fact.
+      var memHits = hits.filter(function (h) { return h.kind !== 'doc'; });
+      var docHits = hits.filter(function (h) { return h.kind === 'doc'; });
+      var catCount = {}; memHits.forEach(function (h) { catCount[h.category] = 1; });
+      var docCount = {}; docHits.forEach(function (h) { docCount[h.doc] = 1; });
+
+      main('<div class="vhead"><h1>' + hits.length + ' hits</h1></div>' +
+        '<p class="vsub">for <code>' + e(q) + '</code> across ' + Object.keys(catCount).length + ' categories' +
+        (docHits.length ? ' and ' + Object.keys(docCount).length + ' docs' : '') + '</p>' +
+        (memHits.length ? renderGroups(memHits, 'c', 'category') : '') +
+        (docHits.length
+          ? '<h3 class="search-section">Docs</h3><div class="doc-hits">' + renderGroups(docHits, 'd', 'doc') + '</div>'
+          : ''));
     }).catch(function (err) {
       main('<div class="banner bad">' + e(err.message) + '</div>');
     });
@@ -1097,7 +1139,12 @@
     if (q) location.hash = '#/search/' + encodeURIComponent(q);
   });
 
-  $('new-btn').addEventListener('click', function () { location.hash = '#/new'; });
+  $('new-btn').addEventListener('click', function (ev) {
+    ev.stopPropagation();
+    $('new-menu').classList.toggle('hidden');
+  });
+  $('new-menu').addEventListener('click', function () { $('new-menu').classList.add('hidden'); });
+  document.addEventListener('click', function () { $('new-menu').classList.add('hidden'); });
 
   /* --------------------------------------------------------------- router */
 
