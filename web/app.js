@@ -191,14 +191,6 @@
   // sidebar renders both groups from the same renderSidebar() call.
   function refreshIndexes() { return Promise.all([loadIndex(), loadDocs()]); }
 
-  // buildTree keys off `.category`; docs carry `.doc` instead, so present
-  // them through the same shape rather than forking the tree algorithm.
-  function docsAsCategories(docs) {
-    return docs.map(function (d) {
-      return { category: d.doc, bytes: d.bytes, mtime: d.mtime, sections: d.sections, title: d.title };
-    });
-  }
-
   /* The store is flat -- names must match ^[a-z0-9-]+$ -- but the convention is
    * `<parent>-<sub>`, so the hierarchy is recoverable from the names alone.
    * Parent = the LONGEST existing category that is a prefix of this one, which
@@ -231,75 +223,107 @@
     try { localStorage.setItem('mem.collapsed', JSON.stringify(list)); } catch (_) { /* private mode */ }
   }
 
-  // shared by both sidebar groups: which rows a caret toggle affects, ancestor
-  // force-open for the currently active row, and the filter's visible set.
-  // Collapse state is stored as "kind:name" so a category and a doc sharing a
-  // name don't share a collapsed/expanded flag too.
-  function treeOpenState(tree, kind, activeName, filter) {
+  // slug -> [category, ...] that reference it via [[doc:slug]]. A doc absent
+  // here has no owning category and falls into the "Unattached docs" group.
+  function docOwnersOf(index) {
+    var owners = {};
+    index.forEach(function (c) {
+      (c.docs || []).forEach(function (slug) {
+        (owners[slug] = owners[slug] || []).push(c.category);
+      });
+    });
+    return owners;
+  }
+
+  // which rows a caret toggle affects, ancestor force-open for the currently
+  // active row (category or, via its owning category/ies, a doc), and the
+  // filter's visible set. Collapse state is stored as "c:name" -- docs have
+  // no expand state of their own, they ride their owning category's.
+  function treeOpenState(tree, activeKind, activeName, filter, docOwners) {
     var collapsed = collapsedSet();
     var forced = {};
-    for (var p = activeName && tree.node[activeName] ? tree.node[activeName].parent : null; p; p = tree.node[p].parent) {
-      forced[p] = true;
+    function forceAncestors(name) {
+      for (var p = tree.node[name] ? tree.node[name].parent : null; p; p = tree.node[p].parent) forced[p] = true;
+    }
+    if (activeKind === 'c' && activeName && tree.node[activeName]) {
+      forceAncestors(activeName);
+    } else if (activeKind === 'd' && activeName) {
+      (docOwners[activeName] || []).forEach(function (owner) {
+        forced[owner] = true;   // open the owner itself, so its doc children render
+        forceAncestors(owner);
+      });
     }
     var visible = null;
     if (filter) {
       visible = {};
       Object.keys(tree.node).forEach(function (n) {
-        if (n.indexOf(filter) < 0) return;
+        var docMatch = (tree.node[n].cat.docs || []).some(function (d) { return d.indexOf(filter) >= 0; });
+        if (n.indexOf(filter) < 0 && !docMatch) return;
         visible[n] = true;
         for (var a = tree.node[n].parent; a; a = tree.node[a].parent) visible[a] = true;
       });
     }
     return {
       visible: visible,
-      isOpen: function (n) { return !!filter || forced[n] || collapsed.indexOf(kind + ':' + n) < 0; }
+      isOpen: function (n) { return !!filter || forced[n] || collapsed.indexOf('c:' + n) < 0; }
     };
   }
 
-  // Renders one sidebar group (categories or docs) into `html`. Categories
-  // carry a size bar and a section count; doc rows carry neither -- a doc has
-  // no soft cap and "## sections" don't summarize a handoff the way they
-  // summarize a fact category.
-  function renderTree(html, tree, kind, activeName, filter, withMeta) {
-    var st = treeOpenState(tree, kind, activeName, filter);
+  function docRowHTML(slug, meta, active, padLeft) {
+    return '<div class="catrow docrow" style="padding-left:' + padLeft + 'px">' +
+      '<span class="caret ghost">·</span>' +
+      '<a class="cat docref' + (active ? ' active' : '') + '" href="#/d/' + encodeURIComponent(slug) +
+      '" title="' + e(slug) + '">' +
+      '<div class="cat-name"><span class="docmark" aria-hidden="true">📄</span> ' +
+      e(meta ? meta.title : slug) + '</div></a></div>';
+  }
+
+  // Renders the category tree, with each category's referenced docs as child
+  // rows (one level deeper, after any sub-categories) riding the same caret.
+  function renderTree(html, tree, activeKind, activeName, filter, docOwners, docMeta) {
+    var st = treeOpenState(tree, activeKind, activeName, filter, docOwners);
     function walk(name) {
       if (st.visible && !st.visible[name]) return;
       var nd = tree.node[name], c = nd.cat;
       var shown = nd.parent ? name.slice(nd.parent.length + 1) : name;
       var open = st.isOpen(name);
       var kids = st.visible ? nd.kids.filter(function (k) { return st.visible[k]; }) : nd.kids;
+      var docs = c.docs || [];
+      var hasChildren = kids.length > 0 || docs.length > 0;
 
-      var meta = '';
-      if (withMeta) {
-        var pct = Math.min(100, Math.round(c.bytes / CAP_BYTES * 100));
-        var cls = c.bytes >= CAP_BYTES ? ' over' : c.bytes >= WARN_BYTES ? ' warn' : '';
-        meta = '<div class="bar' + cls + '"><i style="width:' + pct + '%"></i></div>' +
-          '<div class="cat-meta"><span>' + fmtBytes(c.bytes) + ' · ' + c.sections.length + ' §</span>' +
-          '<span>' + fmtAgo(c.mtime) + '</span></div>';
-      } else {
-        meta = '<div class="cat-meta"><span>' + fmtBytes(c.bytes) + '</span>' +
-          '<span>' + fmtAgo(c.mtime) + '</span></div>';
-      }
+      var pct = Math.min(100, Math.round(c.bytes / CAP_BYTES * 100));
+      var cls = c.bytes >= CAP_BYTES ? ' over' : c.bytes >= WARN_BYTES ? ' warn' : '';
+      var meta = '<div class="bar' + cls + '"><i style="width:' + pct + '%"></i></div>' +
+        '<div class="cat-meta"><span>' + fmtBytes(c.bytes) + ' · ' + c.sections.length + ' §</span>' +
+        '<span>' + fmtAgo(c.mtime) + '</span></div>';
 
       html.push(
         // indent is capped: nesting is unbounded by design (the tree is derived
         // from names, not stored), but past a few levels the indent would eat
         // the 272px sidebar and the name would wrap to nothing
         '<div class="catrow" style="padding-left:' + (Math.min(nd.depth, 5) * 13) + 'px">' +
-        (kids.length
-          ? '<button class="caret" data-toggle="' + kind + ':' + e(name) + '" title="' +
+        (hasChildren
+          ? '<button class="caret" data-toggle="c:' + e(name) + '" title="' +
             (open ? 'Collapse' : 'Expand') + '">' + (open ? '▾' : '▸') + '</button>'
           : '<span class="caret ghost">·</span>') +
-        '<a class="cat' + (name === activeName ? ' active' : '') + '" href="#/' + kind + '/' +
+        '<a class="cat' + (activeKind === 'c' && name === activeName ? ' active' : '') + '" href="#/c/' +
         encodeURIComponent(name) + '" title="' + e(name) + '">' +
         '<div class="cat-name">' + e(shown) +
         (kids.length && !open ? ' <span class="pill sub">' + kids.length + '</span>' : '') +
-        (kind === 'c' && c.docs && c.docs.length
-          ? ' <span class="pill" title="' + e(c.docs.join(', ')) + '">' + c.docs.length + ' docs</span>'
+        // the badge is a collapsed-state summary -- once expanded, the doc
+        // rows themselves are the answer to "how many", so it steps aside
+        (docs.length && !open
+          ? ' <span class="pill" title="' + e(docs.join(', ')) + '">' + docs.length + ' docs</span>'
           : '') + '</div>' +
         meta + '</a></div>'
       );
-      if (open) kids.forEach(walk);
+      if (open) {
+        kids.forEach(walk);
+        var padLeft = Math.min(nd.depth + 1, 6) * 13;
+        docs.forEach(function (slug) {
+          html.push(docRowHTML(slug, docMeta[slug], activeKind === 'd' && slug === activeName, padLeft));
+        });
+      }
     }
     tree.roots.forEach(walk);
   }
@@ -307,12 +331,24 @@
   function renderSidebar() {
     var filter = ($('filter').value || '').toLowerCase().trim();
     var tree = buildTree(state.index);
-    var docTree = buildTree(docsAsCategories(state.docs));
+    var docOwners = docOwnersOf(state.index);
+    var docMeta = {};
+    state.docs.forEach(function (d) { docMeta[d.doc] = d; });
+    var unattached = state.docs.filter(function (d) { return !docOwners[d.doc]; });
+    if (filter) unattached = unattached.filter(function (d) { return d.doc.indexOf(filter) >= 0; });
 
     var html = [];
-    renderTree(html, tree, 'c', state.cat, filter, true);
-    html.push('<div class="group-head">Docs<a href="#/newdoc" title="New doc">+</a></div>');
-    renderTree(html, docTree, 'd', state.doc, filter, false);
+    renderTree(html, tree, state.kind, state.kind === 'd' ? state.doc : state.cat, filter, docOwners, docMeta);
+
+    // docs no category references still need a home -- labelled as what they
+    // are (unattached), not as "Docs", and omitted entirely when empty so an
+    // ordinary store with everything cross-referenced shows no trailing group.
+    if (unattached.length) {
+      html.push('<div class="group-head">Unattached docs</div>');
+      unattached.forEach(function (d) {
+        html.push(docRowHTML(d.doc, d, state.kind === 'd' && d.doc === state.doc, 13));
+      });
+    }
 
     $('catlist').innerHTML = html.join('') ||
       '<p class="small muted" style="padding:8px">No match.</p>';

@@ -175,6 +175,13 @@ input:focus, textarea:focus { outline: 2px solid var(--accent-line); outline-off
 }
 .group-head a:hover { color: var(--ink); background: var(--line-2); }
 .cat-meta { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--ink-3); }
+/* a doc nested under its owning category (or, for an unattached doc, under
+   the "Unattached docs" group) -- lighter weight than a category row, no
+   bar/meta, so it visibly reads as a leaf rather than another project. */
+.docrow .cat { padding-top: 6px; padding-bottom: 6px; }
+.docrow .cat-name { font-size: 13px; font-weight: 400; color: var(--ink-2); }
+.docrow .cat.active { background: var(--accent-bg); border-color: var(--accent-line); color: var(--ink); }
+.docmark { font-size: 12px; }
 .bar { height: 3px; border-radius: 2px; background: var(--line); margin: 5px 0 4px; overflow: hidden; }
 .bar > i { display: block; height: 100%; background: var(--ok-line); }
 .bar.warn > i { background: var(--warn-line); }
