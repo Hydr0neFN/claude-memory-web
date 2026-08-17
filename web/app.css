@@ -200,6 +200,10 @@ input:focus, textarea:focus { outline: 2px solid var(--accent-line); outline-off
 .vhead .spacer { flex: 1; }
 .vsub { color: var(--ink-2); font-size: 13px; margin: 0 0 18px; }
 .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+/* the doc-save note field: flexes to fill leftover room instead of claiming
+   a fixed 220px, which is what pushed Save/Close onto their own row at
+   narrow widths */
+.actions #note { flex: 1; min-width: 140px; }
 
 .pill {
   display: inline-block; font-size: 12px; padding: 1px 8px; border-radius: 999px;

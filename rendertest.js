@@ -83,6 +83,59 @@ const xrefsKnownSet = MD.render('see [[doc:tourplan-handoff]] and [[ghost-cat]] 
 check('opts.known accepts a Set: known doc links', /href="#\/d\/tourplan-handoff"/.test(xrefsKnownSet), xrefsKnownSet);
 check('opts.known accepts a Set: unknown category is dead', /class="xref dead"/.test(xrefsKnownSet), xrefsKnownSet);
 
+/* --- heading ids are text-derived, not line-derived --------------------- */
+const headA = MD.render('## Overview\n\nbody\n\n## Endpoint\n\nmore');
+const idOverview = /id="(h-overview)"/.exec(headA);
+const idEndpoint = /id="(h-endpoint)"/.exec(headA);
+check('heading id has no line-number prefix', !!idOverview && !!idEndpoint, headA);
+
+// inserting a line above a heading must not change that heading's id
+const headB = MD.render('New line up top\n\n## Overview\n\nbody\n\n## Endpoint\n\nmore');
+check('id stable when a line is inserted above it',
+  /id="h-overview"/.test(headB) && /id="h-endpoint"/.test(headB), headB);
+
+// two headings with the same text get distinct ids, in order
+const dupHeads = MD.render('## Notes\n\na\n\n## Notes\n\nb\n\n## Notes\n\nc');
+check('duplicate headings get distinct ids',
+  /id="h-notes"/.test(dupHeads) && /id="h-notes-2"/.test(dupHeads) && /id="h-notes-3"/.test(dupHeads),
+  dupHeads);
+
+// sections() and render() must assign the same id to the same heading,
+// independently -- this is what outline links actually depend on
+const dupSrc = '# Title\n\n## Notes\n\na\n\n### Notes\n\nb\n\n## Notes\n\nc';
+const dupSecs = MD.sections(dupSrc);
+const dupHtml = MD.render(dupSrc);
+check('sections() ids match render() ids for duplicate headings',
+  dupSecs.every(s => dupHtml.indexOf('id="' + s.id + '"') >= 0), JSON.stringify(dupSecs));
+
+/* --- sections() covers H2-H4, with level, but not H1/H5/H6 -------------- */
+const levels = MD.sections(
+  '# Title\n\n## Two\n\n### Three\n\n#### Four\n\n##### Five\n\n###### Six\n'
+);
+check('H2 included', levels.some(s => s.name === 'Two' && s.level === 2), JSON.stringify(levels));
+check('H3 included', levels.some(s => s.name === 'Three' && s.level === 3), JSON.stringify(levels));
+check('H4 included', levels.some(s => s.name === 'Four' && s.level === 4), JSON.stringify(levels));
+check('H1 excluded from outline', !levels.some(s => s.name === 'Title'), JSON.stringify(levels));
+check('H5 excluded from outline', !levels.some(s => s.name === 'Five'), JSON.stringify(levels));
+check('H6 excluded from outline', !levels.some(s => s.name === 'Six'), JSON.stringify(levels));
+check('sections() covers exactly H2-H4', levels.length === 3, JSON.stringify(levels));
+
+// an H1/H5 sharing text with a later H2 must still consume a counter slot,
+// so sections() and render() ids stay in lockstep (see the shared `seen`
+// map in md.js) even though the H1/H5 itself is not an outline entry
+const crossLevelSrc = '# Notes\n\nintro\n\n##### Notes\n\nx\n\n## Notes\n\ny\n';
+const crossSecs = MD.sections(crossLevelSrc);
+const crossHtml = MD.render(crossLevelSrc);
+check('cross-level duplicate: outline id is h-notes-3 (H1 and H5 each took a slot)',
+  crossSecs.length === 1 && crossSecs[0].id === 'h-notes-3', JSON.stringify(crossSecs));
+check('cross-level duplicate: render() assigns the same id to the H2',
+  crossHtml.indexOf('id="h-notes-3"') >= 0, crossHtml);
+
+/* --- scope guard: main.py's sections_of() stays '##'-only --------------- */
+const mainPy = fs.readFileSync(FIX + 'main.py', 'utf8');
+check("main.py SECTION_RE is unchanged ('## ' only, not H3/H4)",
+  /SECTION_RE = re\.compile\(r"\^##\\s\+\(\.\*\?\)\\s\*\$"\)/.test(mainPy), 'SECTION_RE line missing or changed');
+
 /* --- verified badge ----------------------------------------------------- */
 const ver = MD.render('## Endpoint\n<!-- verified: 2026-07-27 -->\n\nbody\n\n## Old\n<!-- verified: 2020-01-01 -->\n\nx');
 check('fresh verified badge', /verified 2026-07-27<\/span><\/h2>/.test(ver), ver);
@@ -111,7 +164,8 @@ for (const f of CORPUS) {
   check(name + ': no raw < from source', !/<(?!\/?(h[1-6]|p|ul|ol|li|code|pre|em|strong|del|a|blockquote|hr|table|thead|tbody|tr|th|td|span|mark)[ >/])/.test(html),
     (html.match(/<(?!\/?(h[1-6]|p|ul|ol|li|code|pre|em|strong|del|a|blockquote|hr|table|thead|tbody|tr|th|td|span|mark)[ >/])[^>]{0,40}/g) || []).slice(0, 3).join(' | '));
   const secs = MD.sections(src);
-  const rawSecs = src.split('\n').filter(l => /^##\s+\S/.test(l)).length;
+  // sections() now covers H2-H4 (see below), not '##' alone
+  const rawSecs = src.split('\n').filter(l => /^#{2,4}\s+\S/.test(l)).length;
   check(name + ': section count matches ' + rawSecs, secs.length === rawSecs, secs.length);
   check(name + ': every section has an id in html', secs.every(s => html.indexOf('id="' + s.id + '"') >= 0));
   check(name + ': data-line present', /data-line="\d+"/.test(html));

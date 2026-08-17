@@ -404,7 +404,9 @@
       var date = s.verified
         ? '<span class="odate' + (d > STALE_DAYS ? ' stale' : '') + '">' + e(s.verified) + '</span>'
         : '';
-      return '<a href="#' + s.id + '">' + e(s.name) + ' ' + date + '</a>';
+      // level 2 sits at the outline's base indent; 3 and 4 step in from there
+      var indent = (s.level - 2) * 12;
+      return '<a href="#' + s.id + '" style="padding-left:' + (9 + indent) + 'px">' + e(s.name) + ' ' + date + '</a>';
     }).join('') + '</details>';
   }
 
@@ -579,7 +581,7 @@
       '<button data-p="pv" role="tab">Preview</button></div>' +
       (kind === 'd'
         ? '<input id="note" class="small" placeholder="note for this save (optional)" ' +
-          'maxlength="60" spellcheck="false" style="width:220px">'
+          'maxlength="60" spellcheck="false">'
         : '') +
       '<button class="btn primary" id="save">Save</button>' +
       '<button class="btn" id="close">Close</button></div></div>' +
@@ -730,7 +732,18 @@
     return {
       invalidate: function () { if (alive()) marks = null; },
       // after a re-render the preview would otherwise sit wherever it was
-      resync: function () { if (alive()) { marks = null; fromEditor(true); } }
+      resync: function () { if (alive()) { marks = null; fromEditor(true); } },
+      // used by the mobile pane switch (see $('seg') below): scroll the editor
+      // to a specific source line directly, via the same mirror measurement
+      // build() uses. The pixel-interpolated `marks` are no good for this --
+      // they get built while pv is display:none on mobile, so every pv offset
+      // captured at that point is zero and the mapping is garbage.
+      scrollToLine: function (line) {
+        if (!alive()) return;
+        var rows = measureLines();
+        var row = rows[line - 1];
+        ed.scrollTop = Math.max(0, (row ? row.offsetTop : 0) - 20);
+      }
     };
   }
 
@@ -791,14 +804,46 @@
       }
     });
 
-    // phone pane switcher; inert above 860px, where both panes are visible
+    // phone pane switcher; inert above 860px, where both panes are visible.
+    // A switch used to just flip data-only and leave scrollTop wherever it
+    // was, which is 0 the first time -- on a long doc, every single toggle
+    // dropped the reader back at the top. Now it carries the current line
+    // across: read from whichever pane is about to hide, land on it in the
+    // pane about to show.
     $('seg').addEventListener('click', function (ev) {
       var b = ev.target.closest('button[data-p]');
       if (!b) return;
-      $('split').setAttribute('data-only', b.getAttribute('data-p'));
+      var target = b.getAttribute('data-p');
+      if (target === $('split').getAttribute('data-only')) return;
+
+      if (target === 'pv') {
+        var caretLine = ed.value.slice(0, ed.selectionStart).split('\n').length;
+        $('split').setAttribute('data-only', 'pv');
+        preview();
+        var nodes = pv.querySelectorAll('[data-line]');
+        var best = null;
+        for (var i = 0; i < nodes.length; i++) {
+          if (parseInt(nodes[i].getAttribute('data-line'), 10) <= caretLine) best = nodes[i];
+          else break;
+        }
+        if (best) best.scrollIntoView({ block: 'start' });
+      } else {
+        // whichever block sits at the top of the (about to hide) preview
+        // becomes the editor's landing line
+        var pvTop = pv.getBoundingClientRect().top;
+        var pvNodes = pv.querySelectorAll('[data-line]');
+        var atLine = 1;
+        for (var j = 0; j < pvNodes.length; j++) {
+          if (pvNodes[j].getBoundingClientRect().top - pvTop <= 4) {
+            atLine = parseInt(pvNodes[j].getAttribute('data-line'), 10) || atLine;
+          } else break;
+        }
+        $('split').setAttribute('data-only', 'ed');
+        if (editorSync) editorSync.scrollToLine(atLine);
+      }
+
       var all = $('seg').querySelectorAll('button');
-      for (var i = 0; i < all.length; i++) all[i].classList.toggle('on', all[i] === b);
-      if (b.getAttribute('data-p') === 'pv') preview();
+      for (var k = 0; k < all.length; k++) all[k].classList.toggle('on', all[k] === b);
     });
 
     $('save').onclick = function () { doSave(kind, cat, isNew); };
@@ -826,8 +871,17 @@
     wrap.insertBefore(bar, wrap.querySelector('.split'));
 
     $('draft-use').onclick = function () {
-      $('ed').value = d.t;
-      $('ed').dispatchEvent(new Event('input'));
+      var ed = $('ed');
+      ed.focus();
+      ed.selectionStart = 0;
+      ed.selectionEnd = ed.value.length;
+      // same reasoning as the Tab handler above: execCommand keeps the
+      // browser's native undo stack, so restoring a draft does not silently
+      // erase whatever the user had just typed before they saw this banner
+      if (!document.execCommand || !document.execCommand('insertText', false, d.t)) {
+        ed.value = d.t;
+      }
+      ed.dispatchEvent(new Event('input'));
       setDirty(true);
       bar.parentNode.removeChild(bar);
       toast('Draft restored — not saved yet');
@@ -1169,11 +1223,19 @@
     return escaped.replace(re, '<mark>$1</mark>');
   }
 
-  $('search-form').addEventListener('submit', function (ev) {
-    ev.preventDefault();
+  function submitSearch() {
     var q = $('search-input').value.trim();
     if (q) location.hash = '#/search/' + encodeURIComponent(q);
+    else location.hash = '#/';
+  }
+  $('search-form').addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    submitSearch();
   });
+  // the native (X) on <input type=search> fires 'search', not 'input', when
+  // it clears the box -- without this, clicking it leaves the old results
+  // on screen with an empty box, which reads as broken rather than cleared
+  $('search-input').addEventListener('search', submitSearch);
 
   $('new-btn').addEventListener('click', function (ev) {
     ev.stopPropagation();
@@ -1189,8 +1251,11 @@
     closeDrawer();
     var h = location.hash.replace(/^#/, '');
 
-    // in-page anchor to a heading: let the browser handle it
-    if (/^h-\d/.test(h)) {
+    // in-page anchor to a heading: let the browser handle it. Ids are text-
+    // derived now (see md.js slug()), not line-derived, so they no longer
+    // reliably start with a digit -- 'h-' alone is what every route below
+    // never starts with, so it is what marks this as an anchor, not a route.
+    if (/^h-/.test(h)) {
       var target = document.getElementById(h);
       if (target) target.scrollIntoView({ block: 'start' });
       return;

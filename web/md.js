@@ -28,9 +28,20 @@ window.MD = (function () {
     });
   }
 
-  function slug(s, n) {
-    var base = String(s).toLowerCase().replace(/[^\w一-鿿]+/g, '-').replace(/^-|-$/g, '');
-    return 'h-' + n + (base ? '-' + base.slice(0, 40) : '');
+  // Text-derived, not line-derived: an id used to be 'h-<line>-<text>', so
+  // editing anything above a heading silently changed every id below it and
+  // broke every existing link to that section. Same text now always yields
+  // the same id, and only an actual duplicate heading gets a '-2', '-3', ...
+  // suffix -- `seen` is one counter map per render()/sections() call, so two
+  // calls over the same document produce the same ids independently.
+  function slug(s, seen) {
+    var base = String(s).toLowerCase().replace(/[^\w一-鿿]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
+    var id = base ? 'h-' + base : 'h-section';
+    if (seen) {
+      var n = (seen[id] = (seen[id] || 0) + 1);
+      if (n > 1) id += '-' + n;
+    }
+    return id;
   }
 
   function link(url, text) {
@@ -98,19 +109,31 @@ window.MD = (function () {
     });
   }
 
-  /* section list (also used for the outline) ------------------------------ */
+  /* section list (also used for the outline) -------------------------------
+   * Scans every heading line (## through ######, same as render()'s HEADING
+   * match) so the `seen` dedup counter stays in lockstep with the ids render()
+   * assigns -- an H1 or H5 sharing text with a later H3 still has to consume
+   * a slot in the counter, even though only H2-H4 are emitted here as outline
+   * entries. Levels 2-4 only: the client-side outline covers section-shaped
+   * headings, not the document title (H1) or deep sub-points (H5/H6). This is
+   * the browser's own outline -- main.py's server-side sections_of() stays
+   * '##'-only, its own contract for /memory/index and search attribution. */
   function sections(text) {
     var lines = String(text).split('\n');
     var out = [];
+    var seen = {};
     for (var i = 0; i < lines.length; i++) {
-      var m = /^##\s+(.*?)\s*$/.exec(lines[i]);
+      var m = HEADING.exec(lines[i]);
       if (!m) continue;
+      var lvl = m[1].length;
+      var id = slug(m[2], seen);
+      if (lvl < 2 || lvl > 4) continue;
       var verified = null;
       for (var j = i + 1; j < Math.min(i + 3, lines.length); j++) {
         var v = VERIFIED.exec(lines[j]);
         if (v) { verified = v[1]; break; }
       }
-      out.push({ name: m[1], verified: verified, line: i + 1, id: slug(m[1], i + 1) });
+      out.push({ name: m[2], verified: verified, line: i + 1, id: id, level: lvl });
     }
     return out;
   }
@@ -136,6 +159,7 @@ window.MD = (function () {
     var html = [];
     var para = [];
     var paraLine = 0;
+    var headSeen = {};    // heading-id dedup counter -- see slug()
     var listStack = [];   // [{indent, tag}]
     var lastHeading = -1; // index in html[] of the heading tag still open to a badge
     var lastHeadingLine = -1;
@@ -192,7 +216,7 @@ window.MD = (function () {
       if ((m = HEADING.exec(line))) {
         flushAll();
         var lvl = Math.min(m[1].length, 4);
-        html.push('<h' + lvl + ' id="' + slug(m[2], n) + '" data-line="' + n + '">' +
+        html.push('<h' + lvl + ' id="' + slug(m[2], headSeen) + '" data-line="' + n + '">' +
           inline(m[2], known) + '</h' + lvl + '>');
         lastHeading = html.length - 1;
         lastHeadingLine = n;
