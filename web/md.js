@@ -13,7 +13,7 @@
 window.MD = (function () {
   'use strict';
 
-  var VERIFIED = /^\s*<!--\s*verified:\s*(\d{4}-\d{2}-\d{2})\s*-->\s*$/;
+  var VERIFIED = /^\s*<!--\s*verified:\s*(\d{4}-\d{2}-\d{2}|never)\s*-->\s*$/;
   var COMMENT = /^\s*<!--[\s\S]*?-->\s*$/;
   var HEADING = /^(#{1,6})\s+(.*?)\s*#*\s*$/;
   var BULLET = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/;
@@ -145,6 +145,10 @@ window.MD = (function () {
   }
 
   function badge(date, staleDays) {
+    // 'never' means this fact doesn't rot -- never styled stale, no age shown.
+    if (date === 'never') {
+      return ' <span class="vbadge pill">stable</span>';
+    }
     var d = daysSince(date);
     var cls = d !== null && d > staleDays ? 'pill stale' : 'pill';
     return ' <span class="vbadge ' + cls + '">verified ' + esc(date) + '</span>';

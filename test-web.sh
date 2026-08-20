@@ -529,6 +529,31 @@ check "GET /memory/search default scope is still stable" "$before" "$after"
 case "$after" in *'"kind"'*) echo "FAIL: default-scope search leaked a kind key (after sections/pins)"; FAIL=$((FAIL+1)) ;;
   *) echo "PASS: default-scope search still has no kind key (after sections/pins)"; PASS=$((PASS+1)) ;; esac
 
+echo "=== 11. verified: never marker ==="
+VERCAT="webui-test-verified"
+curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $TOKEN" -H "If-Match: *" "$BASE/memory/$VERCAT"
+VERFILE=$(mktemp)
+printf '## Permanent\n<!-- verified: never -->\n\n- does not rot\n\n## Fresh\n<!-- verified: 2026-08-01 -->\n\n- recently checked\n\n## Unmarked\n\n- no marker at all\n' > "$VERFILE"
+code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "If-None-Match: *" --data-binary @"$VERFILE" "$BASE/memory/$VERCAT")
+check "seed verified-never category" 200 "$code"
+
+idx=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/index")
+verified_field=$(echo "$idx" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+e = [c for c in d if c['category'] == '$VERCAT']
+secs = {s['name']: s['verified'] for s in e[0]['sections']} if e else {}
+print(json.dumps(secs, sort_keys=True))
+")
+check "index reports verified: never for the Permanent section" \
+  '{"Fresh": "2026-08-01", "Permanent": "never", "Unmarked": null}' "$verified_field"
+
+code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Bearer $TOKEN" \
+  -H "If-Match: *" "$BASE/memory/$VERCAT")
+check "verified-never scratch category deleted" 200 "$code"
+rm -f "$VERFILE"
+
 echo "=== cleanup ==="
 code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Bearer $TOKEN" \
   -H "If-Match: *" "$BASE/memory/$CAT")

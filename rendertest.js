@@ -142,6 +142,18 @@ check('fresh verified badge', /verified 2026-07-27<\/span><\/h2>/.test(ver), ver
 check('stale verified badge marked', /pill stale">verified 2020-01-01/.test(ver), ver);
 check('other comments dropped', MD.render('<!-- hi -->\ntext').indexOf('hi') === -1);
 
+/* --- 'never' verified marker: renders 'stable', never styled stale ------ */
+const never = MD.render('## Permanent\n<!-- verified: never -->\n\nbody\n\n## Fresh\n<!-- verified: 2026-07-27 -->\n\nx\n\n## Old\n<!-- verified: 2020-01-01 -->\n\ny');
+check('never marker renders a stable badge', /class="vbadge pill">stable<\/span><\/h2>/.test(never), never);
+check('never marker is never styled stale', !/pill stale">stable/.test(never), never);
+// a dated section elsewhere in the same document still renders as today
+check('dated section next to a never section: fresh badge unaffected', /verified 2026-07-27<\/span><\/h2>/.test(never), never);
+check('dated section next to a never section: stale badge still marked', /pill stale">verified 2020-01-01/.test(never), never);
+
+const neverSecs = MD.sections('## Permanent\n<!-- verified: never -->\n\nbody');
+check("sections() reports verified: 'never' for a never-marked heading",
+  neverSecs.length === 1 && neverSecs[0].verified === 'never', JSON.stringify(neverSecs));
+
 /* --- structure balance on documents -------------------------------------
  * fixtures/ is the committed synthetic corpus. Real categories dropped beside
  * this file are picked up too when present, but are gitignored -- the tests

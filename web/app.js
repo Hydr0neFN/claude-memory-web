@@ -400,10 +400,14 @@
     var open = window.matchMedia('(min-width: 1001px)').matches ? ' open' : '';
     return '<details class="outline"' + open + '><summary>Jump to section (' + secs.length +
       ')</summary><h4>Sections</h4>' + secs.map(function (s) {
-      var d = s.verified ? MD.daysSince(s.verified) : null;
-      var date = s.verified
-        ? '<span class="odate' + (d > STALE_DAYS ? ' stale' : '') + '">' + e(s.verified) + '</span>'
-        : '';
+      // 'never' means this fact doesn't rot -- shown as 'stable', never styled stale.
+      var date = '';
+      if (s.verified === 'never') {
+        date = '<span class="odate">stable</span>';
+      } else if (s.verified) {
+        var d = MD.daysSince(s.verified);
+        date = '<span class="odate' + (d > STALE_DAYS ? ' stale' : '') + '">' + e(s.verified) + '</span>';
+      }
       // level 2 sits at the outline's base indent; 3 and 4 step in from there
       var indent = (s.level - 2) * 12;
       return '<a href="#' + s.id + '" style="padding-left:' + (9 + indent) + 'px">' + e(s.name) + ' ' + date + '</a>';
