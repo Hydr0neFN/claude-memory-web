@@ -227,6 +227,157 @@ code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Beare
   -H "If-Match: *" "$BASE/docs/$DOC")
 check "scratch doc deleted" 200 "$code"
 
+echo "=== 8. section-level read/write ==="
+SECFILE=$(mktemp); SECBODY=$(mktemp); PRECAT=$(mktemp); POSTCAT=$(mktemp)
+curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $TOKEN" -H "If-Match: *" "$BASE/memory/$CAT"
+printf '## Alpha\n\n- one\n- two\n\n## Beta\n\n- three\n\n## Gamma\n\n- four\n' > "$SECFILE"
+code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "If-None-Match: *" --data-binary @"$SECFILE" "$BASE/memory/$CAT")
+check "seed section category" 200 "$code"
+# the rev to combine with ?section= below, further down: the seed commit
+# just made, which is guaranteed to actually contain 'Alpha' -- the oldest
+# entry in this category's full history predates this section (it's from
+# section 1/3's unrelated "## Scratch" seed) and would 404 legitimately.
+SEED_REV=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT/history" \
+  | grep -o '"sha": *"[0-9a-f]*"' | head -1 | grep -o '[0-9a-f]\{40\}')
+
+curl -s -D "$HDR" -o "$BODY" -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT" >/dev/null
+WHOLE_ETAG=$(etag_of "$HDR")
+
+curl -s -D "$HDR" -o "$BODY" -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT?section=Beta" >/dev/null
+check "section read returns exactly that block" "$(printf '## Beta\n\n- three')" "$(cat "$BODY")"
+check "section GET carries the whole-file ETag" "$WHOLE_ETAG" "$(etag_of "$HDR")"
+XSEC=$(grep -i '^x-memory-section:' "$HDR" | tr -d '\r' | sed 's/^[Xx]-[Mm]emory-[Ss]ection: *//')
+check "X-Memory-Section echoes the resolved name" "Beta" "$XSEC"
+
+code=$(curl -s -o "$BODY" -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT?section=Nope")
+check "unknown section 404s" 404 "$code"
+contains "404 names the available sections" "Alpha, Beta, Gamma" "$(cat "$BODY")"
+
+# rest-of-file byte-identical: capture the Alpha/Gamma bytes before a Beta
+# edit, then diff the same bytes after.
+before_alpha=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT?section=Alpha")
+before_gamma=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT?section=Gamma")
+printf '## Beta\n\n- three EDITED\n' > "$SECBODY"
+code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "If-Match: $WHOLE_ETAG" --data-binary @"$SECBODY" "$BASE/memory/$CAT?section=Beta")
+check "section write with current whole-file etag" 200 "$code"
+after_alpha=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT?section=Alpha")
+after_gamma=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT?section=Gamma")
+check "section write leaves Alpha byte-identical" "$before_alpha" "$after_alpha"
+check "section write leaves Gamma byte-identical" "$before_gamma" "$after_gamma"
+edited=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT?section=Beta")
+contains "edited section reflects the new body" "three EDITED" "$edited"
+
+msg=$(git -c safe.directory='*' -C data log -1 --format=%s)
+contains "commit subject carries #<section>" "$CAT#Beta" "$msg"
+
+code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN" \
+  --data-binary @"$SECBODY" "$BASE/memory/$CAT?section=Beta")
+check "section write without precondition still 428s" 428 "$code"
+code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "If-Match: 0000000000000000000000000000000000000000" \
+  --data-binary @"$SECBODY" "$BASE/memory/$CAT?section=Beta")
+check "section write with stale etag still 409s" 409 "$code"
+
+# rename: differing heading in the PUT body renames the section.
+curl -s -D "$HDR" -o /dev/null -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT" >/dev/null
+ETAG=$(etag_of "$HDR")
+printf '## Delta\n\n- four renamed\n' > "$SECBODY"
+code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "If-Match: $ETAG" --data-binary @"$SECBODY" "$BASE/memory/$CAT?section=Gamma")
+check "rename via differing heading" 200 "$code"
+msg=$(git -c safe.directory='*' -C data log -1 --format=%s)
+contains "commit subject uses the new (post-rename) name" "$CAT#Delta" "$msg"
+code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT?section=Gamma")
+check "old section name is gone after rename" 404 "$code"
+code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT?section=Delta")
+check "new section name resolves after rename" 200 "$code"
+
+# upsert: absent section 404s without ?mode=upsert, appends with it.
+curl -s -D "$HDR" -o /dev/null -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT" >/dev/null
+ETAG=$(etag_of "$HDR")
+printf '## Epsilon\n\n- new one\n' > "$SECBODY"
+code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "If-Match: $ETAG" --data-binary @"$SECBODY" "$BASE/memory/$CAT?section=Epsilon")
+check "missing section without upsert 404s" 404 "$code"
+code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "If-Match: $ETAG" --data-binary @"$SECBODY" "$BASE/memory/$CAT?section=Epsilon&mode=upsert")
+check "upsert appends the missing section" 200 "$code"
+appended=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT?section=Epsilon")
+contains "appended section is readable back" "new one" "$appended"
+
+# DELETE removes just that section, rest untouched.
+before_alpha=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT?section=Alpha")
+curl -s -D "$HDR" -o /dev/null -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT" >/dev/null
+ETAG=$(etag_of "$HDR")
+code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Bearer $TOKEN" \
+  -H "If-Match: $ETAG" "$BASE/memory/$CAT?section=Epsilon")
+check "DELETE ?section= removes the section" 200 "$code"
+code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT?section=Epsilon")
+check "deleted section is gone" 404 "$code"
+after_alpha=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT?section=Alpha")
+check "DELETE ?section= leaves Alpha byte-identical" "$before_alpha" "$after_alpha"
+msg=$(git -c safe.directory='*' -C data log -1 --format=%s)
+contains "DELETE commit subject carries #<section>" "$CAT#Epsilon" "$msg"
+
+curl -s -D "$HDR" -o /dev/null -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT" >/dev/null
+ETAG=$(etag_of "$HDR")
+code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Bearer $TOKEN" \
+  -H "If-Match: $ETAG" "$BASE/memory/$CAT?section=Nope")
+check "DELETE unknown section 404s" 404 "$code"
+
+# ?section= combined with ?rev= -- SEED_REV is the section-8 seed commit,
+# which is known to contain 'Alpha' (see where it's captured, above).
+if [ -n "$SEED_REV" ]; then
+  old=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT?section=Alpha&rev=$SEED_REV")
+  code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT?section=Alpha&rev=$SEED_REV")
+  check "?section= combined with ?rev=" 200 "$code"
+  contains "?section=&?rev= returns that revision's section body" "- one" "$old"
+else
+  echo "FAIL: could not resolve SEED_REV for section+rev test"; FAIL=$((FAIL+1))
+fi
+
+# 400: section body must start with its own '## ' heading
+curl -s -D "$HDR" -o /dev/null -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT" >/dev/null
+ETAG=$(etag_of "$HDR")
+code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "If-Match: $ETAG" --data-binary $'not a heading\n' "$BASE/memory/$CAT?section=Alpha")
+check "section body without a '## ' heading is rejected" 400 "$code"
+
+rm -f "$SECFILE" "$SECBODY" "$PRECAT" "$POSTCAT"
+
+echo "=== 9. /memory/pins ==="
+PINCAT="webui-test-pins"
+curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $TOKEN" -H "If-Match: *" "$BASE/memory/$PINCAT"
+PINFILE=$(mktemp)
+printf '## Notes\n\n<!-- pin: retracted -->\n- old claim, superseded\n\n## Legacy\n\nRETRACTED: the earlier approach failed.\n' > "$PINFILE"
+code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "If-None-Match: *" --data-binary @"$PINFILE" "$BASE/memory/$PINCAT")
+check "seed pins category" 200 "$code"
+
+code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$BASE/memory/pins")
+check "GET /memory/pins" 200 "$code"
+pins=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/pins")
+contains "finds the explicit pin marker" "\"category\":\"$PINCAT\",\"section\":\"Notes\",\"line\":4,\"kind\":\"retracted\"" \
+  "$(echo "$pins" | tr -d ' \n')"
+contains "finds the legacy prose marker" "\"category\":\"$PINCAT\",\"section\":\"Legacy\"" "$(echo "$pins" | tr -d ' \n')"
+contains "legacy marker is flagged legacy:true" "\"legacy\":true" "$(echo "$pins" | tr -d ' \n')"
+
+code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Bearer $TOKEN" \
+  -H "If-Match: *" "$BASE/memory/$PINCAT")
+check "pins scratch category deleted" 200 "$code"
+rm -f "$PINFILE"
+
+echo "=== 10. regressions still hold after sections/pins ==="
+code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT")
+check "GET /memory/\$CAT with no ?section is still 200 (byte-identical code path)" 200 "$code"
+before=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/search?q=memory")
+after=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/search?q=memory")
+check "GET /memory/search default scope is still stable" "$before" "$after"
+case "$after" in *'"kind"'*) echo "FAIL: default-scope search leaked a kind key (after sections/pins)"; FAIL=$((FAIL+1)) ;;
+  *) echo "PASS: default-scope search still has no kind key (after sections/pins)"; PASS=$((PASS+1)) ;; esac
+
 echo "=== cleanup ==="
 code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Bearer $TOKEN" \
   -H "If-Match: *" "$BASE/memory/$CAT")

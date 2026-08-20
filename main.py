@@ -27,6 +27,18 @@ VERIFIED_RE = re.compile(r"<!--\s*verified:\s*(\d{4}-\d{2}-\d{2})\s*-->")
 DOC_REF_RE = re.compile(r"\[\[doc:([a-z][a-z0-9-]*)\]\]")
 ACTOR_RE = re.compile(r"^[\w./ -]{1,40}$")
 NOTE_CTRL_RE = re.compile(r"[\x00-\x1f]")
+PIN_MARKER_RE = re.compile(r"<!--\s*pin:\s*([a-z][a-z0-9-]*)\s*-->", re.IGNORECASE)
+LEGACY_PIN_RE = re.compile(
+    r"\b(RETRACTED|CORRECTED|do not re-litigate|do not re-offer|do not re-open)\b",
+    re.IGNORECASE,
+)
+LEGACY_PIN_KIND = {
+    "retracted": "retracted",
+    "corrected": "corrected",
+    "do not re-litigate": "do-not-relitigate",
+    "do not re-offer": "do-not-reoffer",
+    "do not re-open": "do-not-reopen",
+}
 
 SEARCH_LIMIT_DEFAULT = 20
 SEARCH_LIMIT_MAX = 100
@@ -275,6 +287,97 @@ def section_body(lines: list, idx: int) -> str:
     return "\n".join(lines[start:end]).strip()
 
 
+def find_section_start(lines: list, name: str):
+    """Line index of the '## ' header whose (trimmed) name matches exactly,
+    or None if no such section exists."""
+    for i, line in enumerate(lines):
+        m = SECTION_RE.match(line)
+        if m and m.group(1) == name:
+            return i
+    return None
+
+
+def find_section_bounds(lines: list, name: str):
+    """(start, end) line-index bounds of the named '## ' section, end
+    exclusive (next '## ' header or EOF). None if the section is absent."""
+    start = find_section_start(lines, name)
+    if start is None:
+        return None
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if SECTION_RE.match(lines[j]):
+            end = j
+            break
+    return start, end
+
+
+def section_not_found(text: str, name: str) -> HTTPException:
+    available = [s["name"] for s in sections_of(text)]
+    return HTTPException(
+        status_code=404,
+        detail="section '%s' not found; available sections: %s" % (name, ", ".join(available)),
+    )
+
+
+def section_response(body: str, name: str, headers: dict) -> PlainTextResponse:
+    """The named '## ' section's full text (heading line through EOF/next
+    header), under the whole-file ETag passed in via headers."""
+    lines = body.splitlines()
+    idx = find_section_start(lines, name)
+    if idx is None:
+        raise section_not_found(body, name)
+    out_headers = dict(headers)
+    out_headers["X-Memory-Section"] = name
+    return PlainTextResponse(section_body(lines, idx), headers=out_headers)
+
+
+def scan_pins() -> list:
+    """Every retraction/decision marker across /memory: explicit
+    '<!-- pin: kind -->' comments, plus the legacy prose forms that predate
+    them (RETRACTED, CORRECTED, "do not re-litigate/re-offer/re-open")."""
+    out = []
+    for path in sorted(DATA_DIR.glob("*.md")):
+        text = path.read_text(encoding="utf-8")
+        lines = text.splitlines()
+        for i, line in enumerate(lines):
+            m = PIN_MARKER_RE.search(line)
+            if m:
+                kind = m.group(1).lower()
+                stripped = PIN_MARKER_RE.sub("", line).strip()
+                if stripped:
+                    claim_idx = i
+                elif i + 1 < len(lines) and lines[i + 1].strip():
+                    claim_idx = i + 1
+                elif i - 1 >= 0 and lines[i - 1].strip():
+                    claim_idx = i - 1
+                else:
+                    claim_idx = i
+                out.append(
+                    {
+                        "category": path.stem,
+                        "section": section_at(lines, claim_idx),
+                        "line": claim_idx + 1,
+                        "kind": kind,
+                        "text": lines[claim_idx].strip(),
+                    }
+                )
+                continue
+            lm = LEGACY_PIN_RE.search(line)
+            if lm:
+                phrase = lm.group(1).lower()
+                out.append(
+                    {
+                        "category": path.stem,
+                        "section": section_at(lines, i),
+                        "line": i + 1,
+                        "kind": LEGACY_PIN_KIND.get(phrase, phrase.replace(" ", "-")),
+                        "text": line.strip(),
+                        "legacy": True,
+                    }
+                )
+    return out
+
+
 # --------------------------------------------------------------------------
 # auth routes — the browser trades the bearer token for a session cookie once
 # --------------------------------------------------------------------------
@@ -411,6 +514,15 @@ def search(
     return JSONResponse(hits)
 
 
+@app.get("/memory/pins")
+def pins(request: Request):
+    """Machine-readable retraction/decision markers across the whole store.
+    Declared above /memory/{category} so 'pins' is never parsed as a
+    category name."""
+    check_auth(request)
+    return JSONResponse(scan_pins())
+
+
 def history_of(rel: str, path: Path, limit: int) -> list:
     try:
         log = git(
@@ -449,7 +561,7 @@ def history(category: str, request: Request, limit: int = 50):
 
 
 @app.get("/memory/{category}")
-def get_category(category: str, request: Request, rev: str = ""):
+def get_category(category: str, request: Request, rev: str = "", section: str = ""):
     check_auth(request)
     path = validate_category(category)
 
@@ -459,39 +571,90 @@ def get_category(category: str, request: Request, rev: str = ""):
         show = git("show", "%s:%s" % (rev, path.name), check=False)
         if show.returncode != 0:
             raise HTTPException(status_code=404, detail="rev or path not found")
-        return PlainTextResponse(
-            show.stdout,
-            headers={"ETag": '"%s"' % blob_sha(show.stdout.encode("utf-8")),
-                     "X-Memory-Rev": rev},
-        )
+        headers = {"ETag": '"%s"' % blob_sha(show.stdout.encode("utf-8")), "X-Memory-Rev": rev}
+        if section:
+            return section_response(show.stdout, section, headers)
+        return PlainTextResponse(show.stdout, headers=headers)
 
     if not path.exists():
         raise HTTPException(status_code=404, detail="not found")
     body = path.read_text(encoding="utf-8")
-    return PlainTextResponse(body, headers={"ETag": '"%s"' % blob_sha(body.encode("utf-8"))})
+    headers = {"ETag": '"%s"' % blob_sha(body.encode("utf-8"))}
+    if section:
+        return section_response(body, section, headers)
+    return PlainTextResponse(body, headers=headers)
 
 
 @app.put("/memory/{category}")
-async def put_category(category: str, request: Request):
+async def put_category(category: str, request: Request, section: str = "", mode: str = ""):
     check_write_auth(request)
     path = validate_category(category)
     require_precondition(path, request)
 
-    body = await request.body()
+    raw_body = await request.body()
+
+    if section:
+        if not path.exists():
+            raise HTTPException(status_code=404, detail="not found")
+        block_text = raw_body.decode("utf-8")
+        block_lines = block_text.splitlines()
+        heading = SECTION_RE.match(block_lines[0]) if block_lines else None
+        if not heading:
+            raise HTTPException(
+                status_code=400, detail="section body must start with a '## ' heading line"
+            )
+        new_name = heading.group(1)
+
+        text = path.read_text(encoding="utf-8")
+        lines = text.splitlines()
+        bounds = find_section_bounds(lines, section)
+        if bounds is None:
+            if mode != "upsert":
+                raise section_not_found(text, section)
+            new_lines = lines + ([""] if lines and lines[-1] != "" else []) + block_lines
+        else:
+            start, end = bounds
+            new_lines = lines[:start] + block_lines + lines[end:]
+
+        new_text = "\n".join(new_lines)
+        if not new_text.endswith("\n"):
+            new_text += "\n"
+        path.write_text(new_text, encoding="utf-8")
+        out_body = new_text.encode("utf-8")
+        git_commit(commit_subject("PUT", "%s#%s" % (category, new_name), request))
+        return PlainTextResponse("OK", headers={"ETag": '"%s"' % blob_sha(out_body)})
+
     existed = path.exists()
-    path.write_text(body.decode("utf-8"), encoding="utf-8")
+    path.write_text(raw_body.decode("utf-8"), encoding="utf-8")
     git_commit(commit_subject("PUT" if existed else "CREATE", category, request))
 
-    return PlainTextResponse("OK", headers={"ETag": '"%s"' % blob_sha(body)})
+    return PlainTextResponse("OK", headers={"ETag": '"%s"' % blob_sha(raw_body)})
 
 
 @app.delete("/memory/{category}")
-def delete_category(category: str, request: Request):
+def delete_category(category: str, request: Request, section: str = ""):
     check_write_auth(request)
     path = validate_category(category)
     if not path.exists():
         raise HTTPException(status_code=404, detail="not found")
     require_precondition(path, request)
+
+    if section:
+        text = path.read_text(encoding="utf-8")
+        lines = text.splitlines()
+        bounds = find_section_bounds(lines, section)
+        if bounds is None:
+            raise section_not_found(text, section)
+        start, end = bounds
+        new_lines = lines[:start] + lines[end:]
+        new_text = "\n".join(new_lines)
+        if new_text and not new_text.endswith("\n"):
+            new_text += "\n"
+        path.write_text(new_text, encoding="utf-8")
+        git_commit(commit_subject("DELETE", "%s#%s" % (category, section), request))
+        return PlainTextResponse(
+            "OK", headers={"ETag": '"%s"' % blob_sha(new_text.encode("utf-8"))}
+        )
 
     path.unlink()
     git_commit(commit_subject("DELETE", category, request))

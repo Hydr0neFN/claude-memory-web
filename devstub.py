@@ -16,6 +16,18 @@ SECTION_RE = re.compile(r"^##\s+(.*?)\s*$")
 TITLE_RE = re.compile(r"^#(?!#)\s+(.*?)\s*$")
 VERIFIED_RE = re.compile(r"<!--\s*verified:\s*(\d{4}-\d{2}-\d{2})\s*-->")
 DOC_REF_RE = re.compile(r"\[\[doc:([a-z][a-z0-9-]*)\]\]")
+PIN_MARKER_RE = re.compile(r"<!--\s*pin:\s*([a-z][a-z0-9-]*)\s*-->", re.IGNORECASE)
+LEGACY_PIN_RE = re.compile(
+    r"\b(RETRACTED|CORRECTED|do not re-litigate|do not re-offer|do not re-open)\b",
+    re.IGNORECASE,
+)
+LEGACY_PIN_KIND = {
+    "retracted": "retracted",
+    "corrected": "corrected",
+    "do not re-litigate": "do-not-relitigate",
+    "do not re-offer": "do-not-reoffer",
+    "do not re-open": "do-not-reopen",
+}
 
 # category -> markdown, seeded from the real fixtures
 STORE = {}
@@ -97,6 +109,81 @@ def doc_refs_of(text):
         if slug not in seen:
             seen.add(slug)
             out.append(slug)
+    return out
+
+
+def find_section_start(lines, name):
+    for i, line in enumerate(lines):
+        m = SECTION_RE.match(line)
+        if m and m.group(1) == name:
+            return i
+    return None
+
+
+def find_section_bounds(lines, name):
+    start = find_section_start(lines, name)
+    if start is None:
+        return None
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if SECTION_RE.match(lines[j]):
+            end = j
+            break
+    return start, end
+
+
+def section_body(lines, idx):
+    start = 0
+    for i in range(idx, -1, -1):
+        if SECTION_RE.match(lines[i]):
+            start = i
+            break
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if SECTION_RE.match(lines[j]):
+            end = j
+            break
+    return "\n".join(lines[start:end]).strip()
+
+
+def section_at(lines, idx):
+    for i in range(idx, -1, -1):
+        m = SECTION_RE.match(lines[i])
+        if m:
+            return m.group(1)
+    return ""
+
+
+def scan_pins(store):
+    out = []
+    for cat, text in sorted(store.items()):
+        lines = text.splitlines()
+        for i, line in enumerate(lines):
+            m = PIN_MARKER_RE.search(line)
+            if m:
+                kind = m.group(1).lower()
+                stripped = PIN_MARKER_RE.sub("", line).strip()
+                if stripped:
+                    claim_idx = i
+                elif i + 1 < len(lines) and lines[i + 1].strip():
+                    claim_idx = i + 1
+                elif i - 1 >= 0 and lines[i - 1].strip():
+                    claim_idx = i - 1
+                else:
+                    claim_idx = i
+                out.append({
+                    "category": cat, "section": section_at(lines, claim_idx),
+                    "line": claim_idx + 1, "kind": kind, "text": lines[claim_idx].strip(),
+                })
+                continue
+            lm = LEGACY_PIN_RE.search(line)
+            if lm:
+                phrase = lm.group(1).lower()
+                out.append({
+                    "category": cat, "section": section_at(lines, i), "line": i + 1,
+                    "kind": LEGACY_PIN_KIND.get(phrase, phrase.replace(" ", "-")),
+                    "text": line.strip(), "legacy": True,
+                })
     return out
 
 
@@ -196,6 +283,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                                          "snippet": line.strip()[:240]})
             return self._json(hits[:100])
 
+        if p == "/memory/pins":
+            return self._json(scan_pins(STORE))
+
         m = re.match(r"^/memory/([a-z0-9-]+)/history$", p)
         if m:
             return self._json(HISTORY)
@@ -205,10 +295,24 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             cat = m.group(1)
             if q.get("rev"):
                 body = STORE.get(cat, "") + "\n\n## Removed in a later revision\n\n- old fact\n"
-                return self._text(body, headers={"ETag": '"%s"' % blob_sha(body)})
-            if cat not in STORE:
+            elif cat not in STORE:
                 return self._json({"detail": "not found"}, 404)
-            return self._text(STORE[cat], headers={"ETag": '"%s"' % blob_sha(STORE[cat])})
+            else:
+                body = STORE[cat]
+            headers = {"ETag": '"%s"' % blob_sha(body)}
+            section = (q.get("section", [""])[0])
+            if section:
+                lines = body.splitlines()
+                idx = find_section_start(lines, section)
+                if idx is None:
+                    return self._json(
+                        {"detail": "section '%s' not found; available sections: %s" % (
+                            section, ", ".join(s["name"] for s in sections_of(body)))},
+                        404,
+                    )
+                headers["X-Memory-Section"] = section
+                return self._text(section_body(lines, idx), headers=headers)
+            return self._text(body, headers=headers)
 
         if p == "/docs":
             return self._json(sorted(DOCS))
@@ -251,16 +355,18 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         return self._json({"detail": "not found"}, 404)
 
     def do_PUT(self):
-        path = urllib.parse.urlparse(self.path).path
-        m = re.match(r"^/memory/([a-z0-9-]+)$", path)
+        u = urllib.parse.urlparse(self.path)
+        q = urllib.parse.parse_qs(u.query)
+        m = re.match(r"^/memory/([a-z0-9-]+)$", u.path)
         if m:
-            return self._put(m.group(1), STORE)
-        m = re.match(r"^/docs/([a-z0-9-]+)$", path)
+            return self._put(m.group(1), STORE, q)
+        m = re.match(r"^/docs/([a-z0-9-]+)$", u.path)
         if m:
-            return self._put(m.group(1), DOCS)
+            return self._put(m.group(1), DOCS, q)
         return self._json({"detail": "invalid name"}, 400)
 
-    def _put(self, name, store):
+    def _put(self, name, store, q=None):
+        q = q or {}
         if not self.headers.get("x-memory-actor"):
             return self._json({"detail": "X-Memory-Actor required"}, 403)
         body = self.rfile.read(int(self.headers.get("content-length", 0))).decode("utf-8")
@@ -272,16 +378,63 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if_match = self.headers.get("if-match")
         if name in store and if_match and if_match.strip('"') not in ("*", blob_sha(store[name])):
             return self._json({"detail": "etag mismatch"}, 409)
+
+        section = (q.get("section", [""])[0])
+        if section:
+            if name not in store:
+                return self._json({"detail": "not found"}, 404)
+            block_lines = body.splitlines()
+            if not block_lines or not SECTION_RE.match(block_lines[0]):
+                return self._json({"detail": "section body must start with a '## ' heading line"}, 400)
+            text = store[name]
+            lines = text.splitlines()
+            bounds = find_section_bounds(lines, section)
+            if bounds is None:
+                if (q.get("mode", [""])[0]) != "upsert":
+                    return self._json(
+                        {"detail": "section '%s' not found; available sections: %s" % (
+                            section, ", ".join(s["name"] for s in sections_of(text)))},
+                        404,
+                    )
+                new_lines = lines + ([""] if lines and lines[-1] != "" else []) + block_lines
+            else:
+                start, end = bounds
+                new_lines = lines[:start] + block_lines + lines[end:]
+            new_text = "\n".join(new_lines)
+            if not new_text.endswith("\n"):
+                new_text += "\n"
+            store[name] = new_text
+            return self._text("OK", headers={"ETag": '"%s"' % blob_sha(new_text)})
+
         store[name] = body
         return self._text("OK", headers={"ETag": '"%s"' % blob_sha(body)})
 
     def do_DELETE(self):
-        path = urllib.parse.urlparse(self.path).path
-        m = re.match(r"^/memory/([a-z0-9-]+)$", path)
+        u = urllib.parse.urlparse(self.path)
+        q = urllib.parse.parse_qs(u.query)
+        section = (q.get("section", [""])[0])
+        m = re.match(r"^/memory/([a-z0-9-]+)$", u.path)
         if m and m.group(1) in STORE:
+            if section:
+                text = STORE[m.group(1)]
+                lines = text.splitlines()
+                bounds = find_section_bounds(lines, section)
+                if bounds is None:
+                    return self._json(
+                        {"detail": "section '%s' not found; available sections: %s" % (
+                            section, ", ".join(s["name"] for s in sections_of(text)))},
+                        404,
+                    )
+                start, end = bounds
+                new_lines = lines[:start] + lines[end:]
+                new_text = "\n".join(new_lines)
+                if new_text and not new_text.endswith("\n"):
+                    new_text += "\n"
+                STORE[m.group(1)] = new_text
+                return self._text("OK", headers={"ETag": '"%s"' % blob_sha(new_text)})
             del STORE[m.group(1)]
             return self._text("OK")
-        m = re.match(r"^/docs/([a-z0-9-]+)$", path)
+        m = re.match(r"^/docs/([a-z0-9-]+)$", u.path)
         if m and m.group(1) in DOCS:
             del DOCS[m.group(1)]
             return self._text("OK")
