@@ -585,6 +585,58 @@ code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Beare
 check "verified-never scratch category deleted" 200 "$code"
 rm -f "$VERFILE"
 
+echo "=== 12. note encoding, git-commit visibility, reserved names ==="
+
+# -- B: non-ASCII --note round-trips instead of mangling/crashing. The CLI
+# percent-encodes X-Memory-Note (header values are latin-1); the server must
+# decode it back before it becomes commit text.
+NOTE_ENC=$(python3 -c "import urllib.parse; print(urllib.parse.quote('更新資料'))")
+code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "If-Match: *" -H "X-Memory-Note: $NOTE_ENC" --data-binary $'## Scratch\n- note test\n' "$BASE/memory/$CAT")
+check "PUT with percent-encoded non-ASCII note" 200 "$code"
+hist=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT/history?limit=1")
+contains "history shows decoded non-ASCII note text" "更新資料" "$hist"
+
+# -- B: a note that was never percent-encoded (a plain client, e.g. curl used
+# directly) must still round-trip unchanged, literal '%' included -- unquote()
+# must not corrupt an already-correct ASCII note.
+code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "If-Match: *" -H "X-Memory-Note: 100% done, not encoded" \
+  --data-binary $'## Scratch\n- note test 2\n' "$BASE/memory/$CAT")
+check "PUT with unencoded ASCII note containing a literal %" 200 "$code"
+hist=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT/history?limit=1")
+contains "history shows the literal-percent note unchanged" "100% done, not encoded" "$hist"
+
+# -- D: a normal write must not carry X-Memory-Commit: failed -- that header
+# exists to surface a *failed* git commit, and must be silent (or absent) on
+# the ordinary success path so it can't cry wolf.
+code=$(curl -s -D "$HDR" -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "If-Match: *" --data-binary $'## Scratch\n- normal write\n' "$BASE/memory/$CAT")
+check "normal write still 200" 200 "$code"
+commit_hdr=$(grep -i '^x-memory-commit:' "$HDR" || true)
+check "normal write carries no X-Memory-Commit: failed header" "" "$commit_hdr"
+
+# -- E: category/doc names that collide with a reserved route (index, search,
+# pins for /memory; index for /docs) must be rejected at write time, not
+# silently create an unreadable file behind the route that owns that name.
+for name in search index pins; do
+  curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $TOKEN" -H "If-Match: *" "$BASE/memory/$name"
+  code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN" \
+    -H "If-None-Match: *" --data-binary $'## Scratch\n- x\n' "$BASE/memory/$name")
+  check "PUT /memory/$name (reserved) rejected" 400 "$code"
+done
+curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $TOKEN" -H "If-Match: *" "$BASE/docs/index"
+code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "If-None-Match: *" --data-binary $'# Scratch\n- x\n' "$BASE/docs/index")
+check "PUT /docs/index (reserved) rejected" 400 "$code"
+# the real routes must still work afterwards -- nothing got wedged in behind them
+code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$BASE/memory/search?q=memory")
+check "GET /memory/search still serves the search endpoint" 200 "$code"
+code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$BASE/memory/index")
+check "GET /memory/index still serves the index endpoint" 200 "$code"
+code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$BASE/docs/index")
+check "GET /docs/index still serves the doc index endpoint" 200 "$code"
+
 echo "=== cleanup ==="
 code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Bearer $TOKEN" \
   -H "If-Match: *" "$BASE/memory/$CAT")

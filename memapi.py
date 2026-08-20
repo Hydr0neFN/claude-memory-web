@@ -130,7 +130,19 @@ UA = "claude-code-memapi/2.0"
 TOKEN_FILE = os.path.join(os.path.expanduser("~"), ".claude", ".memory-token")
 # ETag of the revision each category was last read at, so a write can prove it
 # was based on current content rather than silently clobbering a newer one.
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".claude", ".memcache")
+# Scoped per session on purpose. A single shared cache is worse than none:
+# with two agent sessions running on one machine, A's put refreshes the
+# shared entry, then B -- still holding the older revision -- sends A's
+# fresh ETag as If-Match, the server accepts it, and A's write is silently
+# destroyed with no 409. Demonstrated 2026-08-20. Override with
+# MEMORY_CACHE_SCOPE if you need two shells to share one read.
+CACHE_SCOPE = re.sub(
+    r"[^A-Za-z0-9_-]", "",
+    os.environ.get("MEMORY_CACHE_SCOPE")
+    or os.environ.get("CLAUDE_CODE_SESSION_ID")
+    or "shared",
+)[:64] or "shared"
+CACHE_DIR = os.path.join(os.path.expanduser("~"), ".claude", ".memcache", CACHE_SCOPE)
 
 # Protocol soft cap for one category. Advisory only -- see write().
 SOFT_CAP = 20480
@@ -256,11 +268,16 @@ def precondition(cat, force, is_doc=False):
     live = live_etag(cat, is_doc)
     if live is None:
         return {"If-None-Match": "*"}, None
+    # Refuse rather than warn. A write against a revision this client never
+    # read is the blind overwrite optimistic locking exists to prevent, and
+    # a stderr warning does not stop an agent that is not reading stderr.
     sys.stderr.write(
-        "warning: no cached ETag for '%s' — writing against its current state "
-        "without having read it in this session.\n" % cat
+        "refusing to write %r: nothing was read for it in this session, so this\n"
+        "  write is not based on anything this client saw. Run `memapi.py %sget %s`\n"
+        "  first and merge into what it returns, or pass --force to overwrite\n"
+        "  whatever is there now.\n" % (cat, "doc " if is_doc else "", cat)
     )
-    return {"If-Match": live}, live
+    raise SystemExit(4)
 
 
 def write(method, cat, data, force, is_doc=False, note=None, path=None, label=None):
@@ -272,7 +289,12 @@ def write(method, cat, data, force, is_doc=False, note=None, path=None, label=No
     label = label or cat
     headers, prior_etag = precondition(cat, force, is_doc)
     if note:
-        headers["X-Memory-Note"] = note
+        # HTTP header values are latin-1; a note in the user's own language
+        # (e.g. Chinese) isn't representable raw and used to crash here with
+        # UnicodeEncodeError. Percent-encode it; the server decodes it back
+        # before its existing sanitisation. quote()'s default safe='/' means
+        # an ASCII note round-trips as mostly-escaped-but-correct too.
+        headers["X-Memory-Note"] = urllib.parse.quote(note)
     target = path if path is not None else api_path(cat, is_doc)
     status, body, headers_out = call(method, target, data, headers)
     if status == 409:
@@ -288,13 +310,38 @@ def write(method, cat, data, force, is_doc=False, note=None, path=None, label=No
         raise SystemExit(1)
     key = cache_key(cat, is_doc)
     if method == "DELETE":
+        if path is not None:
+            # A --section delete (path overrides the target, see the
+            # docstring above) leaves the category itself alive and
+            # unchanged in every way except that one section -- dropping
+            # its whole-file cache entry here used to turn the very next
+            # legitimate write into a hard refusal (precondition() refuses
+            # rather than warns when nothing is cached). Re-cache the
+            # post-delete whole-file ETag instead of discarding it. A
+            # whole-category delete (path is None) still clears the cache
+            # below -- there, removal is correct: the category is gone.
+            new_etag = headers_out.get("ETag") or headers_out.get("etag")
+            if new_etag:
+                cache_etag(key, new_etag)
+            else:
+                try:
+                    os.remove(cache_path(key))
+                except OSError:
+                    pass
+        else:
+            try:
+                os.remove(cache_path(key))
+            except OSError:
+                pass
+    else:
+        new_etag = headers_out.get("ETag") or headers_out.get("etag")
+        # Deliberately NOT cached. A cache entry means "this client read
+        # this revision"; a write is not a read. Leaving the post-write
+        # ETag here is what let one writer hand its ETag to another.
         try:
             os.remove(cache_path(key))
         except OSError:
             pass
-    else:
-        new_etag = headers_out.get("ETag") or headers_out.get("etag")
-        cache_etag(key, new_etag)
         # A no-op PUT is correct HTTP (200, no error) and the server made no
         # commit -- both already right, nothing to fix server-side. But 200
         # alone reads as "I wrote something" unless the CLI says otherwise.
@@ -471,12 +518,36 @@ def print_stale_report(index_data, days):
 
 
 def take_flag_value(args, name):
-    """Pull '--name value' out of args, returning (value, remaining_args)."""
+    """Pull '--name value' out of args, returning (value, remaining_args).
+
+    A value can itself look like a flag (--note "--force" is a note whose
+    text is the string "--force") -- that's fine, it's taken verbatim.
+    What's not fine is the flag appearing with nothing after it at all
+    (memapi.py get personal --section); that used to be silently ignored,
+    which for --section meant the command quietly fell back to a whole-
+    category get instead of failing. Treat it as a usage error instead.
+    """
     if name in args:
         i = args.index(name)
-        if i + 1 < len(args):
-            return args[i + 1], args[:i] + args[i + 2:]
+        if i + 1 >= len(args):
+            sys.stderr.write("error: %s requires a value\n" % name)
+            raise SystemExit(2)
+        return args[i + 1], args[:i] + args[i + 2:]
     return None, args
+
+
+def read_or_die(method, path):
+    """GET-style call whose body is meant to go straight to stdout as data
+    for a caller to parse. A non-2xx used to be written to stdout with exit
+    0 anyway -- indistinguishable from real data to anything piping this
+    into a JSON parser. Print the error to stderr and fail the process
+    instead."""
+    status, body, _headers = call(method, path)
+    if status // 100 != 2:
+        sys.stderr.write("error: %s %s -> %s %s\n" % (method, path, status, body))
+        return 1
+    sys.stdout.write(body)
+    return 0
 
 
 def main(argv):
@@ -494,31 +565,57 @@ def main(argv):
             return 2
         return doc_main(args[0], args[1:])
 
-    force = "--force" in args
-    full = "--full" in args
-    upsert = "--upsert" in args
-    diff_flag = "--diff" in args
+    # A literal "--" ends flag parsing -- everything after it is taken as
+    # positional text, never scanned for flag names. That's the escape
+    # hatch for a search term that happens to collide with a flag name
+    # (e.g. `memapi.py search -- --full` searches for the literal string
+    # "--full" instead of enabling full mode).
+    if "--" in args:
+        sep = args.index("--")
+        args, literal_tail = args[:sep], args[sep + 1:]
+    else:
+        literal_tail = []
+
+    # Value flags are extracted FIRST, before any boolean flag is tested
+    # against what's left in args. Getting this backwards is what let
+    # `--note "--force"` be misread as the --force flag itself (its value
+    # was still sitting in args when "--force" in args was evaluated) and
+    # let `--note "--diff"` silently turn a write into a no-op dry run with
+    # no indication anything was skipped.
     scope, args = take_flag_value(args, "--scope")
     note, args = take_flag_value(args, "--note")
     section, args = take_flag_value(args, "--section")
     rename_to, args = take_flag_value(args, "--rename-to")
     rev, args = take_flag_value(args, "--rev")
     stale, args = take_flag_value(args, "--stale")
+
+    force = "--force" in args
+    full = "--full" in args
+    upsert = "--upsert" in args
+    diff_flag = "--diff" in args
     args = [a for a in args if a not in ("--force", "--full", "--upsert", "--diff")]
+    args = args + literal_tail
 
     if cmd == "list":
-        sys.stdout.write(call("GET", "/memory")[1])
+        return read_or_die("GET", "/memory")
     elif cmd == "index":
         if stale is not None:
+            try:
+                stale_days = int(stale)
+            except ValueError:
+                sys.stderr.write(
+                    "error: --stale expects an integer number of days, got %r\n" % stale
+                )
+                return 2
             status, body, _headers = call("GET", "/memory/index")
             if status != 200:
                 sys.stderr.write("error: GET /memory/index -> %s %s\n" % (status, body))
                 return 1
-            print_stale_report(json.loads(body), int(stale))
-        else:
-            sys.stdout.write(call("GET", "/memory/index")[1])
+            print_stale_report(json.loads(body), stale_days)
+            return 0
+        return read_or_die("GET", "/memory/index")
     elif cmd == "pins":
-        sys.stdout.write(call("GET", "/memory/pins")[1])
+        return read_or_die("GET", "/memory/pins")
     elif cmd == "sections":
         status, body, _headers = call("GET", "/memory/" + args[0])
         if status != 200:
@@ -546,9 +643,9 @@ def main(argv):
         params = {"q": " ".join(args), "full": 1 if full else 0}
         if scope:
             params["scope"] = scope
-        sys.stdout.write(call("GET", "/memory/search?" + urllib.parse.urlencode(params))[1])
+        return read_or_die("GET", "/memory/search?" + urllib.parse.urlencode(params))
     elif cmd == "history":
-        sys.stdout.write(call("GET", "/memory/%s/history" % args[0])[1])
+        return read_or_die("GET", "/memory/%s/history" % args[0])
     elif cmd == "put":
         body = io.open(args[1], encoding="utf-8", newline="").read().encode("utf-8")
         if diff_flag:
@@ -580,14 +677,22 @@ def main(argv):
 
 
 def doc_main(cmd, args):
-    force = "--force" in args
+    if "--" in args:
+        sep = args.index("--")
+        args, literal_tail = args[:sep], args[sep + 1:]
+    else:
+        literal_tail = []
+
+    # Value flag extracted before the boolean is tested, same reasoning as
+    # main() -- --note "--force" must not be misread as the --force flag.
     note, args = take_flag_value(args, "--note")
-    args = [a for a in args if a != "--force"]
+    force = "--force" in args
+    args = [a for a in args if a != "--force"] + literal_tail
 
     if cmd == "list":
-        sys.stdout.write(call("GET", "/docs")[1])
+        return read_or_die("GET", "/docs")
     elif cmd == "index":
-        sys.stdout.write(call("GET", "/docs/index")[1])
+        return read_or_die("GET", "/docs/index")
     elif cmd == "get":
         path = "/docs/" + args[0]
         if len(args) > 2 and args[1] == "--rev":
@@ -600,7 +705,7 @@ def doc_main(cmd, args):
             cache_etag(cache_key(args[0], True), headers.get("ETag") or headers.get("etag"))
         sys.stdout.write(body)
     elif cmd == "history":
-        sys.stdout.write(call("GET", "/docs/%s/history" % args[0])[1])
+        return read_or_die("GET", "/docs/%s/history" % args[0])
     elif cmd == "put":
         body = io.open(args[1], encoding="utf-8", newline="").read()
         if not re.search(r"^##[ \t]+\S", body, re.MULTILINE):

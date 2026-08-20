@@ -11,6 +11,7 @@ import os
 import re
 import secrets
 import subprocess
+import sys
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
@@ -119,15 +120,43 @@ def check_write_auth(request: Request) -> None:
         )
 
 
+# Path segments each API claims for its own routes. A category or doc named
+# one of these is unreachable after creation -- the explicit route above
+# /memory/{category} (or /docs/{slug}) always wins, so e.g. PUT /memory/search
+# would create data/search.md, but GET /memory/search would forever hit the
+# search endpoint instead of the file. Reject the collision at write time
+# rather than let it happen silently.
+RESERVED_CATEGORIES = {"index", "search", "pins"}
+RESERVED_DOCS = {"index"}
+
+
 def validate_category(category: str) -> Path:
     if not CATEGORY_RE.match(category):
         raise HTTPException(status_code=400, detail="invalid category name")
+    if category in RESERVED_CATEGORIES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "'%s' is a reserved name -- it collides with GET /memory/%s "
+                "and would be unreadable after creation; choose a different "
+                "category name" % (category, category)
+            ),
+        )
     return DATA_DIR / f"{category}.md"
 
 
 def validate_doc(slug: str) -> Path:
     if not CATEGORY_RE.match(slug):
         raise HTTPException(status_code=400, detail="invalid doc slug")
+    if slug in RESERVED_DOCS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "'%s' is a reserved name -- it collides with GET /docs/%s "
+                "and would be unreadable after creation; choose a different "
+                "doc slug" % (slug, slug)
+            ),
+        )
     return DOCS_DIR / f"{slug}.md"
 
 
@@ -214,13 +243,44 @@ def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     )
 
 
-def git_commit(message: str) -> None:
-    """Commit the whole data dir. Never raises into the request path."""
+def git_commit(message: str) -> bool:
+    """Commit the whole data dir. Never raises into the request path -- a
+    write must succeed even if git fails (a stale .git/index.lock, a fork
+    failure under memory pressure on this shared Pi).
+
+    Returns True if a commit was made (or there was nothing to commit --
+    an identical-content write is not a git failure), False if git itself
+    failed. A False here is logged to stderr and surfaced to the caller so
+    it can set X-Memory-Commit: failed on the response -- history is the
+    recovery path for a bad write, and losing it unnoticed defeats that.
+    """
     try:
         git("add", "-A")
-        git("commit", "-m", message, check=False)
-    except Exception:
-        pass
+        result = git("commit", "-m", message, check=False)
+        if result.returncode != 0 and "nothing to commit" not in (
+            result.stdout + result.stderr
+        ):
+            print(
+                "git_commit failed (rc=%d): %s"
+                % (result.returncode, (result.stderr or result.stdout).strip()),
+                file=sys.stderr,
+            )
+            return False
+        return True
+    except Exception as e:
+        print("git_commit failed: %r" % (e,), file=sys.stderr)
+        return False
+
+
+def commit_headers(headers: dict, committed: bool) -> dict:
+    """Add X-Memory-Commit: failed when git_commit() reported False, so a
+    lost-history failure is visible on the response, not just in the
+    journal. Never turns a git failure into a request failure."""
+    if committed:
+        return headers
+    headers = dict(headers)
+    headers["X-Memory-Commit"] = "failed"
+    return headers
 
 
 def actor(request: Request) -> str:
@@ -240,10 +300,18 @@ def actor(request: Request) -> str:
 def note(request: Request) -> str:
     """Short caption for a commit, from X-Memory-Note. Empty if none sent.
 
+    HTTP header values are latin-1, so a client sending non-ASCII text (the
+    CLI percent-encodes a Chinese --note before setting the header) needs it
+    decoded here first, before the existing sanitisation. unquote() is
+    tolerant of a note that was never encoded: it only touches valid %XX
+    sequences, so a plain ASCII note sent by curl -- literal '%' included --
+    round-trips unchanged.
+
     Stripped of control characters and collapsed whitespace, then truncated --
     it only ever becomes git commit text, never anything structural.
     """
-    raw = NOTE_CTRL_RE.sub("", request.headers.get("x-memory-note") or "")
+    raw = urllib.parse.unquote(request.headers.get("x-memory-note") or "", errors="replace")
+    raw = NOTE_CTRL_RE.sub("", raw)
     return " ".join(raw.split())[:NOTE_MAX]
 
 
@@ -766,14 +834,18 @@ async def put_category(
             new_text += "\n"
         path.write_text(new_text, encoding="utf-8")
         out_body = new_text.encode("utf-8")
-        git_commit(commit_subject("PUT", "%s#%s" % (category, heading_name), request))
-        return PlainTextResponse("OK", headers={"ETag": '"%s"' % blob_sha(out_body)})
+        committed = git_commit(commit_subject("PUT", "%s#%s" % (category, heading_name), request))
+        return PlainTextResponse(
+            "OK", headers=commit_headers({"ETag": '"%s"' % blob_sha(out_body)}, committed)
+        )
 
     existed = path.exists()
     path.write_text(raw_body.decode("utf-8"), encoding="utf-8")
-    git_commit(commit_subject("PUT" if existed else "CREATE", category, request))
+    committed = git_commit(commit_subject("PUT" if existed else "CREATE", category, request))
 
-    return PlainTextResponse("OK", headers={"ETag": '"%s"' % blob_sha(raw_body)})
+    return PlainTextResponse(
+        "OK", headers=commit_headers({"ETag": '"%s"' % blob_sha(raw_body)}, committed)
+    )
 
 
 @app.delete("/memory/{category}")
@@ -814,14 +886,17 @@ def delete_category(category: str, request: Request, section: str = ""):
                 ),
             )
         path.write_text(new_text, encoding="utf-8")
-        git_commit(commit_subject("DELETE", "%s#%s" % (category, section), request))
+        committed = git_commit(commit_subject("DELETE", "%s#%s" % (category, section), request))
         return PlainTextResponse(
-            "OK", headers={"ETag": '"%s"' % blob_sha(new_text.encode("utf-8"))}
+            "OK",
+            headers=commit_headers(
+                {"ETag": '"%s"' % blob_sha(new_text.encode("utf-8"))}, committed
+            ),
         )
 
     path.unlink()
-    git_commit(commit_subject("DELETE", category, request))
-    return PlainTextResponse("OK")
+    committed = git_commit(commit_subject("DELETE", category, request))
+    return PlainTextResponse("OK", headers=commit_headers({}, committed))
 
 
 # --------------------------------------------------------------------------
@@ -906,9 +981,11 @@ async def put_doc(slug: str, request: Request):
     body = await request.body()
     existed = path.exists()
     path.write_text(body.decode("utf-8"), encoding="utf-8")
-    git_commit(commit_subject("PUT" if existed else "CREATE", "doc %s" % slug, request))
+    committed = git_commit(commit_subject("PUT" if existed else "CREATE", "doc %s" % slug, request))
 
-    return PlainTextResponse("OK", headers={"ETag": '"%s"' % blob_sha(body)})
+    return PlainTextResponse(
+        "OK", headers=commit_headers({"ETag": '"%s"' % blob_sha(body)}, committed)
+    )
 
 
 @app.delete("/docs/{slug}")
@@ -920,8 +997,8 @@ def delete_doc(slug: str, request: Request):
     require_precondition(path, request)
 
     path.unlink()
-    git_commit(commit_subject("DELETE", "doc %s" % slug, request))
-    return PlainTextResponse("OK")
+    committed = git_commit(commit_subject("DELETE", "doc %s" % slug, request))
+    return PlainTextResponse("OK", headers=commit_headers({}, committed))
 
 
 # --------------------------------------------------------------------------
