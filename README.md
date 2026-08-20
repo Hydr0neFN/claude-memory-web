@@ -60,7 +60,8 @@ auth.
 | `main.py` | `$APP_DIR/main.py` | the API, plus `/auth/*` and the static mount |
 | `webauth.py` | `$APP_DIR/webauth.py` | HMAC cookie sessions + login throttle |
 | `web/` | `$APP_DIR/web/` | `index.html`, `app.css`, `app.js`, `md.js`, `diff.js` |
-| `test-web.sh` | `$APP_DIR/test-web.sh` | 31-check suite, run on the box |
+| `test-web.sh` | `$APP_DIR/test-web.sh` | server test suite, run on the box |
+| `memapi.py` | anywhere on a client | command-line client for this API |
 | `devstub.py` | — | fake backend for local UI work, dev only |
 | `rendertest.js` | — | 28 checks over `md.js` / `diff.js`, dev only |
 | `fixtures/` | — | synthetic corpus the render tests run against |
