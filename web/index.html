@@ -6,7 +6,7 @@
 <meta name="color-scheme" content="light dark">
 <meta name="robots" content="noindex, nofollow">
 <title>Memory</title>
-<link rel="stylesheet" href="/app.css?v=12">
+<link rel="stylesheet" href="/app.css?v=13">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='78' font-size='78'>🧠</text></svg>">
 </head>
 <body>
@@ -32,6 +32,8 @@
     <form id="search-form" class="search">
       <input id="search-input" type="search" placeholder="Search all categories…" spellcheck="false">
     </form>
+    <a class="btn ghost" href="#/pins" title="Retraction and decision markers">Pins<span id="pins-count" class="pill hidden"></span></a>
+    <a class="btn ghost" href="#/stale" title="Sections due for a freshness check">Stale</a>
     <div class="newmenu">
       <button id="new-btn" class="btn" title="New category or doc">+ New ▾</button>
       <div id="new-menu" class="dropdown hidden">
@@ -56,8 +58,8 @@
 <div id="modal-root"></div>
 <div id="toast" class="toast hidden"></div>
 
-<script src="/md.js?v=13"></script>
+<script src="/md.js?v=14"></script>
 <script src="/diff.js?v=12"></script>
-<script src="/app.js?v=13"></script>
+<script src="/app.js?v=14"></script>
 </body>
 </html>

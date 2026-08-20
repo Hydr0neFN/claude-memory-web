@@ -34,6 +34,14 @@ SECTION_RE = re.compile(r"^##\s+(.*?)\s*$")
 TITLE_RE = re.compile(r"^#(?!#)\s+(.*?)\s*$")
 VERIFIED_RE = re.compile(r"<!--\s*verified:\s*(\d{4}-\d{2}-\d{2}|never)\s*-->")
 DOC_REF_RE = re.compile(r"\[\[doc:([a-z][a-z0-9-]*)\]\]")
+# Deliberately the same shape as the UI's [[category]] rule in md.js: on
+# "[[doc:slug]]" the capture group ([a-z][a-z0-9-]*) reads "doc" and then
+# stops at ':', which isn't in the class, so the immediately-following "]]"
+# check fails and DOC_REF_RE (checked separately, see doc_refs_of) owns that
+# syntax instead. No fence-awareness here, matching doc_refs_of's existing
+# behaviour -- both are additive index metadata, not a place where a stray
+# "[[name]]" inside a code example has ever mattered enough to fix.
+CATEGORY_REF_RE = re.compile(r"\[\[([a-z][a-z0-9-]*)\]\]")
 ACTOR_RE = re.compile(r"^[\w./ -]{1,40}$")
 NOTE_CTRL_RE = re.compile(r"[\x00-\x1f]")
 PIN_MARKER_RE = re.compile(r"<!--\s*pin:\s*([a-z][a-z0-9-]*)\s*-->", re.IGNORECASE)
@@ -325,6 +333,22 @@ def doc_refs_of(text: str) -> list:
     return out
 
 
+def category_refs_of(text: str, self_name: str) -> list:
+    """[[category-name]] references in a category body, deduplicated, in
+    first-appearance order, excluding a reference to self_name -- a category
+    that mentions its own name in its own body doesn't 'reference' itself in
+    the sense the UI's backlink view cares about."""
+    out = []
+    seen = set()
+    for m in CATEGORY_REF_RE.finditer(text):
+        name = m.group(1)
+        if name == self_name or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
 def section_bounds_at_index(lines: list, idx: int):
     """(start, end) of the real section containing line idx, fence-aware.
     end is trimmed back past any trailing blank lines before the next
@@ -544,6 +568,7 @@ def index(request: Request):
                 "etag": blob_sha(text.encode("utf-8")),
                 "sections": sections_of(text),
                 "docs": doc_refs_of(text),
+                "refs": category_refs_of(text, path.stem),
             }
         )
     return JSONResponse(out)

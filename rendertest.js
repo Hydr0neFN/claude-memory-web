@@ -196,6 +196,15 @@ check('diff line ops correct', JSON.stringify(dl) ===
   JSON.stringify([{op:' ',text:'x'},{op:'-',text:'y'},{op:'+',text:'Q'},{op:' ',text:'z'}]), JSON.stringify(dl));
 check('diff escapes html', /&lt;script/.test(Diff.render('a', '<script>', 3).html));
 
+/* --- MD.slug (stale-view heading links) --------------------------------- */
+// same derivation render()/sections() use internally, exposed for the stale
+// view which only has a section name (no line number) to link from.
+check('MD.slug matches the id render() assigns the same heading',
+  MD.slug('Rpi remote access') === /id="([^"]+)"/.exec(MD.render('## Rpi remote access'))[1],
+  MD.slug('Rpi remote access'));
+check('MD.slug is stable for the same input', MD.slug('Foo Bar') === MD.slug('Foo Bar'));
+check('MD.slug handles CJK', MD.slug('揪日子') === 'h-' + '揪日子');
+
 /* --- perf sanity -------------------------------------------------------- */
 const t0 = Date.now();
 for (let i = 0; i < 20; i++) MD.render(a);

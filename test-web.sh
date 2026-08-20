@@ -223,6 +223,37 @@ case "$idx" in *'"category": "handoff-index"'*|*'"category":"handoff-index"'*)
     echo "FAIL: /memory/index lists a doc as a top-level category entry"; FAIL=$((FAIL+1)) ;;
   *) echo "PASS: no doc appears as its own top-level index entry"; PASS=$((PASS+1)) ;; esac
 
+echo "=== 7c. /memory/index refs key (category backlinks) ==="
+REFA="zz-refs-a"
+REFB="zz-refs-b"
+curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $TOKEN" -H "If-Match: *" "$BASE/memory/$REFA"
+curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $TOKEN" -H "If-Match: *" "$BASE/memory/$REFB"
+code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "If-None-Match: *" --data-binary $'## Scratch\n\n- nothing here\n' "$BASE/memory/$REFB")
+check "create $REFB (no outgoing refs)" 200 "$code"
+code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "If-None-Match: *" --data-binary $'## Scratch\n\n- see [[zz-refs-b]] and also [[zz-refs-a]] (self)\n' "$BASE/memory/$REFA")
+check "create $REFA (refs $REFB and itself)" 200 "$code"
+
+idx2=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/index")
+refs_a=$(echo "$idx2" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+e = [c for c in d if c["category"] == "zz-refs-a"]
+print(repr(e[0]["refs"]) if e else "MISSING")
+')
+check "a category referencing another reports it, self-reference excluded" "['zz-refs-b']" "$refs_a"
+refs_b=$(echo "$idx2" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+e = [c for c in d if c["category"] == "zz-refs-b"]
+print(repr(e[0]["refs"]) if e else "MISSING")
+')
+check "a category referencing nothing reports []" "[]" "$refs_b"
+
+curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $TOKEN" -H "If-Match: *" "$BASE/memory/$REFA"
+curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $TOKEN" -H "If-Match: *" "$BASE/memory/$REFB"
+
 code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Bearer $TOKEN" \
   -H "If-Match: *" "$BASE/docs/$DOC")
 check "scratch doc deleted" 200 "$code"

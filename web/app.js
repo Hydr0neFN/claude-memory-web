@@ -188,8 +188,9 @@
   }
 
   // wherever the category index is refreshed, the doc index is too -- the
-  // sidebar renders both groups from the same renderSidebar() call.
-  function refreshIndexes() { return Promise.all([loadIndex(), loadDocs()]); }
+  // sidebar renders both groups from the same renderSidebar() call. The pins
+  // count rides along: any edit can add or remove a pin marker.
+  function refreshIndexes() { return Promise.all([loadIndex(), loadDocs(), loadPinsCount()]); }
 
   /* The store is flat -- names must match ^[a-z0-9-]+$ -- but the convention is
    * `<parent>-<sub>`, so the hierarchy is recoverable from the names alone.
@@ -233,6 +234,31 @@
       });
     });
     return owners;
+  }
+
+  // category name -> [category, ...] that reference it via [[name]]. Same
+  // inversion as docOwnersOf, over the index's 'refs' key instead of 'docs' --
+  // both are forward edges the server reports per-file; the "Referenced by"
+  // views on category/doc pages are just this map read backwards.
+  function catReferencersOf(index) {
+    var referencers = {};
+    index.forEach(function (c) {
+      (c.refs || []).forEach(function (name) {
+        (referencers[name] = referencers[name] || []).push(c.category);
+      });
+    });
+    return referencers;
+  }
+
+  // Shared renderer for a "Referenced by" block on a category/doc read view.
+  // Omits the whole thing when nothing points here -- an always-present empty
+  // heading would just be noise on the majority of pages with no backlinks.
+  function referencedByHTML(names, kind) {
+    if (!names || !names.length) return '';
+    return '<div class="cat-docs"><span class="muted small">Referenced by:</span>' +
+      names.map(function (n) {
+        return '<a class="pill doclink" href="#/' + kind + '/' + encodeURIComponent(n) + '">' + e(n) + '</a>';
+      }).join('') + '</div>';
   }
 
   // which rows a caret toggle affects, ancestor force-open for the currently
@@ -426,6 +452,17 @@
     setTimeout(function () { best.classList.remove('flash'); }, 1800);
   }
 
+  // Used by the stale-sections view: it only has a section name from
+  // /memory/index, not a line number, so it links to the heading's rendered
+  // id (see md.js's slug export) instead of a #/l/<line> route.
+  function scrollToHeadingId(id) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    el.scrollIntoView({ block: 'center' });
+    el.classList.add('flash');
+    setTimeout(function () { el.classList.remove('flash'); }, 1800);
+  }
+
   /* ------------------------------------------------------------ home view */
 
   function viewHome() {
@@ -483,7 +520,7 @@
 
   /* ------------------------------------------------------------ read view */
 
-  function viewCategory(cat, line) {
+  function viewCategory(cat, line, heading) {
     state.cat = cat;
     state.kind = 'c';
     state.editing = false;
@@ -514,6 +551,7 @@
               return '<a class="pill doclink" href="#/d/' + encodeURIComponent(d) + '">' + e(d) + '</a>';
             }).join('') + '</div>'
           : '') +
+        referencedByHTML(catReferencersOf(state.index)[cat], 'c') +
         '<div class="reading"><article class="md">' +
         MD.render(r.body, { staleDays: STALE_DAYS, known: knownRefs() }) + '</article>' + outlineHTML(r.body) + '</div>'
       );
@@ -524,6 +562,7 @@
       $('main').querySelector('[data-act="delete"]').onclick = function () { askDelete(cat); };
 
       if (line) setTimeout(function () { scrollToLine(line); }, 30);
+      if (heading) setTimeout(function () { scrollToHeadingId(heading); }, 30);
     }).catch(function (err) {
       main('<div class="banner bad">' + e(err.message) + '</div>');
     });
@@ -555,6 +594,7 @@
         '<p class="vsub">' + fmtBytes(size) + ' · etag ' +
         '<code>' + e(r.etag.slice(0, 8)) + '</code>' +
         (meta ? ' · changed ' + fmtAgo(meta.mtime) : '') + '</p>' +
+        referencedByHTML(docOwnersOf(state.index)[slug], 'c') +
         '<div class="reading"><article class="md">' +
         MD.render(r.body, { staleDays: STALE_DAYS, known: knownRefs() }) + '</article>' + outlineHTML(r.body) + '</div>'
       );
@@ -1248,6 +1288,160 @@
   $('new-menu').addEventListener('click', function () { $('new-menu').classList.add('hidden'); });
   document.addEventListener('click', function () { $('new-menu').classList.add('hidden'); });
 
+  /* ----------------------------------------------------------------- pins */
+
+  // The topbar count is a plain pill, not a red nag badge -- pins are normal,
+  // expected content (a store with none is the unusual case), so this is
+  // "here's how many" not "something is wrong."
+  function updatePinsBadge(n) {
+    var b = $('pins-count');
+    if (!b) return;
+    b.textContent = n;
+    b.classList.toggle('hidden', !n);
+  }
+
+  function loadPinsCount() {
+    return apiJSON('/memory/pins').then(function (list) {
+      updatePinsBadge(list.length);
+    }).catch(function () { /* topbar count is a bonus, not load-bearing */ });
+  }
+
+  function viewPins() {
+    state.cat = null;
+    state.doc = null;
+    state.kind = null;
+    state.editing = false;
+    renderSidebar();
+    loading();
+    apiJSON('/memory/pins').then(function (list) {
+      updatePinsBadge(list.length);
+
+      if (!list.length) {
+        main('<div class="vhead"><h1>Pins</h1></div>' +
+          '<p class="vsub">No retraction or decision markers in the store.</p>');
+        return;
+      }
+
+      // category -> section -> [pin, ...], in the order scan_pins() returned
+      // them (file order, then line order within a file).
+      var byCat = {};
+      var order = [];
+      list.forEach(function (p) {
+        if (!byCat[p.category]) { byCat[p.category] = {}; order.push(p.category); }
+        var sec = p.section || '(preamble)';
+        (byCat[p.category][sec] = byCat[p.category][sec] || []).push(p);
+      });
+
+      var html = ['<div class="vhead"><h1>Pins</h1></div>',
+        '<p class="vsub">' + list.length + ' retraction / decision marker' +
+        (list.length === 1 ? '' : 's') + ' across the store. Legacy prose markers ' +
+        '(RETRACTED, CORRECTED, "do not re-open"…) are worth converting to an ' +
+        'explicit <code>&lt;!-- pin: kind --&gt;</code> comment.</p>'];
+
+      order.forEach(function (cat) {
+        html.push('<h3 class="search-section"><a href="#/c/' + encodeURIComponent(cat) + '">' + e(cat) + '</a></h3>');
+        Object.keys(byCat[cat]).forEach(function (sec) {
+          html.push(
+            '<div class="pill sec-tag">' + e(sec) + '</div>' +
+            '<div class="revs" style="margin-bottom:14px">' + byCat[cat][sec].map(function (p) {
+              return '<div class="rev pin-row">' +
+                '<a class="pin-kind pill' + (p.legacy ? ' warn' : ' ok') + '" ' +
+                'href="#/c/' + encodeURIComponent(p.category) + '/l/' + p.line + '" ' +
+                'title="' + (p.legacy ? 'legacy prose marker' : 'explicit pin marker') + '">' +
+                e(p.kind) + '</a>' +
+                '<span class="pin-text md">' + MD.render(p.text, { known: knownRefs() }) + '</span>' +
+                '</div>';
+            }).join('') + '</div>'
+          );
+        });
+      });
+
+      main(html.join(''));
+    }).catch(function (err) {
+      main('<div class="banner bad">' + e(err.message) + '</div>');
+    });
+  }
+
+  /* ---------------------------------------------------------------- stale */
+
+  var STALE_THRESHOLDS = [30, 90, 180];
+
+  function staleThreshold() {
+    var v;
+    try { v = parseInt(localStorage.getItem('mem.staleThreshold') || '', 10); } catch (_) { v = NaN; }
+    return STALE_THRESHOLDS.indexOf(v) >= 0 ? v : STALE_DAYS;
+  }
+
+  function setStaleThreshold(v) {
+    try { localStorage.setItem('mem.staleThreshold', String(v)); } catch (_) { /* private mode */ }
+  }
+
+  function viewStale() {
+    state.cat = null;
+    state.doc = null;
+    state.kind = null;
+    state.editing = false;
+    renderSidebar();
+
+    var threshold = staleThreshold();
+    var rows = [];
+    var stableCount = 0;
+    var noMarkerCount = 0;
+
+    state.index.forEach(function (c) {
+      c.sections.forEach(function (s) {
+        // 'verified: never' means this fact doesn't rot -- excluded from the
+        // list entirely and reported only as a count, per spec: that marker
+        // exists so this list can reach zero.
+        if (s.verified === 'never') { stableCount++; return; }
+        if (!s.verified) {
+          noMarkerCount++;
+          rows.push({ cat: c.category, name: s.name, verified: null, age: Infinity });
+          return;
+        }
+        var age = MD.daysSince(s.verified);
+        if (age !== null && age > threshold) {
+          rows.push({ cat: c.category, name: s.name, verified: s.verified, age: age });
+        }
+      });
+    });
+    rows.sort(function (a, b) { return b.age - a.age; });
+
+    var html = [
+      '<div class="vhead"><h1>Stale sections</h1><span class="spacer"></span>' +
+      '<div class="seg" id="stale-seg" role="tablist">' +
+      STALE_THRESHOLDS.map(function (d) {
+        return '<button data-d="' + d + '" class="' + (d === threshold ? 'on' : '') +
+          '" role="tab">' + d + 'd</button>';
+      }).join('') + '</div></div>',
+      '<p class="vsub">' + rows.length + ' section' + (rows.length === 1 ? '' : 's') +
+      ' unverified for over ' + threshold + ' days' +
+      (noMarkerCount ? ' (' + noMarkerCount + ' with no <!-- verified: --> marker at all)' : '') +
+      ' · ' + stableCount + ' section' + (stableCount === 1 ? '' : 's') + ' marked stable</p>'
+    ];
+
+    if (!rows.length) {
+      html.push('<p class="muted">Nothing stale at this threshold.</p>');
+    } else {
+      html.push('<div class="revs">' + rows.map(function (r) {
+        var id = MD.slug(r.name);
+        return '<div class="rev"><a class="msg" href="#/c/' + encodeURIComponent(r.cat) + '/h/' + encodeURIComponent(id) + '">' +
+          e(r.cat) + ' <span class="muted">›</span> ' + e(r.name) + '</a>' +
+          '<span class="when">' + (r.verified ? e(r.verified) : 'no marker') + '</span></div>';
+      }).join('') + '</div>');
+    }
+
+    main(html.join(''));
+
+    var seg = $('stale-seg');
+    if (seg) seg.addEventListener('click', function (ev) {
+      var b = ev.target.closest('button[data-d]');
+      if (!b) return;
+      setStaleThreshold(parseInt(b.getAttribute('data-d'), 10));
+      viewStale();
+    });
+  }
+
   /* --------------------------------------------------------------- router */
 
   function route() {
@@ -1273,12 +1467,16 @@
 
     if (parts[0] === 'search') return viewSearch(decodeURIComponent(parts.slice(1).join('/')));
 
+    if (parts[0] === 'pins') return viewPins();
+    if (parts[0] === 'stale') return viewStale();
+
     if (parts[0] === 'c' && parts[1]) {
       var cat = decodeURIComponent(parts[1]);
       if (parts[2] === 'edit') return viewEdit(cat);
       if (parts[2] === 'history') return viewHistory('c', cat);
       if (parts[2] === 'rev' && parts[3]) return viewRev('c', cat, parts[3]);
       if (parts[2] === 'l' && parts[3]) return viewCategory(cat, parseInt(parts[3], 10));
+      if (parts[2] === 'h' && parts[3]) return viewCategory(cat, null, decodeURIComponent(parts[3]));
       return viewCategory(cat);
     }
 

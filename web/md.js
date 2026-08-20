@@ -315,5 +315,14 @@ window.MD = (function () {
     });
   }
 
-  return { render: render, sections: sections, escape: esc, inline: inline, daysSince: daysSince };
+  // Exposed for the stale-sections view: it only has {name, verified} from
+  // /memory/index (no line numbers), so it links to a heading id computed
+  // the same way render()/sections() compute one, rather than a line route.
+  // Called with no `seen` map -- so, unlike an in-document render, it can't
+  // disambiguate two same-named headings in one category. That's the one
+  // corner case this shortcut accepts.
+  return {
+    render: render, sections: sections, escape: esc, inline: inline,
+    daysSince: daysSince, slug: function (s) { return slug(s, null); }
+  };
 })();
