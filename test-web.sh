@@ -228,9 +228,10 @@ code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Beare
 check "scratch doc deleted" 200 "$code"
 
 echo "=== 8. section-level read/write ==="
-SECFILE=$(mktemp); SECBODY=$(mktemp); PRECAT=$(mktemp); POSTCAT=$(mktemp)
+SECFILE=$(mktemp); SECBODY=$(mktemp)
 curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $TOKEN" -H "If-Match: *" "$BASE/memory/$CAT"
 printf '## Alpha\n\n- one\n- two\n\n## Beta\n\n- three\n\n## Gamma\n\n- four\n' > "$SECFILE"
+SEEDED=$(cat "$SECFILE")
 code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN" \
   -H "If-None-Match: *" --data-binary @"$SECFILE" "$BASE/memory/$CAT")
 check "seed section category" 200 "$code"
@@ -241,8 +242,14 @@ check "seed section category" 200 "$code"
 SEED_REV=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT/history" \
   | grep -o '"sha": *"[0-9a-f]*"' | head -1 | grep -o '[0-9a-f]\{40\}')
 
+# whole file, byte-for-byte, is the baseline every "rest of file unaffected"
+# check below diffs against -- NOT a ?section= read of a neighboring
+# section, which can't see a defect that corrupts the separator between
+# sections (that was exactly the bug: GET/PUT disagreeing on where a
+# section ends, silently eating the blank line before the next heading).
 curl -s -D "$HDR" -o "$BODY" -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT" >/dev/null
 WHOLE_ETAG=$(etag_of "$HDR")
+check "GET whole category body equals what was seeded" "$SEEDED" "$(cat "$BODY")"
 
 curl -s -D "$HDR" -o "$BODY" -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT?section=Beta" >/dev/null
 check "section read returns exactly that block" "$(printf '## Beta\n\n- three')" "$(cat "$BODY")"
@@ -254,20 +261,48 @@ code=$(curl -s -o "$BODY" -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$
 check "unknown section 404s" 404 "$code"
 contains "404 names the available sections" "Alpha, Beta, Gamma" "$(cat "$BODY")"
 
-# rest-of-file byte-identical: capture the Alpha/Gamma bytes before a Beta
-# edit, then diff the same bytes after.
-before_alpha=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT?section=Alpha")
-before_gamma=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT?section=Gamma")
+# --- #1: non-ASCII section name (CJK + em dash) does not 500 -------------
+printf '## tourplan 揪日子 (PickADay) — notes\n\n- cjk and em dash\n' > "$SECFILE"
+code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "If-Match: $WHOLE_ETAG" --data-binary @"$SECFILE" "$BASE/memory/$CAT?section=Gamma&rename_to=tourplan%20%E6%8F%AA%E6%97%A5%E5%AD%90%20%28PickADay%29%20%E2%80%94%20notes")
+check "PUT renaming to a non-ASCII heading" 200 "$code"
+code=$(curl -s -D "$HDR" -o "$BODY" -w "%{http_code}" -H "Authorization: Bearer $TOKEN" \
+  "$BASE/memory/$CAT?section=tourplan%20%E6%8F%AA%E6%97%A5%E5%AD%90%20%28PickADay%29%20%E2%80%94%20notes")
+check "GET of a CJK+em-dash section name returns 200, not 500" 200 "$code"
+contains "CJK+em-dash section body round-trips" "cjk and em dash" "$(cat "$BODY")"
+XSEC2=$(grep -i '^x-memory-section:' "$HDR" | tr -d '\r' | sed 's/^[Xx]-[Mm]emory-[Ss]ection: *//')
+contains "X-Memory-Section is percent-encoded (ASCII-safe)" "%E6%8F" "$XSEC2"
+curl -s -D "$HDR" -o /dev/null -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT" >/dev/null
+ETAG=$(etag_of "$HDR")
+printf '## Gamma\n\n- four\n' > "$SECBODY"
+curl -s -o /dev/null -X PUT -H "Authorization: Bearer $TOKEN" -H "If-Match: $ETAG" \
+  --data-binary @"$SECBODY" "$BASE/memory/$CAT?section=tourplan%20%E6%8F%AA%E6%97%A5%E5%AD%90%20%28PickADay%29%20%E2%80%94%20notes&rename_to=Gamma" >/dev/null
+
+# --- #2: round-trip does not corrupt the rest of the file -----------------
+# GET a section, PUT the exact same bytes back, and diff the WHOLE file
+# before/after -- byte-identical is the only acceptable result.
+curl -s -D "$HDR" -o "$BODY" -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT" >/dev/null
+WHOLE_BEFORE=$(cat "$BODY")
+ETAG=$(etag_of "$HDR")
+curl -s -o "$SECBODY" -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT?section=Alpha"
+code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "If-Match: $ETAG" --data-binary @"$SECBODY" "$BASE/memory/$CAT?section=Alpha")
+check "no-op section round-trip PUT succeeds" 200 "$code"
+WHOLE_AFTER=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT")
+check "whole file is byte-identical after a no-op section round-trip" "$WHOLE_BEFORE" "$WHOLE_AFTER"
+
+# rest-of-file byte-identical after a REAL edit: compare the whole file,
+# not a ?section= read of the neighbor (same reasoning as above).
+before_whole=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT")
+curl -s -D "$HDR" -o /dev/null -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT" >/dev/null
+ETAG=$(etag_of "$HDR")
 printf '## Beta\n\n- three EDITED\n' > "$SECBODY"
 code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN" \
-  -H "If-Match: $WHOLE_ETAG" --data-binary @"$SECBODY" "$BASE/memory/$CAT?section=Beta")
+  -H "If-Match: $ETAG" --data-binary @"$SECBODY" "$BASE/memory/$CAT?section=Beta")
 check "section write with current whole-file etag" 200 "$code"
-after_alpha=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT?section=Alpha")
-after_gamma=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT?section=Gamma")
-check "section write leaves Alpha byte-identical" "$before_alpha" "$after_alpha"
-check "section write leaves Gamma byte-identical" "$before_gamma" "$after_gamma"
-edited=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT?section=Beta")
-contains "edited section reflects the new body" "three EDITED" "$edited"
+after_whole=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT")
+expected_whole=$(echo "$before_whole" | sed 's/^- three$/- three EDITED/')
+check "editing Beta changes only Beta in the whole-file body" "$expected_whole" "$after_whole"
 
 msg=$(git -c safe.directory='*' -C data log -1 --format=%s)
 contains "commit subject carries #<section>" "$CAT#Beta" "$msg"
@@ -280,21 +315,38 @@ code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $
   --data-binary @"$SECBODY" "$BASE/memory/$CAT?section=Beta")
 check "section write with stale etag still 409s" 409 "$code"
 
-# rename: differing heading in the PUT body renames the section.
+# --- #5: rename-by-differing-heading is REJECTED; &rename_to= is required -
 curl -s -D "$HDR" -o /dev/null -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT" >/dev/null
 ETAG=$(etag_of "$HDR")
 printf '## Delta\n\n- four renamed\n' > "$SECBODY"
-code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN" \
+code=$(curl -s -o "$BODY" -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN" \
   -H "If-Match: $ETAG" --data-binary @"$SECBODY" "$BASE/memory/$CAT?section=Gamma")
-check "rename via differing heading" 200 "$code"
+check "drifted heading WITHOUT rename_to is rejected" 400 "$code"
+contains "400 explains rename_to is needed" "rename_to" "$(cat "$BODY")"
+code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT?section=Gamma")
+check "rejected rename leaves the original section in place" 200 "$code"
+gamma_body=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT?section=Gamma")
+contains "rejected rename did not touch Gamma's content" "- four" "$gamma_body"
+
+code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "If-Match: $ETAG" --data-binary @"$SECBODY" "$BASE/memory/$CAT?section=Gamma&rename_to=Delta")
+check "explicit rename_to=Delta (expect 200)" 200 "$code"
 msg=$(git -c safe.directory='*' -C data log -1 --format=%s)
 contains "commit subject uses the new (post-rename) name" "$CAT#Delta" "$msg"
 code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT?section=Gamma")
 check "old section name is gone after rename" 404 "$code"
-code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT?section=Delta")
-check "new section name resolves after rename" 200 "$code"
+renamed_body=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT?section=Delta")
+check "new section name resolves to the renamed body" "$(printf '## Delta\n\n- four renamed')" "$renamed_body"
 
-# upsert: absent section 404s without ?mode=upsert, appends with it.
+# --- #6: mode=upsert on a category that does not exist is 400, not 404 ---
+curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $TOKEN" -H "If-Match: *" "$BASE/memory/upsert-nope-scratch"
+printf '## New\n\n- x\n' > "$SECBODY"
+code=$(curl -s -o "$BODY" -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "If-None-Match: *" --data-binary @"$SECBODY" "$BASE/memory/upsert-nope-scratch?section=New&mode=upsert")
+check "upsert on a nonexistent category is 400 (not a contradictory 404)" 400 "$code"
+
+# upsert onto an EXISTING category: absent section 404s without ?mode=upsert,
+# appends with it.
 curl -s -D "$HDR" -o /dev/null -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT" >/dev/null
 ETAG=$(etag_of "$HDR")
 printf '## Epsilon\n\n- new one\n' > "$SECBODY"
@@ -307,17 +359,29 @@ check "upsert appends the missing section" 200 "$code"
 appended=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT?section=Epsilon")
 contains "appended section is readable back" "new one" "$appended"
 
-# DELETE removes just that section, rest untouched.
-before_alpha=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT?section=Alpha")
+# --- DELETE removes just that section; ETag it returns matches a following
+# whole-file GET's ETag (DELETE discards response headers otherwise) ------
+before_whole=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT")
 curl -s -D "$HDR" -o /dev/null -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT" >/dev/null
 ETAG=$(etag_of "$HDR")
-code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Bearer $TOKEN" \
+code=$(curl -s -D "$HDR" -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Bearer $TOKEN" \
   -H "If-Match: $ETAG" "$BASE/memory/$CAT?section=Epsilon")
 check "DELETE ?section= removes the section" 200 "$code"
+DELETE_ETAG=$(etag_of "$HDR")
 code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT?section=Epsilon")
 check "deleted section is gone" 404 "$code"
-after_alpha=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT?section=Alpha")
-check "DELETE ?section= leaves Alpha byte-identical" "$before_alpha" "$after_alpha"
+curl -s -D "$HDR" -o /dev/null -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT" >/dev/null
+FOLLOWUP_ETAG=$(etag_of "$HDR")
+check "DELETE's returned ETag matches a following whole-file GET's ETag" "$FOLLOWUP_ETAG" "$DELETE_ETAG"
+after_whole=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT")
+expected_whole=$(printf '%s\n' "$before_whole" | python3 -c "
+import sys
+t = sys.stdin.read()
+i = t.index('## Epsilon')
+j = t.find('## ', i + 2)
+print(t[:i] + (t[j:] if j != -1 else ''), end='')
+")
+check "DELETE ?section= leaves the rest of the whole file byte-identical" "$expected_whole" "$after_whole"
 msg=$(git -c safe.directory='*' -C data log -1 --format=%s)
 contains "DELETE commit subject carries #<section>" "$CAT#Epsilon" "$msg"
 
@@ -326,6 +390,75 @@ ETAG=$(etag_of "$HDR")
 code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Bearer $TOKEN" \
   -H "If-Match: $ETAG" "$BASE/memory/$CAT?section=Nope")
 check "DELETE unknown section 404s" 404 "$code"
+
+# --- #3: deleting the ONLY section refuses instead of leaving an empty file
+curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $TOKEN" -H "If-Match: *" "$BASE/memory/only-section-scratch"
+printf '## Solo\n\n- content\n' > "$SECBODY"
+curl -s -o /dev/null -X PUT -H "Authorization: Bearer $TOKEN" -H "If-None-Match: *" \
+  --data-binary @"$SECBODY" "$BASE/memory/only-section-scratch"
+curl -s -D "$HDR" -o /dev/null -H "Authorization: Bearer $TOKEN" "$BASE/memory/only-section-scratch" >/dev/null
+ETAG=$(etag_of "$HDR")
+code=$(curl -s -o "$BODY" -w "%{http_code}" -X DELETE -H "Authorization: Bearer $TOKEN" \
+  -H "If-Match: $ETAG" "$BASE/memory/only-section-scratch?section=Solo")
+check "deleting the only section is refused, not silently emptied" 400 "$code"
+contains "400 explains the empty-category refusal" "empty" "$(cat "$BODY")"
+code=$(curl -s -o "$BODY" -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$BASE/memory/only-section-scratch")
+check "category still exists and is readable after the refused delete" 200 "$code"
+contains "category content is untouched by the refused delete" "- content" "$(cat "$BODY")"
+still_listed=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory" | grep -c "only-section-scratch" || true)
+check "category is not a 0-byte husk in /memory" "1" "$still_listed"
+curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $TOKEN" -H "If-Match: *" "$BASE/memory/only-section-scratch"
+
+# --- #4: '## ' inside a fenced code block is not a real section ----------
+curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $TOKEN" -H "If-Match: *" "$BASE/memory/fence-scratch"
+printf '## Real\n\n- content\n\n```\n## not a real heading\nsome code\n```\n\n## Also Real\n\n- more\n' > "$SECBODY"
+curl -s -o /dev/null -X PUT -H "Authorization: Bearer $TOKEN" -H "If-None-Match: *" \
+  --data-binary @"$SECBODY" "$BASE/memory/fence-scratch"
+idx=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/index")
+sections=$(echo "$idx" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+e=[c for c in d if c['category']=='fence-scratch']
+print([s['name'] for s in e[0]['sections']] if e else 'MISSING')
+")
+check "fenced '## ' is not indexed as a real section" "['Real', 'Also Real']" "$sections"
+code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" \
+  "$BASE/memory/fence-scratch?section=not%20a%20real%20heading")
+check "GET on the fake fenced heading 404s" 404 "$code"
+real=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/fence-scratch?section=Real")
+contains "GET Real section includes the fence, untouched" '```' "$real"
+curl -s -D "$HDR" -o /dev/null -H "Authorization: Bearer $TOKEN" "$BASE/memory/fence-scratch" >/dev/null
+ETAG=$(etag_of "$HDR")
+code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Bearer $TOKEN" \
+  -H "If-Match: $ETAG" "$BASE/memory/fence-scratch?section=Also%20Real")
+check "DELETE ?section= on a real section past a fence still works" 200 "$code"
+curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $TOKEN" -H "If-Match: *" "$BASE/memory/fence-scratch"
+
+# --- duplicate section names: first wins, GET/PUT/DELETE all agree -------
+curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $TOKEN" -H "If-Match: *" "$BASE/memory/dup-scratch"
+printf '## Dup\n\n- first\n\n## Dup\n\n- second\n' > "$SECBODY"
+curl -s -o /dev/null -X PUT -H "Authorization: Bearer $TOKEN" -H "If-None-Match: *" \
+  --data-binary @"$SECBODY" "$BASE/memory/dup-scratch"
+got=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/dup-scratch?section=Dup")
+check "GET on a duplicate name returns the FIRST occurrence" "$(printf '## Dup\n\n- first')" "$got"
+curl -s -D "$HDR" -o /dev/null -H "Authorization: Bearer $TOKEN" "$BASE/memory/dup-scratch" >/dev/null
+ETAG=$(etag_of "$HDR")
+printf '## Dup\n\n- FIRST EDITED\n' > "$SECBODY"
+curl -s -o /dev/null -X PUT -H "Authorization: Bearer $TOKEN" -H "If-Match: $ETAG" \
+  --data-binary @"$SECBODY" "$BASE/memory/dup-scratch?section=Dup"
+whole=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/dup-scratch")
+check "PUT on a duplicate name edits only the FIRST occurrence" \
+  "$(printf '## Dup\n\n- FIRST EDITED\n\n## Dup\n\n- second')" "$whole"
+curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $TOKEN" -H "If-Match: *" "$BASE/memory/dup-scratch"
+
+# --- edge cases: trailing '##' in a heading; last section, no trailing \n
+curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $TOKEN" -H "If-Match: *" "$BASE/memory/edge-scratch"
+printf '## Alpha ##\n\n- x' > "$SECBODY"
+curl -s -o /dev/null -X PUT -H "Authorization: Bearer $TOKEN" -H "If-None-Match: *" \
+  --data-binary @"$SECBODY" "$BASE/memory/edge-scratch"
+got=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/edge-scratch?section=Alpha%20%23%23")
+check "heading with trailing '##', last section, no trailing newline" "$(printf '## Alpha ##\n\n- x')" "$got"
+curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $TOKEN" -H "If-Match: *" "$BASE/memory/edge-scratch"
 
 # ?section= combined with ?rev= -- SEED_REV is the section-8 seed commit,
 # which is known to contain 'Alpha' (see where it's captured, above).
@@ -345,13 +478,13 @@ code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $
   -H "If-Match: $ETAG" --data-binary $'not a heading\n' "$BASE/memory/$CAT?section=Alpha")
 check "section body without a '## ' heading is rejected" 400 "$code"
 
-rm -f "$SECFILE" "$SECBODY" "$PRECAT" "$POSTCAT"
+rm -f "$SECFILE" "$SECBODY"
 
 echo "=== 9. /memory/pins ==="
 PINCAT="webui-test-pins"
 curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $TOKEN" -H "If-Match: *" "$BASE/memory/$PINCAT"
 PINFILE=$(mktemp)
-printf '## Notes\n\n<!-- pin: retracted -->\n- old claim, superseded\n\n## Legacy\n\nRETRACTED: the earlier approach failed.\n' > "$PINFILE"
+printf '## Notes\n\n<!-- pin: retracted -->\n- old claim, superseded\n\n## Legacy\n\nRETRACTED: the earlier approach failed.\n\n## Boundary\n\n- bad claim\n<!-- pin: decided -->\n- good claim\n\n## Chatter\n\n- I corrected the typo in the config, nothing else.\n\n## Fenced\n\n```\nRETRACTED: this is example text inside a code block\n```\n\n- real content\n' > "$PINFILE"
 code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN" \
   -H "If-None-Match: *" --data-binary @"$PINFILE" "$BASE/memory/$PINCAT")
 check "seed pins category" 200 "$code"
@@ -359,10 +492,26 @@ check "seed pins category" 200 "$code"
 code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$BASE/memory/pins")
 check "GET /memory/pins" 200 "$code"
 pins=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/pins")
-contains "finds the explicit pin marker" "\"category\":\"$PINCAT\",\"section\":\"Notes\",\"line\":4,\"kind\":\"retracted\"" \
-  "$(echo "$pins" | tr -d ' \n')"
-contains "finds the legacy prose marker" "\"category\":\"$PINCAT\",\"section\":\"Legacy\"" "$(echo "$pins" | tr -d ' \n')"
-contains "legacy marker is flagged legacy:true" "\"legacy\":true" "$(echo "$pins" | tr -d ' \n')"
+flat=$(echo "$pins" | tr -d ' \n')
+contains "finds the explicit pin marker (category/section/line/kind)" \
+  "\"category\":\"$PINCAT\",\"section\":\"Notes\",\"line\":4,\"kind\":\"retracted\"" "$flat"
+contains "finds the legacy prose marker (category/section/line/kind)" \
+  "\"category\":\"$PINCAT\",\"section\":\"Legacy\",\"line\":8,\"kind\":\"retracted\"" "$flat"
+contains "legacy marker is flagged legacy:true" "\"legacy\":true" "$flat"
+contains "marker AFTER its claim prefers the PRECEDING line" \
+  "\"section\":\"Boundary\",\"line\":12,\"kind\":\"decided\",\"text\":\"-badclaim\"" "$flat"
+narrative_hit=$(echo "$pins" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+print(any(p['category']=='$PINCAT' and p['section']=='Chatter' for p in d))
+")
+check "narrative false-positive ('I corrected the typo') is rejected" "False" "$narrative_hit"
+fenced_hit=$(echo "$pins" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+print(any(p['category']=='$PINCAT' and p['section']=='Fenced' for p in d))
+")
+check "marker inside a fenced code block is skipped" "False" "$fenced_hit"
 
 code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Bearer $TOKEN" \
   -H "If-Match: *" "$BASE/memory/$PINCAT")
@@ -370,8 +519,10 @@ check "pins scratch category deleted" 200 "$code"
 rm -f "$PINFILE"
 
 echo "=== 10. regressions still hold after sections/pins ==="
+whole_now=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT")
 code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT")
 check "GET /memory/\$CAT with no ?section is still 200 (byte-identical code path)" 200 "$code"
+check "GET /memory/\$CAT with no ?section returns the exact current body" "$whole_now" "$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT")"
 before=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/search?q=memory")
 after=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/search?q=memory")
 check "GET /memory/search default scope is still stable" "$before" "$after"

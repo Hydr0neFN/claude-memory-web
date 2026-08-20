@@ -1,8 +1,17 @@
+"""Claude Memory API.
+
+Known limitation: '## ' sections can be read, replaced, or deleted, but not
+reordered or inserted at a specific position -- a section write always lands
+either in its existing slot or appended at the end (?mode=upsert). A category
+that has grown past the ~20KB split threshold still needs a whole-file PUT to
+restructure. This is an accepted gap, not an oversight.
+"""
 import hashlib
 import os
 import re
 import secrets
 import subprocess
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -28,9 +37,20 @@ DOC_REF_RE = re.compile(r"\[\[doc:([a-z][a-z0-9-]*)\]\]")
 ACTOR_RE = re.compile(r"^[\w./ -]{1,40}$")
 NOTE_CTRL_RE = re.compile(r"[\x00-\x1f]")
 PIN_MARKER_RE = re.compile(r"<!--\s*pin:\s*([a-z][a-z0-9-]*)\s*-->", re.IGNORECASE)
+# Deliberately tighter than "the word anywhere in a sentence" for RETRACTED
+# and CORRECTED specifically: they must appear in that literal case (so "I
+# corrected the typo" never matches) AND at a real clause boundary (line
+# start, a markdown bullet dash, sentence-ending punctuation, or right after
+# a bold marker) -- not embedded mid-sentence. "do not re-(litigate|offer
+# |open)" is left case-insensitive and position-unconstrained on purpose:
+# it's already a specific three-word idiom, not a common dictionary word, so
+# the false-positive risk that justifies constraining RETRACTED/CORRECTED
+# doesn't apply, and in the live store it turns up after a plain "- " bullet
+# dash as often as after a full stop. Fence-aware scanning (see fence_mask)
+# keeps both halves out of code examples regardless.
 LEGACY_PIN_RE = re.compile(
-    r"\b(RETRACTED|CORRECTED|do not re-litigate|do not re-offer|do not re-open)\b",
-    re.IGNORECASE,
+    r"(?:(?:^|(?<=[.!?]\s)|(?<=\*\*)|(?<=\*\*\s)|(?<=-\s)|(?<=—\s))(RETRACTED|CORRECTED)\b"
+    r"|\b((?i:do not re-(?:litigate|offer|open)))\b)"
 )
 LEGACY_PIN_KIND = {
     "retracted": "retracted",
@@ -232,31 +252,64 @@ def commit_subject(verb: str, target: str, request: Request) -> str:
 # --------------------------------------------------------------------------
 
 
+FENCE_RE = re.compile(r"^\s*```")
+
+
+def fence_mask(lines: list) -> list:
+    """bool per line: True if that line is inside, or is itself a delimiter
+    of, a fenced ``` code block. Every section scanner below is built on
+    this, so a '## ' inside a fenced example is never mistaken for a real
+    heading -- one shared helper rather than four separate scanners."""
+    mask = [False] * len(lines)
+    open_ = False
+    for i, line in enumerate(lines):
+        if FENCE_RE.match(line):
+            mask[i] = True
+            open_ = not open_
+        else:
+            mask[i] = open_
+    return mask
+
+
+def section_headers(lines: list) -> list:
+    """[(index, name)] for every real '## ' heading, in document order,
+    skipping anything inside a fenced code block. Duplicate names: whichever
+    appears first wins in every lookup below, since callers scan this list
+    in order and stop at the first match."""
+    mask = fence_mask(lines)
+    out = []
+    for i, line in enumerate(lines):
+        if mask[i]:
+            continue
+        m = SECTION_RE.match(line)
+        if m:
+            out.append((i, m.group(1)))
+    return out
+
+
 def sections_of(text: str) -> list:
     """Return [{name, verified}] for every '## ' header in the document."""
-    out = []
     lines = text.splitlines()
-    for i, line in enumerate(lines):
-        m = SECTION_RE.match(line)
-        if not m:
-            continue
+    out = []
+    for i, name in section_headers(lines):
         verified = None
         for nxt in lines[i + 1 : i + 3]:
             v = VERIFIED_RE.search(nxt)
             if v:
                 verified = v.group(1)
                 break
-        out.append({"name": m.group(1), "verified": verified})
+        out.append({"name": name, "verified": verified})
     return out
 
 
 def section_at(lines: list, idx: int) -> str:
-    """Name of the nearest '## ' header at or above line idx."""
-    for i in range(idx, -1, -1):
-        m = SECTION_RE.match(lines[i])
-        if m:
-            return m.group(1)
-    return ""
+    """Name of the nearest real '## ' header at or above line idx."""
+    name = ""
+    for i, hname in section_headers(lines):
+        if i > idx:
+            break
+        name = hname
+    return name
 
 
 def doc_refs_of(text: str) -> list:
@@ -272,43 +325,48 @@ def doc_refs_of(text: str) -> list:
     return out
 
 
-def section_body(lines: list, idx: int) -> str:
-    """Full text of the '## ' section containing line idx."""
+def section_bounds_at_index(lines: list, idx: int):
+    """(start, end) of the real section containing line idx, fence-aware.
+    end is trimmed back past any trailing blank lines before the next
+    heading (or EOF), so that blank separator belongs to neither section and
+    a GET/PUT/DELETE round-trip never touches it. Falls back to (0, ...) if
+    idx is above any heading (preamble)."""
+    headers = section_headers(lines)
     start = 0
-    for i in range(idx, -1, -1):
-        if SECTION_RE.match(lines[i]):
-            start = i
-            break
     end = len(lines)
-    for j in range(start + 1, len(lines)):
-        if SECTION_RE.match(lines[j]):
-            end = j
+    for i, _name in headers:
+        if i <= idx:
+            start = i
+        else:
+            end = i
             break
-    return "\n".join(lines[start:end]).strip()
+    trimmed_end = end
+    while trimmed_end > start + 1 and lines[trimmed_end - 1].strip() == "":
+        trimmed_end -= 1
+    return start, trimmed_end
 
 
-def find_section_start(lines: list, name: str):
-    """Line index of the '## ' header whose (trimmed) name matches exactly,
-    or None if no such section exists."""
-    for i, line in enumerate(lines):
-        m = SECTION_RE.match(line)
-        if m and m.group(1) == name:
-            return i
-    return None
+def section_body(lines: list, idx: int) -> str:
+    """Full text of the '## ' section containing line idx (see
+    section_bounds_at_index for exactly what "full text" excludes)."""
+    start, end = section_bounds_at_index(lines, idx)
+    return "\n".join(lines[start:end])
 
 
 def find_section_bounds(lines: list, name: str):
-    """(start, end) line-index bounds of the named '## ' section, end
-    exclusive (next '## ' header or EOF). None if the section is absent."""
-    start = find_section_start(lines, name)
-    if start is None:
-        return None
-    end = len(lines)
-    for j in range(start + 1, len(lines)):
-        if SECTION_RE.match(lines[j]):
-            end = j
-            break
-    return start, end
+    """(start, end) bounds of the named '## ' section -- same trailing-blank
+    trimming as section_bounds_at_index, so GET/PUT/DELETE on a name all
+    agree on where the section actually ends. None if absent."""
+    headers = section_headers(lines)
+    for pos, (i, hname) in enumerate(headers):
+        if hname != name:
+            continue
+        end = headers[pos + 1][0] if pos + 1 < len(headers) else len(lines)
+        trimmed_end = end
+        while trimmed_end > i + 1 and lines[trimmed_end - 1].strip() == "":
+            trimmed_end -= 1
+        return i, trimmed_end
+    return None
 
 
 def section_not_found(text: str, name: str) -> HTTPException:
@@ -319,39 +377,43 @@ def section_not_found(text: str, name: str) -> HTTPException:
     )
 
 
+def section_header_value(name: str) -> str:
+    """X-Memory-Section is percent-encoded: Starlette response headers are
+    latin-1 only, and roughly a third of the live store's section names
+    contain non-ASCII (em dashes, arrows, CJK) -- unencoded, those 500."""
+    return urllib.parse.quote(name, safe="")
+
+
 def section_response(body: str, name: str, headers: dict) -> PlainTextResponse:
-    """The named '## ' section's full text (heading line through EOF/next
-    header), under the whole-file ETag passed in via headers."""
+    """The named '## ' section's exact text (see find_section_bounds for
+    what's included), under the whole-file ETag passed in via headers."""
     lines = body.splitlines()
-    idx = find_section_start(lines, name)
-    if idx is None:
+    bounds = find_section_bounds(lines, name)
+    if bounds is None:
         raise section_not_found(body, name)
+    start, end = bounds
     out_headers = dict(headers)
-    out_headers["X-Memory-Section"] = name
-    return PlainTextResponse(section_body(lines, idx), headers=out_headers)
+    out_headers["X-Memory-Section"] = section_header_value(name)
+    return PlainTextResponse("\n".join(lines[start:end]), headers=out_headers)
 
 
 def scan_pins() -> list:
     """Every retraction/decision marker across /memory: explicit
     '<!-- pin: kind -->' comments, plus the legacy prose forms that predate
-    them (RETRACTED, CORRECTED, "do not re-litigate/re-offer/re-open")."""
+    them (RETRACTED, CORRECTED, "do not re-litigate/re-offer/re-open").
+    Skips fenced code blocks, same as the section scanners."""
     out = []
     for path in sorted(DATA_DIR.glob("*.md")):
         text = path.read_text(encoding="utf-8")
         lines = text.splitlines()
+        mask = fence_mask(lines)
         for i, line in enumerate(lines):
+            if mask[i]:
+                continue
             m = PIN_MARKER_RE.search(line)
             if m:
                 kind = m.group(1).lower()
-                stripped = PIN_MARKER_RE.sub("", line).strip()
-                if stripped:
-                    claim_idx = i
-                elif i + 1 < len(lines) and lines[i + 1].strip():
-                    claim_idx = i + 1
-                elif i - 1 >= 0 and lines[i - 1].strip():
-                    claim_idx = i - 1
-                else:
-                    claim_idx = i
+                claim_idx = claim_line_for_marker(lines, i, mask)
                 out.append(
                     {
                         "category": path.stem,
@@ -364,7 +426,7 @@ def scan_pins() -> list:
                 continue
             lm = LEGACY_PIN_RE.search(line)
             if lm:
-                phrase = lm.group(1).lower()
+                phrase = (lm.group(1) or lm.group(2)).lower()
                 out.append(
                     {
                         "category": path.stem,
@@ -376,6 +438,34 @@ def scan_pins() -> list:
                     }
                 )
     return out
+
+
+def claim_line_for_marker(lines: list, i: int, mask: list) -> int:
+    """Which line an explicit <!-- pin: kind --> on line i is actually
+    about. Prefers the claim text ON the marker's own line; failing that,
+    the line ABOVE (the marker normally follows what it pins) as long as
+    that line isn't itself a section heading or a boundary with nothing
+    above it within the same section; only then falls back to the line
+    below. This order matters: a marker sitting right before the next
+    section's heading must not be reported as pinning that heading."""
+    stripped = PIN_MARKER_RE.sub("", lines[i]).strip()
+    if stripped:
+        return i
+    if (
+        i - 1 >= 0
+        and lines[i - 1].strip()
+        and not mask[i - 1]
+        and not SECTION_RE.match(lines[i - 1])
+    ):
+        return i - 1
+    if (
+        i + 1 < len(lines)
+        and lines[i + 1].strip()
+        and not mask[i + 1]
+        and not SECTION_RE.match(lines[i + 1])
+    ):
+        return i + 1
+    return i
 
 
 # --------------------------------------------------------------------------
@@ -586,7 +676,9 @@ def get_category(category: str, request: Request, rev: str = "", section: str = 
 
 
 @app.put("/memory/{category}")
-async def put_category(category: str, request: Request, section: str = "", mode: str = ""):
+async def put_category(
+    category: str, request: Request, section: str = "", mode: str = "", rename_to: str = ""
+):
     check_write_auth(request)
     path = validate_category(category)
     require_precondition(path, request)
@@ -595,6 +687,20 @@ async def put_category(category: str, request: Request, section: str = "", mode:
 
     if section:
         if not path.exists():
+            if mode == "upsert":
+                # require_precondition just accepted 'If-None-Match: *' for a
+                # category that doesn't exist yet -- a plain 404 here would
+                # contradict the precondition that just succeeded. A section
+                # upsert only ever adds to an existing file (see the module
+                # docstring's "no positional insert" limitation), so this is
+                # a 400, not an implicit whole-category create.
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "category '%s' does not exist; PUT it whole (without "
+                        "?section) first, then upsert into it" % category
+                    ),
+                )
             raise HTTPException(status_code=404, detail="not found")
         block_text = raw_body.decode("utf-8")
         block_lines = block_text.splitlines()
@@ -603,7 +709,21 @@ async def put_category(category: str, request: Request, section: str = "", mode:
             raise HTTPException(
                 status_code=400, detail="section body must start with a '## ' heading line"
             )
-        new_name = heading.group(1)
+        heading_name = heading.group(1)
+        # No implicit rename from a heading/section mismatch: callers are
+        # LLMs that routinely drift '## Context' to '## Context:' or
+        # '### Context', and a silent rename would 404 every existing
+        # reference to the old name. A rename must be requested explicitly.
+        expected_name = rename_to if rename_to else section
+        if heading_name != expected_name:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "heading '%s' does not match expected '%s'; pass "
+                    "&rename_to=<new-name> with a body heading of <new-name> "
+                    "for a deliberate rename" % (heading_name, expected_name)
+                ),
+            )
 
         text = path.read_text(encoding="utf-8")
         lines = text.splitlines()
@@ -621,7 +741,7 @@ async def put_category(category: str, request: Request, section: str = "", mode:
             new_text += "\n"
         path.write_text(new_text, encoding="utf-8")
         out_body = new_text.encode("utf-8")
-        git_commit(commit_subject("PUT", "%s#%s" % (category, new_name), request))
+        git_commit(commit_subject("PUT", "%s#%s" % (category, heading_name), request))
         return PlainTextResponse("OK", headers={"ETag": '"%s"' % blob_sha(out_body)})
 
     existed = path.exists()
@@ -648,8 +768,26 @@ def delete_category(category: str, request: Request, section: str = ""):
         start, end = bounds
         new_lines = lines[:start] + lines[end:]
         new_text = "\n".join(new_lines)
-        if new_text and not new_text.endswith("\n"):
-            new_text += "\n"
+        if new_text.strip():
+            if not new_text.endswith("\n"):
+                new_text += "\n"
+        elif new_text:
+            # nothing but whitespace would remain -- normalise to truly
+            # empty so the check below is unambiguous either way.
+            new_text = ""
+        if not new_text.strip():
+            # Deleting this section would leave a 0-byte husk that still
+            # shows up in /memory and /memory/index. Refuse instead of
+            # silently emptying the category -- use DELETE /memory/{category}
+            # (no ?section) if the whole category should go.
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "deleting section '%s' would leave '%s' empty; delete the "
+                    "whole category instead (DELETE /memory/%s with no "
+                    "?section)" % (section, category, category)
+                ),
+            )
         path.write_text(new_text, encoding="utf-8")
         git_commit(commit_subject("DELETE", "%s#%s" % (category, section), request))
         return PlainTextResponse(

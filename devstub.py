@@ -16,10 +16,13 @@ SECTION_RE = re.compile(r"^##\s+(.*?)\s*$")
 TITLE_RE = re.compile(r"^#(?!#)\s+(.*?)\s*$")
 VERIFIED_RE = re.compile(r"<!--\s*verified:\s*(\d{4}-\d{2}-\d{2})\s*-->")
 DOC_REF_RE = re.compile(r"\[\[doc:([a-z][a-z0-9-]*)\]\]")
+FENCE_RE = re.compile(r"^\s*```")
 PIN_MARKER_RE = re.compile(r"<!--\s*pin:\s*([a-z][a-z0-9-]*)\s*-->", re.IGNORECASE)
+# Mirrors main.py's LEGACY_PIN_RE -- see the comment there for why RETRACTED/
+# CORRECTED are case+position constrained while "do not re-*" is not.
 LEGACY_PIN_RE = re.compile(
-    r"\b(RETRACTED|CORRECTED|do not re-litigate|do not re-offer|do not re-open)\b",
-    re.IGNORECASE,
+    r"(?:(?:^|(?<=[.!?]\s)|(?<=\*\*)|(?<=\*\*\s)|(?<=-\s)|(?<=—\s))(RETRACTED|CORRECTED)\b"
+    r"|\b((?i:do not re-(?:litigate|offer|open)))\b)"
 )
 LEGACY_PIN_KIND = {
     "retracted": "retracted",
@@ -112,65 +115,105 @@ def doc_refs_of(text):
     return out
 
 
-def find_section_start(lines, name):
+def fence_mask(lines):
+    mask, open_ = [False] * len(lines), False
     for i, line in enumerate(lines):
+        if FENCE_RE.match(line):
+            mask[i] = True
+            open_ = not open_
+        else:
+            mask[i] = open_
+    return mask
+
+
+def section_headers(lines):
+    """[(index, name)] for every real '## ' heading, fence-aware."""
+    mask = fence_mask(lines)
+    out = []
+    for i, line in enumerate(lines):
+        if mask[i]:
+            continue
         m = SECTION_RE.match(line)
-        if m and m.group(1) == name:
-            return i
-    return None
+        if m:
+            out.append((i, m.group(1)))
+    return out
 
 
 def find_section_bounds(lines, name):
-    start = find_section_start(lines, name)
-    if start is None:
-        return None
-    end = len(lines)
-    for j in range(start + 1, len(lines)):
-        if SECTION_RE.match(lines[j]):
-            end = j
-            break
-    return start, end
+    """(start, end) trimmed back past trailing blank lines before the next
+    heading/EOF, so that separator round-trips untouched. Mirrors main.py."""
+    headers = section_headers(lines)
+    for pos, (i, hname) in enumerate(headers):
+        if hname != name:
+            continue
+        end = headers[pos + 1][0] if pos + 1 < len(headers) else len(lines)
+        trimmed_end = end
+        while trimmed_end > i + 1 and lines[trimmed_end - 1].strip() == "":
+            trimmed_end -= 1
+        return i, trimmed_end
+    return None
 
 
 def section_body(lines, idx):
-    start = 0
-    for i in range(idx, -1, -1):
-        if SECTION_RE.match(lines[i]):
+    headers = section_headers(lines)
+    start, end = 0, len(lines)
+    for i, _name in headers:
+        if i <= idx:
             start = i
+        else:
+            end = i
             break
-    end = len(lines)
-    for j in range(start + 1, len(lines)):
-        if SECTION_RE.match(lines[j]):
-            end = j
-            break
-    return "\n".join(lines[start:end]).strip()
+    trimmed_end = end
+    while trimmed_end > start + 1 and lines[trimmed_end - 1].strip() == "":
+        trimmed_end -= 1
+    return "\n".join(lines[start:trimmed_end])
 
 
 def section_at(lines, idx):
-    for i in range(idx, -1, -1):
-        m = SECTION_RE.match(lines[i])
-        if m:
-            return m.group(1)
-    return ""
+    name = ""
+    for i, hname in section_headers(lines):
+        if i > idx:
+            break
+        name = hname
+    return name
+
+
+def section_header_value(name):
+    """Percent-encoded so a non-ASCII section name never breaks a latin-1
+    response header, same as main.py's section_header_value."""
+    return urllib.parse.quote(name, safe="")
+
+
+def claim_line_for_marker(lines, i, mask):
+    """Mirrors main.py's claim_line_for_marker."""
+    stripped = PIN_MARKER_RE.sub("", lines[i]).strip()
+    if stripped:
+        return i
+    if (
+        i - 1 >= 0 and lines[i - 1].strip() and not mask[i - 1]
+        and not SECTION_RE.match(lines[i - 1])
+    ):
+        return i - 1
+    if (
+        i + 1 < len(lines) and lines[i + 1].strip() and not mask[i + 1]
+        and not SECTION_RE.match(lines[i + 1])
+    ):
+        return i + 1
+    return i
 
 
 def scan_pins(store):
     out = []
     for cat, text in sorted(store.items()):
         lines = text.splitlines()
+        mask = fence_mask(lines)
         for i, line in enumerate(lines):
+            if mask[i]:
+                continue
             m = PIN_MARKER_RE.search(line)
             if m:
                 kind = m.group(1).lower()
-                stripped = PIN_MARKER_RE.sub("", line).strip()
-                if stripped:
-                    claim_idx = i
-                elif i + 1 < len(lines) and lines[i + 1].strip():
-                    claim_idx = i + 1
-                elif i - 1 >= 0 and lines[i - 1].strip():
-                    claim_idx = i - 1
-                else:
-                    claim_idx = i
+                claim_idx = claim_line_for_marker(lines, i, mask)
                 out.append({
                     "category": cat, "section": section_at(lines, claim_idx),
                     "line": claim_idx + 1, "kind": kind, "text": lines[claim_idx].strip(),
@@ -178,7 +221,7 @@ def scan_pins(store):
                 continue
             lm = LEGACY_PIN_RE.search(line)
             if lm:
-                phrase = lm.group(1).lower()
+                phrase = (lm.group(1) or lm.group(2)).lower()
                 out.append({
                     "category": cat, "section": section_at(lines, i), "line": i + 1,
                     "kind": LEGACY_PIN_KIND.get(phrase, phrase.replace(" ", "-")),
@@ -188,18 +231,16 @@ def scan_pins(store):
 
 
 def sections_of(text):
-    out, lines = [], text.splitlines()
-    for i, line in enumerate(lines):
-        m = SECTION_RE.match(line)
-        if not m:
-            continue
+    lines = text.splitlines()
+    out = []
+    for i, name in section_headers(lines):
         verified = None
         for nxt in lines[i + 1:i + 3]:
             v = VERIFIED_RE.search(nxt)
             if v:
                 verified = v.group(1)
                 break
-        out.append({"name": m.group(1), "verified": verified})
+        out.append({"name": name, "verified": verified})
     return out
 
 
@@ -303,15 +344,16 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             section = (q.get("section", [""])[0])
             if section:
                 lines = body.splitlines()
-                idx = find_section_start(lines, section)
-                if idx is None:
+                bounds = find_section_bounds(lines, section)
+                if bounds is None:
                     return self._json(
                         {"detail": "section '%s' not found; available sections: %s" % (
                             section, ", ".join(s["name"] for s in sections_of(body)))},
                         404,
                     )
-                headers["X-Memory-Section"] = section
-                return self._text(section_body(lines, idx), headers=headers)
+                start, end = bounds
+                headers["X-Memory-Section"] = section_header_value(section)
+                return self._text("\n".join(lines[start:end]), headers=headers)
             return self._text(body, headers=headers)
 
         if p == "/docs":
@@ -381,16 +423,32 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
         section = (q.get("section", [""])[0])
         if section:
+            mode = (q.get("mode", [""])[0])
+            rename_to = (q.get("rename_to", [""])[0])
             if name not in store:
+                if mode == "upsert":
+                    return self._json(
+                        {"detail": "category '%s' does not exist; PUT it whole first" % name}, 400
+                    )
                 return self._json({"detail": "not found"}, 404)
             block_lines = body.splitlines()
-            if not block_lines or not SECTION_RE.match(block_lines[0]):
+            heading = SECTION_RE.match(block_lines[0]) if block_lines else None
+            if not heading:
                 return self._json({"detail": "section body must start with a '## ' heading line"}, 400)
+            heading_name = heading.group(1)
+            expected_name = rename_to if rename_to else section
+            if heading_name != expected_name:
+                return self._json(
+                    {"detail": "heading '%s' does not match expected '%s'; pass "
+                                "&rename_to=<new-name> for a deliberate rename" % (
+                                    heading_name, expected_name)},
+                    400,
+                )
             text = store[name]
             lines = text.splitlines()
             bounds = find_section_bounds(lines, section)
             if bounds is None:
-                if (q.get("mode", [""])[0]) != "upsert":
+                if mode != "upsert":
                     return self._json(
                         {"detail": "section '%s' not found; available sections: %s" % (
                             section, ", ".join(s["name"] for s in sections_of(text)))},
@@ -428,7 +486,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 start, end = bounds
                 new_lines = lines[:start] + lines[end:]
                 new_text = "\n".join(new_lines)
-                if new_text and not new_text.endswith("\n"):
+                if not new_text.strip():
+                    return self._json(
+                        {"detail": "deleting section '%s' would leave '%s' empty; delete "
+                                    "the whole category instead" % (section, m.group(1))},
+                        400,
+                    )
+                if not new_text.endswith("\n"):
                     new_text += "\n"
                 STORE[m.group(1)] = new_text
                 return self._text("OK", headers={"ETag": '"%s"' % blob_sha(new_text)})
