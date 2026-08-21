@@ -254,6 +254,66 @@ check "a category referencing nothing reports []" "[]" "$refs_b"
 curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $TOKEN" -H "If-Match: *" "$BASE/memory/$REFA"
 curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $TOKEN" -H "If-Match: *" "$BASE/memory/$REFB"
 
+echo "=== 7c. section addressing on /docs ==="
+# Regression for 2026-08-21: ?section= was implemented for /memory only. On
+# /docs it was not rejected, it was IGNORED -- a request for one section
+# returned 200 with the entire document, so an agent trying to save context
+# silently loaded all of it. Docs are the longest files in the store, so this
+# was the half where it mattered most. Every assertion that checks "the rest
+# of the file survived" reads the WHOLE doc, never GET ?section=: the section
+# view is structurally blind to damage outside the section it returns.
+DSEC=$(mktemp)
+
+curl -s -o /dev/null -X PUT -H "Authorization: Bearer $TOKEN" -H "If-Match: *" \
+  --data-binary $'# webui test doc\n\n## Where things stand\n\n- two\n\n## Next step\n\n- ship it\n' \
+  "$BASE/docs/$DOC"
+
+full=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/docs/$DOC")
+sec=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/docs/$DOC?section=Next%20step")
+check "GET /docs/{slug}?section= returns only that section" \
+  "$(printf '## Next step\n\n- ship it')" "$sec"
+if [ "${#sec}" -lt "${#full}" ]; then
+  echo "PASS: the section is smaller than the whole doc (${#sec} < ${#full} bytes)"; PASS=$((PASS+1))
+else
+  echo "FAIL: section ${#sec} not smaller than full ${#full} -- ?section= ignored"; FAIL=$((FAIL+1))
+fi
+
+code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" \
+  "$BASE/docs/$DOC?section=no-such-section")
+check "GET /docs/{slug} with an unknown section 404s (not a silent full body)" 404 "$code"
+
+etag=$(curl -s -D - -o /dev/null -H "Authorization: Bearer $TOKEN" "$BASE/docs/$DOC" \
+  | tr -d '\r' | sed -n 's/^[Ee][Tt][Aa][Gg]: "\(.*\)"$/\1/p')
+printf '## Next step\n\n- ship it twice\n' > "$DSEC"
+code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "If-Match: $etag" --data-binary @"$DSEC" "$BASE/docs/$DOC?section=Next%20step")
+check "PUT /docs/{slug}?section= replaces one section" 200 "$code"
+after=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/docs/$DOC")
+check "the whole doc is exactly the expected bytes after a section write" \
+  "$(printf '# webui test doc\n\n## Where things stand\n\n- two\n\n## Next step\n\n- ship it twice')" \
+  "$after"
+
+etag=$(curl -s -D - -o /dev/null -H "Authorization: Bearer $TOKEN" "$BASE/docs/$DOC" \
+  | tr -d '\r' | sed -n 's/^[Ee][Tt][Aa][Gg]: "\(.*\)"$/\1/p')
+printf '## Renamed\n\n- x\n' > "$DSEC"
+code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "If-Match: $etag" --data-binary @"$DSEC" "$BASE/docs/$DOC?section=Next%20step")
+check "a heading that does not match the section is a 400, not a silent rename" 400 "$code"
+
+msg=$(git -c safe.directory='*' -C data log -1 --format=%s)
+contains "a doc section write names the section in the commit subject" "doc $DOC#Next step" "$msg"
+
+etag=$(curl -s -D - -o /dev/null -H "Authorization: Bearer $TOKEN" "$BASE/docs/$DOC" \
+  | tr -d '\r' | sed -n 's/^[Ee][Tt][Aa][Gg]: "\(.*\)"$/\1/p')
+code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Bearer $TOKEN" \
+  -H "If-Match: $etag" "$BASE/docs/$DOC?section=Next%20step")
+check "DELETE /docs/{slug}?section= removes one section" 200 "$code"
+after=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/docs/$DOC")
+check "the whole doc is exactly the expected bytes after a section delete" \
+  "$(printf '# webui test doc\n\n## Where things stand\n\n- two')" "$after"
+
+rm -f "$DSEC"
+
 code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Bearer $TOKEN" \
   -H "If-Match: *" "$BASE/docs/$DOC")
 check "scratch doc deleted" 200 "$code"

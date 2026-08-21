@@ -64,6 +64,10 @@ Usage:
   memapi.py delete <cat> [--note "..."] [--force] [--section "<name>"]
 
   memapi.py doc list                  -> JSON array of doc slugs
+  memapi.py doc sections <slug>       -> that doc's '## ' section names, one
+                                          per line. Docs are the longest files
+                                          in the store; read one section, not
+                                          the whole thing.
   memapi.py doc index                 -> JSON: sizes, mtimes, titles, sections
   memapi.py doc get <slug> [--rev <sha>]
   memapi.py doc put <slug> <file> [--note "..."] [--force]
@@ -436,9 +440,9 @@ def splice_section(current_text, name, block_text, upsert, rename_to=None):
     return new_text
 
 
-def do_diff(cat, new_body, section, upsert, rename_to=None):
+def do_diff(cat, new_body, section, upsert, rename_to=None, is_doc=False):
     """--diff dry run: never writes. Returns the process exit code."""
-    status, current, _headers = call("GET", "/memory/" + cat)
+    status, current, _headers = call("GET", api_path(cat, is_doc))
     if status == 404:
         current = ""
     elif status != 200:
@@ -683,25 +687,46 @@ def doc_main(cmd, args):
     else:
         literal_tail = []
 
-    # Value flag extracted before the boolean is tested, same reasoning as
-    # main() -- --note "--force" must not be misread as the --force flag.
+    # Value flags first, then booleans -- same ordering rule as main(), and
+    # the same flag set. These used to be missing here entirely: `doc get x
+    # --section y` parsed nothing, sent no query string, and printed the whole
+    # document with a 200. Nothing failed, so nothing was noticed; the caller
+    # just paid for the bytes it was trying not to load.
     note, args = take_flag_value(args, "--note")
+    section, args = take_flag_value(args, "--section")
+    rename_to, args = take_flag_value(args, "--rename-to")
+    rev, args = take_flag_value(args, "--rev")
+
     force = "--force" in args
-    args = [a for a in args if a != "--force"] + literal_tail
+    upsert = "--upsert" in args
+    diff_flag = "--diff" in args
+    args = [a for a in args if a not in ("--force", "--upsert", "--diff")] + literal_tail
 
     if cmd == "list":
         return read_or_die("GET", "/docs")
     elif cmd == "index":
         return read_or_die("GET", "/docs/index")
+    elif cmd == "sections":
+        status, body, _headers = call("GET", "/docs/" + args[0])
+        if status != 200:
+            sys.stderr.write("error: GET doc %s -> %s %s\n" % (args[0], status, body))
+            return 1
+        for _i, name in section_headers(body.splitlines()):
+            print(name)
     elif cmd == "get":
         path = "/docs/" + args[0]
-        if len(args) > 2 and args[1] == "--rev":
-            path += "?rev=" + urllib.parse.quote(args[2])
+        q = []
+        if section:
+            q.append("section=" + urllib.parse.quote(section))
+        if rev:
+            q.append("rev=" + urllib.parse.quote(rev))
+        if q:
+            path += "?" + "&".join(q)
         status, body, headers = call("GET", path)
         if status != 200:
             sys.stderr.write("error: %s %s\n" % (status, body))
             return 1
-        if "?rev=" not in path:
+        if not rev:
             cache_etag(cache_key(args[0], True), headers.get("ETag") or headers.get("etag"))
         sys.stdout.write(body)
     elif cmd == "history":
@@ -713,8 +738,32 @@ def doc_main(cmd, args):
                 "warning: '%s' has no '## ' heading; it will show sections: [] "
                 "with no outline in `doc index`.\n" % args[1]
             )
-        return write("PUT", args[0], body.encode("utf-8"), force, is_doc=True, note=note)
+        raw = body.encode("utf-8")
+        if diff_flag:
+            return do_diff(args[0], raw, section, upsert, rename_to, is_doc=True)
+        if section:
+            target = "/docs/%s?section=%s" % (
+                urllib.parse.quote(args[0]),
+                urllib.parse.quote(section),
+            )
+            if upsert:
+                target += "&mode=upsert"
+            if rename_to:
+                target += "&rename_to=" + urllib.parse.quote(rename_to)
+            label = "doc %s#%s" % (args[0], rename_to if rename_to else section)
+            return write(
+                "PUT", args[0], raw, force, is_doc=True, note=note, path=target, label=label
+            )
+        return write("PUT", args[0], raw, force, is_doc=True, note=note)
     elif cmd == "delete":
+        if section:
+            target = "/docs/%s?section=%s" % (
+                urllib.parse.quote(args[0]),
+                urllib.parse.quote(section),
+            )
+            return write(
+                "DELETE", args[0], None, force, is_doc=True, note=note, path=target
+            )
         return write("DELETE", args[0], None, force, is_doc=True, note=note)
     else:
         print("unknown doc command: " + cmd)

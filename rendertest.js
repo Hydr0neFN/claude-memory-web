@@ -205,6 +205,34 @@ check('MD.slug matches the id render() assigns the same heading',
 check('MD.slug is stable for the same input', MD.slug('Foo Bar') === MD.slug('Foo Bar'));
 check('MD.slug handles CJK', MD.slug('揪日子') === 'h-' + '揪日子');
 
+/* --- inline HTML comments ----------------------------------------------- */
+// Regression for 2026-08-20: the block scanner strips only whole-line comments,
+// so a pin marker written on the same line as its fact (which protocol-write
+// explicitly allows) rendered as literal `<!-- pin: corrected -->` text.
+{
+  const h = MD.render('- **CORRECTED** <!-- pin: corrected --> the old number was wrong');
+  check('inline pin marker is not rendered as literal text', !/&lt;!--/.test(h), h);
+  check('inline pin marker renders as a badge', /class="pinbadge"[^>]*>corrected</.test(h), h);
+  check('the fact around an inline pin survives', /the old number was wrong/.test(h), h);
+
+  const g = MD.render('alpha <!-- some private note --> omega');
+  check('a non-pin inline comment is dropped entirely',
+    !/&lt;!--/.test(g) && !/private note/.test(g) && /alpha/.test(g) && /omega/.test(g), g);
+
+  const BQ = String.fromCharCode(96);
+  const cs = MD.render('use ' + BQ + '<!-- pin: decided -->' + BQ + ' as the marker');
+  check('a comment inside a code span is left visible',
+    /<code>&lt;!-- pin: decided --&gt;<\/code>/.test(cs), cs);
+
+  const wl = MD.render('## H\n<!-- verified: 2026-08-20 -->\n\ntext');
+  check('whole-line verified marker still becomes a heading badge',
+    /vbadge/.test(wl) && !/&lt;!--/.test(wl), wl);
+
+  const multi = MD.render('a <!-- pin: retracted --> b <!-- pin: decided --> c');
+  check('two inline pins on one line both render',
+    (multi.match(/pinbadge/g) || []).length === 2, multi);
+}
+
 /* --- perf sanity -------------------------------------------------------- */
 const t0 = Date.now();
 for (let i = 0; i < 20; i++) MD.render(a);

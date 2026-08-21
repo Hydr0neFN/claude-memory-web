@@ -1,5 +1,9 @@
 """Claude Memory API.
 
+Section addressing (?section=) works identically on /memory/{category} and
+/docs/{slug}; both go through section_put_text / section_delete_text so a
+change to one cannot miss the other.
+
 Known limitation: '## ' sections can be read, replaced, or deleted, but not
 reordered or inserted at a specific position -- a section write always lands
 either in its existing slot or appended at the end (?mode=upsert). A category
@@ -489,6 +493,86 @@ def section_response(body: str, name: str, headers: dict) -> PlainTextResponse:
     return PlainTextResponse("\n".join(lines[start:end]), headers=out_headers)
 
 
+def section_put_text(path, name: str, raw_body: bytes, mode: str, rename_to: str,
+                    absent_detail: str):
+    """New whole-file text for a '## ' section write, plus the heading name to
+    put in the commit subject. Shared by /memory/{category} and /docs/{slug}:
+    they used to hold independent copies of the read path and /docs simply
+    never got the write path at all, so ?section= was silently ignored there
+    -- an agent asking for three lines got the whole document and a 200."""
+    if not path.exists():
+        if mode == "upsert":
+            # require_precondition just accepted 'If-None-Match: *' for a file
+            # that doesn't exist yet -- a plain 404 here would contradict the
+            # precondition that just succeeded. A section upsert only ever adds
+            # to an existing file (see the module docstring's "no positional
+            # insert" limitation), so this is a 400, not an implicit create.
+            raise HTTPException(status_code=400, detail=absent_detail)
+        raise HTTPException(status_code=404, detail="not found")
+
+    block_lines = raw_body.decode("utf-8").splitlines()
+    heading = SECTION_RE.match(block_lines[0]) if block_lines else None
+    if not heading:
+        raise HTTPException(
+            status_code=400, detail="section body must start with a '## ' heading line"
+        )
+    heading_name = heading.group(1)
+    # No implicit rename from a heading/section mismatch: callers are LLMs that
+    # routinely drift '## Context' to '## Context:' or '### Context', and a
+    # silent rename would 404 every existing reference to the old name. A
+    # rename must be requested explicitly.
+    expected_name = rename_to if rename_to else name
+    if heading_name != expected_name:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "heading '%s' does not match expected '%s'; pass "
+                "&rename_to=<new-name> with a body heading of <new-name> "
+                "for a deliberate rename" % (heading_name, expected_name)
+            ),
+        )
+
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    bounds = find_section_bounds(lines, name)
+    if bounds is None:
+        if mode != "upsert":
+            raise section_not_found(text, name)
+        new_lines = lines + ([""] if lines and lines[-1] != "" else []) + block_lines
+    else:
+        start, end = bounds
+        new_lines = lines[:start] + block_lines + lines[end:]
+
+    new_text = "\n".join(new_lines)
+    if not new_text.endswith("\n"):
+        new_text += "\n"
+    return new_text, heading_name
+
+
+def section_delete_text(path, name: str, empty_detail: str) -> str:
+    """New whole-file text after removing a '## ' section. Refuses to leave a
+    0-byte husk behind; see section_put_text for why this is shared."""
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    bounds = find_section_bounds(lines, name)
+    if bounds is None:
+        raise section_not_found(text, name)
+    start, end = bounds
+    new_text = "\n".join(lines[:start] + lines[end:])
+    if new_text.strip():
+        if not new_text.endswith("\n"):
+            new_text += "\n"
+    elif new_text:
+        # nothing but whitespace would remain -- normalise to truly empty so
+        # the check below is unambiguous either way.
+        new_text = ""
+    if not new_text.strip():
+        # Deleting this section would leave a husk that still shows up in the
+        # listings. Refuse instead of silently emptying the file.
+        raise HTTPException(status_code=400, detail=empty_detail)
+    return new_text
+
+
 def scan_pins() -> list:
     """Every retraction/decision marker across /memory: explicit
     '<!-- pin: kind -->' comments, plus the legacy prose forms that predate
@@ -779,59 +863,11 @@ async def put_category(
     raw_body = await request.body()
 
     if section:
-        if not path.exists():
-            if mode == "upsert":
-                # require_precondition just accepted 'If-None-Match: *' for a
-                # category that doesn't exist yet -- a plain 404 here would
-                # contradict the precondition that just succeeded. A section
-                # upsert only ever adds to an existing file (see the module
-                # docstring's "no positional insert" limitation), so this is
-                # a 400, not an implicit whole-category create.
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "category '%s' does not exist; PUT it whole (without "
-                        "?section) first, then upsert into it" % category
-                    ),
-                )
-            raise HTTPException(status_code=404, detail="not found")
-        block_text = raw_body.decode("utf-8")
-        block_lines = block_text.splitlines()
-        heading = SECTION_RE.match(block_lines[0]) if block_lines else None
-        if not heading:
-            raise HTTPException(
-                status_code=400, detail="section body must start with a '## ' heading line"
-            )
-        heading_name = heading.group(1)
-        # No implicit rename from a heading/section mismatch: callers are
-        # LLMs that routinely drift '## Context' to '## Context:' or
-        # '### Context', and a silent rename would 404 every existing
-        # reference to the old name. A rename must be requested explicitly.
-        expected_name = rename_to if rename_to else section
-        if heading_name != expected_name:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "heading '%s' does not match expected '%s'; pass "
-                    "&rename_to=<new-name> with a body heading of <new-name> "
-                    "for a deliberate rename" % (heading_name, expected_name)
-                ),
-            )
-
-        text = path.read_text(encoding="utf-8")
-        lines = text.splitlines()
-        bounds = find_section_bounds(lines, section)
-        if bounds is None:
-            if mode != "upsert":
-                raise section_not_found(text, section)
-            new_lines = lines + ([""] if lines and lines[-1] != "" else []) + block_lines
-        else:
-            start, end = bounds
-            new_lines = lines[:start] + block_lines + lines[end:]
-
-        new_text = "\n".join(new_lines)
-        if not new_text.endswith("\n"):
-            new_text += "\n"
+        new_text, heading_name = section_put_text(
+            path, section, raw_body, mode, rename_to,
+            "category '%s' does not exist; PUT it whole (without ?section) "
+            "first, then upsert into it" % category,
+        )
         path.write_text(new_text, encoding="utf-8")
         out_body = new_text.encode("utf-8")
         committed = git_commit(commit_subject("PUT", "%s#%s" % (category, heading_name), request))
@@ -857,34 +893,12 @@ def delete_category(category: str, request: Request, section: str = ""):
     require_precondition(path, request)
 
     if section:
-        text = path.read_text(encoding="utf-8")
-        lines = text.splitlines()
-        bounds = find_section_bounds(lines, section)
-        if bounds is None:
-            raise section_not_found(text, section)
-        start, end = bounds
-        new_lines = lines[:start] + lines[end:]
-        new_text = "\n".join(new_lines)
-        if new_text.strip():
-            if not new_text.endswith("\n"):
-                new_text += "\n"
-        elif new_text:
-            # nothing but whitespace would remain -- normalise to truly
-            # empty so the check below is unambiguous either way.
-            new_text = ""
-        if not new_text.strip():
-            # Deleting this section would leave a 0-byte husk that still
-            # shows up in /memory and /memory/index. Refuse instead of
-            # silently emptying the category -- use DELETE /memory/{category}
-            # (no ?section) if the whole category should go.
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "deleting section '%s' would leave '%s' empty; delete the "
-                    "whole category instead (DELETE /memory/%s with no "
-                    "?section)" % (section, category, category)
-                ),
-            )
+        new_text = section_delete_text(
+            path, section,
+            "deleting section '%s' would leave '%s' empty; delete the whole "
+            "category instead (DELETE /memory/%s with no ?section)"
+            % (section, category, category),
+        )
         path.write_text(new_text, encoding="utf-8")
         committed = git_commit(commit_subject("DELETE", "%s#%s" % (category, section), request))
         return PlainTextResponse(
@@ -950,7 +964,7 @@ def doc_history(slug: str, request: Request, limit: int = 50):
 
 
 @app.get("/docs/{slug}")
-def get_doc(slug: str, request: Request, rev: str = ""):
+def get_doc(slug: str, request: Request, rev: str = "", section: str = ""):
     check_auth(request)
     path = validate_doc(slug)
 
@@ -960,25 +974,46 @@ def get_doc(slug: str, request: Request, rev: str = ""):
         show = git("show", "%s:docs/%s.md" % (rev, slug), check=False)
         if show.returncode != 0:
             raise HTTPException(status_code=404, detail="rev or path not found")
-        return PlainTextResponse(
-            show.stdout,
-            headers={"ETag": '"%s"' % blob_sha(show.stdout.encode("utf-8")),
-                     "X-Memory-Rev": rev},
-        )
+        headers = {"ETag": '"%s"' % blob_sha(show.stdout.encode("utf-8")),
+                   "X-Memory-Rev": rev}
+        if section:
+            return section_response(show.stdout, section, headers)
+        return PlainTextResponse(show.stdout, headers=headers)
 
     if not path.exists():
         raise HTTPException(status_code=404, detail="not found")
     body = path.read_text(encoding="utf-8")
-    return PlainTextResponse(body, headers={"ETag": '"%s"' % blob_sha(body.encode("utf-8"))})
+    headers = {"ETag": '"%s"' % blob_sha(body.encode("utf-8"))}
+    if section:
+        return section_response(body, section, headers)
+    return PlainTextResponse(body, headers=headers)
 
 
 @app.put("/docs/{slug}")
-async def put_doc(slug: str, request: Request):
+async def put_doc(
+    slug: str, request: Request, section: str = "", mode: str = "", rename_to: str = ""
+):
     check_write_auth(request)
     path = validate_doc(slug)
     require_precondition(path, request)
 
     body = await request.body()
+
+    if section:
+        new_text, heading_name = section_put_text(
+            path, section, body, mode, rename_to,
+            "doc '%s' does not exist; PUT it whole (without ?section) first, "
+            "then upsert into it" % slug,
+        )
+        path.write_text(new_text, encoding="utf-8")
+        out_body = new_text.encode("utf-8")
+        committed = git_commit(
+            commit_subject("PUT", "doc %s#%s" % (slug, heading_name), request)
+        )
+        return PlainTextResponse(
+            "OK", headers=commit_headers({"ETag": '"%s"' % blob_sha(out_body)}, committed)
+        )
+
     existed = path.exists()
     path.write_text(body.decode("utf-8"), encoding="utf-8")
     committed = git_commit(commit_subject("PUT" if existed else "CREATE", "doc %s" % slug, request))
@@ -989,12 +1024,30 @@ async def put_doc(slug: str, request: Request):
 
 
 @app.delete("/docs/{slug}")
-def delete_doc(slug: str, request: Request):
+def delete_doc(slug: str, request: Request, section: str = ""):
     check_write_auth(request)
     path = validate_doc(slug)
     if not path.exists():
         raise HTTPException(status_code=404, detail="not found")
     require_precondition(path, request)
+
+    if section:
+        new_text = section_delete_text(
+            path, section,
+            "deleting section '%s' would leave doc '%s' empty; delete the "
+            "whole doc instead (DELETE /docs/%s with no ?section)"
+            % (section, slug, slug),
+        )
+        path.write_text(new_text, encoding="utf-8")
+        committed = git_commit(
+            commit_subject("DELETE", "doc %s#%s" % (slug, section), request)
+        )
+        return PlainTextResponse(
+            "OK",
+            headers=commit_headers(
+                {"ETag": '"%s"' % blob_sha(new_text.encode("utf-8"))}, committed
+            ),
+        )
 
     path.unlink()
     committed = git_commit(commit_subject("DELETE", "doc %s" % slug, request))

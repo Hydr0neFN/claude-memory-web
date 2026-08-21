@@ -17,6 +17,23 @@ token, and git-commits every write so any edit is recoverable. Reads are
 is the git blob SHA of the body. `main.py` and `webauth.py` here are the whole
 server.
 
+There are two namespaces. `/memory/{category}` holds facts — short, deduplicated,
+one topic each. `/docs/{slug}` holds working documents — handoffs, runbooks,
+audit reports: long, project-scoped, superseded rather than accumulated. Docs
+live in `data/docs/`, which every `/memory` endpoint is blind to because its
+glob is non-recursive. `/memory/search` skips docs unless you pass
+`&scope=docs|all`, so handoff prose never swamps a fact lookup.
+
+Both namespaces support `?section=<name>` on GET, PUT and DELETE, addressing a
+single `## ` block: read three lines out of a 20 KB file, or splice three lines
+back in without touching another byte. The locking unit stays the whole file —
+`If-Match` still carries the whole-file ETag — only the *editing* unit becomes
+the section. That matters for LLM callers, which otherwise load an entire
+category to change one line and hand-roll a whole-file patch to write it back.
+A body whose heading does not match the section is a `400`, never an implicit
+rename, because a silent rename would break every existing reference to the old
+name.
+
 ## What the UI does
 
 - **Sidebar tree** — the store is flat (names match `^[a-z0-9-]+$`) but the
@@ -49,9 +66,10 @@ Cookie-authorized writes must also send `X-Memory-Actor`; a cross-site request
 cannot set a custom header, and the cookie is `SameSite=strict` on top of that.
 The header doubles as the author in the git commit (`PUT infra via memory-web`).
 
-Login is throttled per client IP, and `/docs`, `/redoc` and `/openapi.json` are
-disabled — on a public hostname the schema was the only thing readable without
-auth.
+Login is throttled per client IP. FastAPI's own `/docs`, `/redoc` and
+`/openapi.json` are disabled — on a public hostname the schema was the only
+thing readable without auth, and `/docs` is now the working-documents namespace
+described above.
 
 ## Files
 

@@ -253,6 +253,9 @@ input:focus, textarea:focus { outline: 2px solid var(--accent-line); outline-off
 .md th { background: var(--line-2); }
 .md mark { background: var(--mark); color: inherit; border-radius: 3px; padding: 0 2px; }
 .md .vbadge { font-size: 11px; font-weight: 400; margin-left: 8px; vertical-align: middle; }
+.md .pinbadge { font-size: 10px; text-transform: uppercase; letter-spacing: .04em;
+  padding: 1px 6px; border: 1px solid var(--line); border-radius: 999px;
+  opacity: .7; vertical-align: middle; }
 .md .flash { animation: flash 1.6s ease-out; }
 @keyframes flash { from { background: var(--mark); } to { background: transparent; } }
 

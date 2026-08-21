@@ -387,7 +387,26 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 return self._text(body, headers={"ETag": '"%s"' % blob_sha(body)})
             if slug not in DOCS:
                 return self._json({"detail": "not found"}, 404)
-            return self._text(DOCS[slug], headers={"ETag": '"%s"' % blob_sha(DOCS[slug])})
+            body = DOCS[slug]
+            headers = {"ETag": '"%s"' % blob_sha(body)}
+            # Same ?section= handling as /memory above. The stub must not be
+            # more permissive than the server: /docs used to ignore the
+            # parameter and return the whole body with a 200, which is exactly
+            # the failure a stub should reproduce or refuse, never paper over.
+            section = (q.get("section", [""])[0])
+            if section:
+                lines = body.splitlines()
+                bounds = find_section_bounds(lines, section)
+                if bounds is None:
+                    return self._json(
+                        {"detail": "section '%s' not found; available sections: %s" % (
+                            section, ", ".join(s2["name"] for s2 in sections_of(body)))},
+                        404,
+                    )
+                start, end = bounds
+                headers["X-Memory-Section"] = section_header_value(section)
+                return self._text("\n".join(lines[start:end]), headers=headers)
+            return self._text(body, headers=headers)
 
         return super().do_GET()
 
@@ -500,6 +519,28 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._text("OK")
         m = re.match(r"^/docs/([a-z0-9-]+)$", u.path)
         if m and m.group(1) in DOCS:
+            if section:
+                text = DOCS[m.group(1)]
+                lines = text.splitlines()
+                bounds = find_section_bounds(lines, section)
+                if bounds is None:
+                    return self._json(
+                        {"detail": "section '%s' not found; available sections: %s" % (
+                            section, ", ".join(s2["name"] for s2 in sections_of(text)))},
+                        404,
+                    )
+                start, end = bounds
+                new_text = "\n".join(lines[:start] + lines[end:])
+                if not new_text.strip():
+                    return self._json(
+                        {"detail": "deleting section '%s' would leave doc '%s' empty; "
+                                   "delete the whole doc instead" % (section, m.group(1))},
+                        400,
+                    )
+                if not new_text.endswith("\n"):
+                    new_text += "\n"
+                DOCS[m.group(1)] = new_text
+                return self._text("OK", headers={"ETag": '"%s"' % blob_sha(new_text)})
             del DOCS[m.group(1)]
             return self._text("OK")
         return self._json({"detail": "not found"}, 404)

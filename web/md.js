@@ -72,6 +72,20 @@ window.MD = (function () {
       return '\u0000' + (codes.length - 1) + '\u0000';
     });
 
+    // Inline HTML comments. The block scanner strips only comments that occupy
+    // a whole line, but `protocol-write` explicitly allows a pin marker on the
+    // SAME line as the fact it marks, and those fell through to esc() and
+    // rendered as literal `<!-- pin: corrected -->` text. A comment is invisible
+    // in markdown wherever it sits. `pin:` is the one kind worth surfacing to a
+    // human -- it marks a retraction or a standing decision -- so it becomes a
+    // small badge; every other comment is dropped. This runs after the code-span
+    // extraction above, so a comment inside backticks is already a placeholder
+    // and survives untouched.
+    out = out.replace(/&lt;!--([\s\S]*?)--&gt;/g, function (m, body) {
+      var pin = /^\s*pin:\s*([a-z][a-z-]*)\s*$/.exec(body);
+      return pin ? '<span class="pinbadge" title="pin marker">' + pin[1] + '</span>' : '';
+    });
+
     // [[doc:slug]] -> in-app link to a working document. Checked first so
     // 'doc:' is consumed here rather than falling through to the plain
     // [[category]] rule below (which would otherwise treat 'doc' as a scheme
