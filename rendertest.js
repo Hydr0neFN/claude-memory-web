@@ -228,6 +228,22 @@ check('MD.slug handles CJK', MD.slug('揪日子') === 'h-' + '揪日子');
   check('whole-line verified marker still becomes a heading badge',
     /vbadge/.test(wl) && !/&lt;!--/.test(wl), wl);
 
+  // An opener with no closer must stay visible as literal text and must NOT
+  // swallow the rest of the paragraph looking for one. Found by review after
+  // the first version matched across newlines while flushPara() joined
+  // paragraph lines with a space -- so one mistyped '<!--' silently deleted
+  // every following line up to the next '-->' (an arrow in prose counts).
+  const un = MD.render('line one <!-- oops\nline two <!-- pin: decided --> end');
+  check('an unterminated comment stays literal', /&lt;!-- oops/.test(un), un);
+  check('text after an unterminated comment survives', /line two/.test(un) && /end/.test(un), un);
+  check('a pin later in the same paragraph still renders', /pinbadge/.test(un), un);
+  const solo = MD.render('risk <!-- fixme');
+  check('an unterminated comment alone is left alone', /&lt;!-- fixme/.test(solo), solo);
+  check('an ascii arrow in prose is untouched',
+    /--&gt; 2ms/.test(MD.render('latency 5ms --> 2ms')), MD.render('latency 5ms --> 2ms'));
+  check('emphasis still spans a wrapped source line',
+    /<strong>alpha\nbeta<\/strong>/.test(MD.render('**alpha\nbeta**')), MD.render('**alpha\nbeta**'));
+
   const multi = MD.render('a <!-- pin: retracted --> b <!-- pin: decided --> c');
   check('two inline pins on one line both render',
     (multi.match(/pinbadge/g) || []).length === 2, multi);

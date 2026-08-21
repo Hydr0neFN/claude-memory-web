@@ -558,7 +558,17 @@ def section_delete_text(path, name: str, empty_detail: str) -> str:
     if bounds is None:
         raise section_not_found(text, name)
     start, end = bounds
-    new_text = "\n".join(lines[:start] + lines[end:])
+    head, tail = lines[:start], lines[end:]
+    # find_section_bounds trims the blank line that separated this section
+    # from the next heading OUT of the section, so it stays at the head of
+    # `tail` -- while the blank that separated the PREVIOUS section from this
+    # one is still at the end of `head`. Joining them leaves two blank lines
+    # where there was one. Harmless to a renderer, but it is byte drift: it
+    # accumulates one blank per deletion and shows up as noise in every
+    # subsequent diff of the file.
+    if head and tail and head[-1] == "" and tail[0] == "":
+        tail = tail[1:]
+    new_text = "\n".join(head + tail)
     if new_text.strip():
         if not new_text.endswith("\n"):
             new_text += "\n"

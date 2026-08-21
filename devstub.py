@@ -503,8 +503,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                         404,
                     )
                 start, end = bounds
-                new_lines = lines[:start] + lines[end:]
-                new_text = "\n".join(new_lines)
+                head, tail = lines[:start], lines[end:]
+                if head and tail and head[-1] == "" and tail[0] == "":
+                    tail = tail[1:]      # see main.py's section_delete_text
+                new_text = "\n".join(head + tail)
                 if not new_text.strip():
                     return self._json(
                         {"detail": "deleting section '%s' would leave '%s' empty; delete "
@@ -530,7 +532,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                         404,
                     )
                 start, end = bounds
-                new_text = "\n".join(lines[:start] + lines[end:])
+                head, tail = lines[:start], lines[end:]
+                if head and tail and head[-1] == "" and tail[0] == "":
+                    tail = tail[1:]      # see main.py's section_delete_text
+                new_text = "\n".join(head + tail)
                 if not new_text.strip():
                     return self._json(
                         {"detail": "deleting section '%s' would leave doc '%s' empty; "

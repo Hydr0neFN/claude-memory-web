@@ -81,7 +81,14 @@ window.MD = (function () {
     // small badge; every other comment is dropped. This runs after the code-span
     // extraction above, so a comment inside backticks is already a placeholder
     // and survives untouched.
-    out = out.replace(/&lt;!--([\s\S]*?)--&gt;/g, function (m, body) {
+    // The body deliberately cannot cross a newline. HTML says a comment runs
+    // until the next closer, but inline() is handed a whole joined paragraph,
+    // so one mistyped opener would swallow every following line up to the
+    // next '-->' -- including an arrow written in prose -- and the reader
+    // would see text silently vanish with nothing to indicate it. Confining
+    // the match to a single line means an unterminated opener stays visible
+    // as literal text, which is the failure you can actually notice.
+    out = out.replace(/&lt;!--([^\n]*?)--&gt;/g, function (m, body) {
       var pin = /^\s*pin:\s*([a-z][a-z-]*)\s*$/.exec(body);
       return pin ? '<span class="pinbadge" title="pin marker">' + pin[1] + '</span>' : '';
     });
@@ -185,7 +192,12 @@ window.MD = (function () {
 
     function flushPara() {
       if (!para.length) return;
-      html.push('<p data-line="' + paraLine + '">' + inline(para.join(' '), known) + '</p>');
+      // Joined with a newline, not a space: HTML collapses it to the same
+      // single space when rendering, but it keeps the source line boundaries
+      // visible to inline(), whose comment rule refuses to cross one. Joining
+      // with a space erased that boundary and let a mistyped '<!--' on one
+      // line swallow every line after it up to the next '-->'.
+      html.push('<p data-line="' + paraLine + '">' + inline(para.join('\n'), known) + '</p>');
       para = [];
     }
 

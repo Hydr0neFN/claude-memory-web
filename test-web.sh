@@ -312,6 +312,24 @@ after=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/docs/$DOC")
 check "the whole doc is exactly the expected bytes after a section delete" \
   "$(printf '# webui test doc\n\n## Where things stand\n\n- two')" "$after"
 
+# Deleting a MIDDLE section used to leave two blank lines where there was one:
+# find_section_bounds trims the blank before the next heading out of the
+# section, so it stays with the tail, while the blank that preceded the deleted
+# section stays with the head. Nothing renders differently, which is why it
+# survived -- it is byte drift that accumulates one blank per deletion and
+# makes every later diff of the file noisier. Asserted on the whole document.
+curl -s -o /dev/null -X PUT -H "Authorization: Bearer $TOKEN" -H "If-Match: *" \
+  --data-binary $'## S1\n\nContent 1\n\n## S2\n\nContent 2\n\n## S3\n\nContent 3\n' \
+  "$BASE/docs/$DOC"
+etag=$(curl -s -D - -o /dev/null -H "Authorization: Bearer $TOKEN" "$BASE/docs/$DOC" \
+  | tr -d '\r' | sed -n 's/^[Ee][Tt][Aa][Gg]: "\(.*\)"$/\1/p')
+code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Bearer $TOKEN" \
+  -H "If-Match: $etag" "$BASE/docs/$DOC?section=S2")
+check "delete a middle section" 200 "$code"
+after=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/docs/$DOC")
+check "deleting a middle section leaves exactly one blank line, not two" \
+  "$(printf '## S1\n\nContent 1\n\n## S3\n\nContent 3')" "$after"
+
 rm -f "$DSEC"
 
 code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Bearer $TOKEN" \
