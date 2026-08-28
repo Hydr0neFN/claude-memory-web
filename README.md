@@ -1,3 +1,5 @@
+**English** · [繁體中文](README.zh-TW.md)
+
 # claude-memory-web
 
 Browser UI for a personal [Claude Memory API](#what-the-api-is) — a small
