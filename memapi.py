@@ -651,7 +651,9 @@ def main(argv):
     elif cmd == "history":
         return read_or_die("GET", "/memory/%s/history" % args[0])
     elif cmd == "put":
-        body = io.open(args[1], encoding="utf-8", newline="").read().encode("utf-8")
+        # newline="" keeps the file byte-exact; normalise CRLF here so a file authored
+        # on Windows cannot put CRLF into the store, which the service hashes on disk.
+        body = io.open(args[1], encoding="utf-8", newline="").read().replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
         if diff_flag:
             return do_diff(args[0], body, section, upsert, rename_to)
         if section:
@@ -732,7 +734,7 @@ def doc_main(cmd, args):
     elif cmd == "history":
         return read_or_die("GET", "/docs/%s/history" % args[0])
     elif cmd == "put":
-        body = io.open(args[1], encoding="utf-8", newline="").read()
+        body = io.open(args[1], encoding="utf-8", newline="").read().replace("\r\n", "\n").replace("\r", "\n")
         if not re.search(r"^##[ \t]+\S", body, re.MULTILINE):
             sys.stderr.write(
                 "warning: '%s' has no '## ' heading; it will show sections: [] "

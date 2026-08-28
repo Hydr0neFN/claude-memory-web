@@ -192,6 +192,29 @@ def parse_if_match(raw: str) -> set:
     return out
 
 
+def normalise_body(data: bytes) -> bytes:
+    """LF-only, valid UTF-8, or 400.
+
+    CRLF must never reach disk: the ETag is the blob sha of the bytes on disk, so a
+    CRLF body served back as LF hashes differently and every later write 409s (the
+    2026-08-28 infra-rpi4-ops incident).
+
+    The UTF-8 check replaces the validation that write_text() used to give for free.
+    Without it a single non-UTF-8 body is committed to disk and then /memory/index,
+    /memory/search and /memory/pins -- all of which read_text() every *.md -- raise
+    UnicodeDecodeError, taking the whole store down for one bad write.
+    """
+    out = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    try:
+        out.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="body must be valid utf-8 (%s)" % exc,
+        )
+    return out
+
+
 def require_precondition(path: Path, request: Request) -> None:
     """Strict optimistic concurrency.
 
@@ -500,6 +523,7 @@ def section_put_text(path, name: str, raw_body: bytes, mode: str, rename_to: str
     they used to hold independent copies of the read path and /docs simply
     never got the write path at all, so ?section= was silently ignored there
     -- an agent asking for three lines got the whole document and a 200."""
+    raw_body = normalise_body(raw_body)   # LF-only and valid UTF-8, or 400
     if not path.exists():
         if mode == "upsert":
             # require_precondition just accepted 'If-None-Match: *' for a file
@@ -718,7 +742,8 @@ def index(request: Request):
     check_auth(request)
     out = []
     for path in sorted(DATA_DIR.glob("*.md")):
-        text = path.read_text(encoding="utf-8")
+        raw = path.read_bytes()   # blob sha of disk bytes, same as GET and the write guard
+        text = raw.decode("utf-8")
         stat = path.stat()
         out.append(
             {
@@ -727,7 +752,7 @@ def index(request: Request):
                 "mtime": datetime.fromtimestamp(stat.st_mtime, timezone.utc)
                 .isoformat()
                 .replace("+00:00", "Z"),
-                "etag": blob_sha(text.encode("utf-8")),
+                "etag": blob_sha(raw),
                 "sections": sections_of(text),
                 "docs": doc_refs_of(text),
                 "refs": category_refs_of(text, path.stem),
@@ -855,8 +880,15 @@ def get_category(category: str, request: Request, rev: str = "", section: str = 
 
     if not path.exists():
         raise HTTPException(status_code=404, detail="not found")
-    body = path.read_text(encoding="utf-8")
-    headers = {"ETag": '"%s"' % blob_sha(body.encode("utf-8"))}
+    # Hash the bytes ON DISK, not the decoded text. read_text() applies universal
+    # newline translation, so a file stored with CRLF is served as LF and hashes
+    # differently from what require_precondition() sees. The client then sends back
+    # a correct-looking ETag and every write 409s forever with no concurrent writer.
+    # This also restores the documented invariant that the ETag IS the git blob id.
+    # Found 2026-08-28 on infra-rpi4-ops, poisoned by a Windows-authored PUT.
+    raw = path.read_bytes()
+    body = raw.decode("utf-8")
+    headers = {"ETag": '"%s"' % blob_sha(raw)}
     if section:
         return section_response(body, section, headers)
     return PlainTextResponse(body, headers=headers)
@@ -868,9 +900,10 @@ async def put_category(
 ):
     check_write_auth(request)
     path = validate_category(category)
-    require_precondition(path, request)
-
+    # Body first: await is a yield point, so checking the precondition before it lets
+    # two slow-uploading writers both pass the check before either writes.
     raw_body = await request.body()
+    require_precondition(path, request)
 
     if section:
         new_text, heading_name = section_put_text(
@@ -878,7 +911,7 @@ async def put_category(
             "category '%s' does not exist; PUT it whole (without ?section) "
             "first, then upsert into it" % category,
         )
-        path.write_text(new_text, encoding="utf-8")
+        path.write_bytes(new_text.encode("utf-8"))   # not write_text: os.linesep would reintroduce CRLF
         out_body = new_text.encode("utf-8")
         committed = git_commit(commit_subject("PUT", "%s#%s" % (category, heading_name), request))
         return PlainTextResponse(
@@ -886,11 +919,15 @@ async def put_category(
         )
 
     existed = path.exists()
-    path.write_text(raw_body.decode("utf-8"), encoding="utf-8")
+    # Hash what we WROTE, not what arrived. Returning blob_sha(raw_body) after writing
+    # the normalised bytes hands the caller an ETag the write guard will reject on its
+    # very next request -- the original bug, reintroduced from the other end.
+    stored = normalise_body(raw_body)
+    path.write_bytes(stored)
     committed = git_commit(commit_subject("PUT" if existed else "CREATE", category, request))
 
     return PlainTextResponse(
-        "OK", headers=commit_headers({"ETag": '"%s"' % blob_sha(raw_body)}, committed)
+        "OK", headers=commit_headers({"ETag": '"%s"' % blob_sha(stored)}, committed)
     )
 
 
@@ -909,7 +946,7 @@ def delete_category(category: str, request: Request, section: str = ""):
             "category instead (DELETE /memory/%s with no ?section)"
             % (section, category, category),
         )
-        path.write_text(new_text, encoding="utf-8")
+        path.write_bytes(new_text.encode("utf-8"))   # not write_text: os.linesep would reintroduce CRLF
         committed = git_commit(commit_subject("DELETE", "%s#%s" % (category, section), request))
         return PlainTextResponse(
             "OK",
@@ -943,7 +980,8 @@ def doc_index(request: Request):
     check_auth(request)
     out = []
     for path in sorted(DOCS_DIR.glob("*.md")):
-        text = path.read_text(encoding="utf-8")
+        raw = path.read_bytes()   # blob sha of disk bytes, same as GET and the write guard
+        text = raw.decode("utf-8")
         stat = path.stat()
         title = path.stem
         for line in text.splitlines():
@@ -958,7 +996,7 @@ def doc_index(request: Request):
                 "mtime": datetime.fromtimestamp(stat.st_mtime, timezone.utc)
                 .isoformat()
                 .replace("+00:00", "Z"),
-                "etag": blob_sha(text.encode("utf-8")),
+                "etag": blob_sha(raw),
                 "title": title,
                 "sections": sections_of(text),
             }
@@ -992,8 +1030,9 @@ def get_doc(slug: str, request: Request, rev: str = "", section: str = ""):
 
     if not path.exists():
         raise HTTPException(status_code=404, detail="not found")
-    body = path.read_text(encoding="utf-8")
-    headers = {"ETag": '"%s"' % blob_sha(body.encode("utf-8"))}
+    raw = path.read_bytes()   # see get_category: hash disk bytes, not decoded text
+    body = raw.decode("utf-8")
+    headers = {"ETag": '"%s"' % blob_sha(raw)}
     if section:
         return section_response(body, section, headers)
     return PlainTextResponse(body, headers=headers)
@@ -1005,9 +1044,8 @@ async def put_doc(
 ):
     check_write_auth(request)
     path = validate_doc(slug)
+    body = await request.body()   # see put_category: body before precondition
     require_precondition(path, request)
-
-    body = await request.body()
 
     if section:
         new_text, heading_name = section_put_text(
@@ -1015,7 +1053,7 @@ async def put_doc(
             "doc '%s' does not exist; PUT it whole (without ?section) first, "
             "then upsert into it" % slug,
         )
-        path.write_text(new_text, encoding="utf-8")
+        path.write_bytes(new_text.encode("utf-8"))   # not write_text: os.linesep would reintroduce CRLF
         out_body = new_text.encode("utf-8")
         committed = git_commit(
             commit_subject("PUT", "doc %s#%s" % (slug, heading_name), request)
@@ -1025,11 +1063,12 @@ async def put_doc(
         )
 
     existed = path.exists()
-    path.write_text(body.decode("utf-8"), encoding="utf-8")
+    stored = normalise_body(body)      # see put_category: hash what we wrote
+    path.write_bytes(stored)
     committed = git_commit(commit_subject("PUT" if existed else "CREATE", "doc %s" % slug, request))
 
     return PlainTextResponse(
-        "OK", headers=commit_headers({"ETag": '"%s"' % blob_sha(body)}, committed)
+        "OK", headers=commit_headers({"ETag": '"%s"' % blob_sha(stored)}, committed)
     )
 
 
@@ -1048,7 +1087,7 @@ def delete_doc(slug: str, request: Request, section: str = ""):
             "whole doc instead (DELETE /docs/%s with no ?section)"
             % (section, slug, slug),
         )
-        path.write_text(new_text, encoding="utf-8")
+        path.write_bytes(new_text.encode("utf-8"))   # not write_text: os.linesep would reintroduce CRLF
         committed = git_commit(
             commit_subject("DELETE", "doc %s#%s" % (slug, section), request)
         )

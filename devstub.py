@@ -431,6 +431,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if not self.headers.get("x-memory-actor"):
             return self._json({"detail": "X-Memory-Actor required"}, 403)
         body = self.rfile.read(int(self.headers.get("content-length", 0))).decode("utf-8")
+        # Match the real service: bodies are stored LF-only. Without this the stub
+        # accepts a CRLF body that production would normalise, so a web-UI test could
+        # pass here and still disagree with the real server on the ETag.
+        body = body.replace("\r\n", "\n").replace("\r", "\n")
 
         if name == "conflict-me":                       # forced 409, to exercise the conflict UI
             store.setdefault(name, "## Theirs\n\n- their line\n- shared\n")

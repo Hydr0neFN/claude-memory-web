@@ -17,6 +17,17 @@ token, and git-commits every write so any edit is recoverable. Reads are
 is the git blob SHA of the body. `main.py` and `webauth.py` here are the whole
 server.
 
+That ETag is the blob SHA of the bytes **on disk**, and every read path — the
+category, the doc, and both index listings — computes it the same way the write
+guard does. Getting this wrong is subtle and unpleasant: hash the *decoded* text
+instead and universal-newline translation applies, so a file stored with CRLF is
+served as LF and hashed over the LF form. A client that faithfully returns the
+ETag it was handed is then refused `409 etag mismatch` forever, with no
+concurrent writer anywhere. Request bodies are therefore normalised to LF, and
+must be valid UTF-8 or the write is refused `400` — without that check one bad
+body would break `index`, `search` and `pins` for the whole store, since all
+three read every file. `tests/test_etag_crlf.py` holds the contract down.
+
 There are two namespaces. `/memory/{category}` holds facts — short, deduplicated,
 one topic each. `/docs/{slug}` holds working documents — handoffs, runbooks,
 audit reports: long, project-scoped, superseded rather than accumulated. Docs
