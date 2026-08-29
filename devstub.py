@@ -279,7 +279,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             # google:false -> the dev shell shows the token field, which is
             # the only path this stub implements.
             return self._json({"authenticated": True, "via": "token",
-                               "email": "", "google": False})
+                               "email": "", "providers": [], "google": False})
 
         if p == "/memory":
             return self._json(sorted(STORE))

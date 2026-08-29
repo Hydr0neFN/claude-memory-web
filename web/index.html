@@ -6,7 +6,7 @@
 <meta name="color-scheme" content="light dark">
 <meta name="robots" content="noindex, nofollow">
 <title>Memory</title>
-<link rel="stylesheet" href="/app.css?v=17">
+<link rel="stylesheet" href="/app.css?v=18">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='78' font-size='78'>🧠</text></svg>">
 </head>
 <body>
@@ -16,8 +16,9 @@
   <div class="login-card">
     <h1>Memory</h1>
     <a id="login-google" class="btn primary block hidden" href="/auth/google">Sign in with Google</a>
-    <p id="login-google-note" class="muted small hidden">Second factor comes from
-      your Google account. Only allow-listed addresses can sign in.</p>
+    <a id="login-github" class="btn primary block hidden" href="/auth/github">Sign in with GitHub</a>
+    <p id="login-oauth-note" class="muted small hidden">Second factor comes from
+      that account. Only allow-listed addresses can sign in.</p>
     <details id="login-token-wrap" class="login-alt">
       <summary class="muted small">Use the API token instead</summary>
       <form id="login-form" autocomplete="off">
@@ -64,8 +65,8 @@
 <div id="modal-root"></div>
 <div id="toast" class="toast hidden"></div>
 
-<script src="/md.js?v=17"></script>
-<script src="/diff.js?v=17"></script>
-<script src="/app.js?v=17"></script>
+<script src="/md.js?v=18"></script>
+<script src="/diff.js?v=18"></script>
+<script src="/app.js?v=18"></script>
 </body>
 </html>

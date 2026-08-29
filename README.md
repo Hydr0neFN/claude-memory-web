@@ -76,15 +76,25 @@ Two ways in, deliberately asymmetric.
 factor. Whoever holds the token can already read and write the whole store
 through the API, so a second factor at the browser door would guard nothing.
 
-**People** sign in with Google, so a phone can read the store without holding
-the token. The second factor is the one already on the Google account; an
+**People** sign in with GitHub or Google, so a phone can read the store without
+holding the token. The second factor is the one already on that account; an
 allowlist of addresses in `auth.json` is the authorization step, because
-"signed in with Google" by itself authorizes anybody with a Google account.
-`GET /auth/google` starts an authorization-code handshake with PKCE, and the
-callback exchanges the code over a direct back-channel call to Google. That is
-why the ID token's signature is never verified here and why the whole flow adds
-no dependency: nothing sits between this service and Google's token endpoint,
-which is the property JWT verification exists to establish.
+"signed in with GitHub" by itself authorizes anybody with a GitHub account.
+`GET /auth/<provider>` starts an authorization-code handshake and the callback
+exchanges the code over a direct back-channel call to the provider. That is why
+no token signature is verified here and why the whole flow adds no dependency:
+nothing sits between this service and the provider's token endpoint, which is
+the property JWT verification exists to establish.
+
+Either provider, or both, can be configured; a provider with no config or an
+empty allowlist is off, its button hidden and its route answering 503. Two
+differences are load-bearing rather than cosmetic: **GitHub OAuth Apps ignore
+PKCE**, so `code_challenge` is sent only to Google and the GitHub handshake is
+held by the signed state cookie and the client secret alone; and **GitHub
+reports a refused code exchange as HTTP 200 with an `error` body**, so the
+status line cannot be used to tell success from failure. GitHub identity comes
+from `GET /user/emails`, which returns every address on the account, so the
+allowlist is matched against the verified ones.
 
 Both paths end at the same cookie. `POST /auth/login` with the token still
 works and is the way back in when Google is unreachable, when the allowlist is
@@ -96,24 +106,32 @@ manage. `keyver` in `auth.json` is the same lever without touching the token:
 bump it and every browser session dies while every agent keeps working
 (`manage_auth.py sign-out-everyone`).
 
-### Configuring Google sign-in
+### Configuring a provider
 
-Create an OAuth **Web application** client at
-<https://console.cloud.google.com/apis/credentials>, with the authorized
-redirect URI set to `https://<your host>/auth/google/callback`, then on the box:
+For GitHub, register an OAuth App at <https://github.com/settings/developers>
+with the authorization callback URL `https://<your host>/auth/github/callback`;
+the client id and secret are issued immediately. For Google, create an OAuth
+**Web application** client at <https://console.cloud.google.com/apis/credentials>
+with the redirect URI `https://<your host>/auth/google/callback` (this one goes
+through the consent-screen forms first). Then, on the box:
 
 ```bash
 sudo -u claudemem $APP_DIR/venv/bin/python $APP_DIR/manage_auth.py \
-     setup <client-id> https://<your host>/auth/google/callback you@example.com
+     setup github <client-id> https://<your host>/auth/github/callback you@example.com
 ```
+
+The address on the allowlist has to be one the provider will report as
+verified — for GitHub that means an address on
+<https://github.com/settings/emails>, not the `users.noreply.github.com` alias.
 
 It prompts for the client secret on the terminal rather than taking it in
 `argv`, and writes `auth.json` mode 600 next to `main.py` — never inside
 `data/`, which is a git repo that keeps every version of every file in it
 forever. No restart is needed: the file is re-read when its contents change.
 
-Leave Google unconfigured and the service behaves exactly as it did before —
-the login page offers the token field and `/auth/google` answers 503.
+Leave every provider unconfigured and the service behaves exactly as it did
+before — the login page offers the token field and `/auth/<provider>`
+answers 503.
 
 Cookie-authorized writes must also send `X-Memory-Actor`; a cross-site request
 cannot set a custom header, and the cookie is `SameSite=strict` on top of that.
@@ -129,8 +147,8 @@ described above.
 | Path | Deployed to | What |
 |---|---|---|
 | `main.py` | `$APP_DIR/main.py` | the API, plus `/auth/*` and the static mount |
-| `webauth.py` | `$APP_DIR/webauth.py` | HMAC cookie sessions, Google OAuth, login throttle |
-| `manage_auth.py` | `$APP_DIR/manage_auth.py` | administers `auth.json`: Google client, allowlist, `keyver` |
+| `webauth.py` | `$APP_DIR/webauth.py` | HMAC cookie sessions, the OAuth provider table, login throttle |
+| `manage_auth.py` | `$APP_DIR/manage_auth.py` | administers `auth.json`: provider clients, allowlists, `keyver` |
 | `web/` | `$APP_DIR/web/` | `index.html`, `app.css`, `app.js`, `md.js`, `diff.js` |
 | `test-web.sh` | `$APP_DIR/test-web.sh` | server test suite, run on the box |
 | `tests/` | `$APP_DIR/tests/` | unit tests: `test_webauth.py` (offline), `test_etag_regression.py` |

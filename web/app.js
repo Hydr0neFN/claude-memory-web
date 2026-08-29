@@ -128,20 +128,27 @@
 
   // Last answer from /auth/me, so a session that expires mid-use returns to a
   // login page that still offers the button the user actually signs in with.
-  var authInfo = { google: false };
+  var authInfo = { providers: [] };
 
   function showLogin(me) {
-    if (me && typeof me.google === 'boolean') authInfo = me;
+    if (me && me.providers) authInfo = me;
     me = authInfo;
     $('app').classList.add('hidden');
     $('login').classList.remove('hidden');
-    // The Google button is shown only when the server says the handshake is
-    // configured -- offering a button that answers 503 is worse than not
-    // offering it, because the token field below is the actual way in.
-    var google = !!(me && me.google);
-    $('login-google').classList.toggle('hidden', !google);
-    $('login-google-note').classList.toggle('hidden', !google);
-    if (!google) {
+    // A provider button appears only when the server says that handshake is
+    // configured -- offering one that answers 503 is worse than not offering
+    // it, because the token field below is the actual way in.
+    var on = (me && me.providers) || [];
+    var any = false;
+    ['google', 'github'].forEach(function (name) {
+      var el = $('login-' + name);
+      if (!el) return;
+      var ok = on.indexOf(name) !== -1;
+      el.classList.toggle('hidden', !ok);
+      any = any || ok;
+    });
+    $('login-oauth-note').classList.toggle('hidden', !any);
+    if (!any) {
       $('login-token-wrap').open = true;
       setTimeout(function () { $('login-token').focus(); }, 30);
     }
@@ -1533,7 +1540,7 @@
       // Remember it even when signed in: this is the only time the page learns
       // whether Google is configured, and showLogin() needs it later if the
       // session expires while the tab is open.
-      if (me && typeof me.google === 'boolean') authInfo = me;
+      if (me && me.providers) authInfo = me;
       if (me.email) $('logout-btn').title = 'Signed in as ' + me.email;
       return me.authenticated ? showApp() : showLogin(me);
     })

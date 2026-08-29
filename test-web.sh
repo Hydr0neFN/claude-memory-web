@@ -719,10 +719,11 @@ check "GET /memory/index still serves the index endpoint" 200 "$code"
 code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$BASE/docs/index")
 check "GET /docs/index still serves the doc index endpoint" 200 "$code"
 
-echo "=== 8. google sign-in routes ==="
+echo "=== 8. oauth sign-in routes ==="
 # No real consent screen is involved: a fake client config is enough to prove
-# the redirect is built correctly, the state is bound to the browser that
-# started the handshake, and an unconfigured server says so instead of 500ing.
+# the redirect is built correctly, that the state is bound to the browser and
+# the provider that started the handshake, and that an unconfigured server says
+# so instead of 500ing.
 AUTHFILE=./auth.json
 AUTHBAK=$(mktemp)
 HADAUTH=no
@@ -735,19 +736,21 @@ trap restore_auth EXIT
 
 rm -f "$AUTHFILE"
 me=$(curl -s "$BASE/auth/me")
-contains "/auth/me reports google unconfigured" '"google":false' "$me"
-code=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/auth/google")
-check "unconfigured /auth/google refuses" 503 "$code"
-code=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/auth/google/callback?code=x&state=y")
-check "unconfigured callback refuses" 503 "$code"
+contains "/auth/me reports no providers" '"providers":[]' "$me"
+for prov in google github; do
+  code=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/auth/$prov")
+  check "unconfigured /auth/$prov refuses" 503 "$code"
+  code=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/auth/$prov/callback?code=x&state=y")
+  check "unconfigured $prov callback refuses" 503 "$code"
+done
 
 cat > "$AUTHFILE" <<'JSON'
 {
   "keyver": 1,
-  "google": {
-    "client_id": "test-client.apps.googleusercontent.com",
+  "github": {
+    "client_id": "Iv1.testclientid",
     "client_secret": "test-secret",
-    "redirect_uri": "https://example.invalid/auth/google/callback",
+    "redirect_uri": "https://example.invalid/auth/github/callback",
     "allowed_emails": ["nobody@example.invalid"]
   }
 }
@@ -756,35 +759,46 @@ chmod 600 "$AUTHFILE"
 id claudemem >/dev/null 2>&1 && chown claudemem:claudemem "$AUTHFILE"
 
 me=$(curl -s "$BASE/auth/me")
-contains "config change is seen without a restart" '"google":true' "$me"
+contains "config change is seen without a restart" '"providers":["github"]' "$me"
+# Google is in the same file format but unconfigured: one provider being on
+# must not switch the other on.
+code=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/auth/google")
+check "the unconfigured provider stays off" 503 "$code"
 
 OJAR=$(mktemp)
-curl -s -D "$HDR" -o /dev/null -c "$OJAR" "$BASE/auth/google"
+curl -s -D "$HDR" -o /dev/null -c "$OJAR" "$BASE/auth/github"
 code=$(grep -c '^HTTP/1.1 302' "$HDR" || true)
-check "/auth/google redirects" 1 "$code"
+check "/auth/github redirects" 1 "$code"
 LOC=$(grep -i '^location:' "$HDR" | tr -d '\r' | sed 's/^[Ll]ocation: *//')
-contains "redirect goes to Google" "https://accounts.google.com/o/oauth2/v2/auth" "$LOC"
-contains "redirect carries the client id" "test-client.apps.googleusercontent.com" "$LOC"
-contains "redirect uses PKCE S256" "code_challenge_method=S256" "$LOC"
-contains "redirect asks only for identity" "scope=openid+email" "$LOC"
+contains "redirect goes to GitHub" "https://github.com/login/oauth/authorize" "$LOC"
+contains "redirect carries the client id" "Iv1.testclientid" "$LOC"
+contains "redirect asks only for the e-mail" "scope=user%3Aemail" "$LOC"
+# GitHub OAuth Apps ignore PKCE; sending it would imply a protection that is
+# not there. The signed state cookie and the client secret are what hold.
+case "$LOC" in *code_challenge*) echo "FAIL: github redirect sends PKCE"; FAIL=$((FAIL+1)) ;;
+  *) echo "PASS: github redirect omits PKCE"; PASS=$((PASS+1)) ;; esac
 OSET=$(grep -i '^set-cookie: mem_oauth' "$HDR" | tr -d '\r')
 contains "state cookie is HttpOnly" "HttpOnly" "$OSET"
-# Lax, not Strict: Strict would withhold this cookie on Google's redirect back,
-# which is the one request it exists for.
+# Lax, not Strict: Strict would withhold this cookie on the provider's redirect
+# back, which is the one request it exists for.
 contains "state cookie is SameSite=lax" "SameSite=lax" "$OSET"
-contains "state cookie is scoped to /auth/google" "Path=/auth/google" "$OSET"
+contains "state cookie is scoped to /auth" "Path=/auth" "$OSET"
 case "$BASE" in https://*) contains "state cookie is Secure" "Secure" "$OSET" ;;
   *) PASS=$((PASS+1)); echo "PASS: state cookie Secure not asserted over http" ;; esac
 
 STATE=$(printf '%s' "$LOC" | sed -n 's/.*[?&]state=\([^&]*\).*/\1/p')
-code=$(curl -s -o /dev/null -w "%{http_code}" -b "$OJAR" "$BASE/auth/google/callback?code=fake&state=wrong-state")
+code=$(curl -s -o /dev/null -w "%{http_code}" -b "$OJAR" "$BASE/auth/github/callback?code=fake&state=wrong-state")
 check "callback with a mismatched state refused" 403 "$code"
-code=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/auth/google/callback?code=fake&state=$STATE")
+code=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/auth/github/callback?code=fake&state=$STATE")
 check "callback without the state cookie refused" 403 "$code"
-code=$(curl -s -o /dev/null -w "%{http_code}" -b "$OJAR" "$BASE/auth/google/callback?state=$STATE")
+code=$(curl -s -o /dev/null -w "%{http_code}" -b "$OJAR" "$BASE/auth/github/callback?state=$STATE")
 check "callback without a code refused" 403 "$code"
-code=$(curl -s -o /dev/null -w "%{http_code}" -b "$OJAR" "$BASE/auth/google/callback?error=access_denied&state=$STATE")
-check "callback carrying Google's error refused" 403 "$code"
+code=$(curl -s -o /dev/null -w "%{http_code}" -b "$OJAR" "$BASE/auth/github/callback?error=access_denied&state=$STATE")
+check "callback carrying the provider's error refused" 403 "$code"
+# The cookie is shared by both callbacks, so the provider is signed into it:
+# a github handshake must not be completable at the google callback.
+code=$(curl -s -o /dev/null -w "%{http_code}" -b "$OJAR" "$BASE/auth/google/callback?code=fake&state=$STATE")
+check "a github handshake cannot be finished at the google callback" 503 "$code"
 rm -f "$OJAR"
 
 echo "=== 8b. keyver signs browsers out, agents stay in ==="

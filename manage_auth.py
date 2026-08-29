@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Administer auth.json -- the Google sign-in config for the memory web UI.
+"""Administer auth.json -- the OAuth sign-in config for the memory web UI.
 
 Run it on the box, as the service user, so the file it writes is already owned
 by the account that has to read it:
@@ -8,7 +8,7 @@ by the account that has to read it:
          /opt/claude-memory/manage_auth.py status
 
 Nothing here restarts the service: main.py re-reads auth.json whenever its
-mtime changes, because a restart is not free -- it is how every deploy
+contents change, because a restart is not free -- it is how every deploy
 interrupts the store.
 
 The API token is NOT managed here. It stays in .env, it is the break-glass
@@ -22,26 +22,38 @@ import sys
 from pathlib import Path
 
 DEFAULT_PATH = Path(__file__).resolve().parent / "auth.json"
+PROVIDERS = ("google", "github")
 
 USAGE = """usage: manage_auth.py <command> [args]
 
   status                       what is configured, without printing secrets
-  setup <client-id> <redirect-uri> [email ...]
-                               configure Google sign-in; the client secret is
-                               read from the terminal, never from argv, so it
-                               does not land in shell history or /proc
-  allow <email> [email ...]    add addresses to the allowlist
-  deny  <email> [email ...]    remove addresses
-  disable-google               forget the Google config entirely
+  setup <provider> <client-id> <redirect-uri> [email ...]
+                               configure a provider; the client secret is read
+                               from the terminal, never from argv, so it does
+                               not land in shell history or /proc
+  allow <provider> <email> ...  add addresses to that provider's allowlist
+  deny  <provider> <email> ...  remove addresses
+  disable <provider>           forget that provider's config entirely
   sign-out-everyone            invalidate every browser session (bumps keyver)
+
+  <provider> is one of: %s
+
+A provider with no config, or with an empty allowlist, is simply off: its
+button does not appear on the login page and its /auth/<provider> route
+answers 503. The API token still signs in at / regardless.
 
 MEMORY_AUTH_FILE overrides the file location (default: auth.json next to
 main.py). It must NOT be inside data/ -- that is a git repo that keeps every
-version of every file in it forever."""
+version of every file in it forever.""" % ", ".join(PROVIDERS)
 
 
 def path() -> Path:
     return Path(os.environ.get("MEMORY_AUTH_FILE") or DEFAULT_PATH)
+
+
+def die(message: str) -> None:
+    sys.stderr.write("error: %s\n" % message)
+    raise SystemExit(2)
 
 
 def load() -> dict:
@@ -72,9 +84,11 @@ def save(data: dict) -> None:
     print("wrote %s" % p)
 
 
-def die(message: str) -> None:
-    sys.stderr.write("error: %s\n" % message)
-    raise SystemExit(2)
+def check_provider(name: str) -> str:
+    n = (name or "").strip().lower()
+    if n not in PROVIDERS:
+        die("unknown provider %r; expected one of: %s" % (name, ", ".join(PROVIDERS)))
+    return n
 
 
 def norm(email: str) -> str:
@@ -87,81 +101,93 @@ def norm(email: str) -> str:
 def cmd_status() -> None:
     p = path()
     data = load()
-    google = data.get("google") or {}
     print("file        %s%s" % (p, "" if p.exists() else "  (does not exist yet)"))
     if p.exists():
         mode = stat.S_IMODE(p.stat().st_mode)
         print("mode        %o%s" % (mode, "" if mode == 0o600 else "   <-- should be 600"))
     print("keyver      %s" % data.get("keyver", 1))
-    if not google:
-        print("google      not configured (token sign-in only)")
-        return
-    cid = str(google.get("client_id") or "")
-    print("google      client_id  ...%s" % (cid[-28:] if cid else "(missing)"))
-    print("            secret     %s" % ("set" if google.get("client_secret") else "(missing)"))
-    print("            redirect   %s" % (google.get("redirect_uri") or "(missing)"))
-    allowed = google.get("allowed_emails") or []
-    print("            allowed    %s" % (", ".join(allowed) if allowed else "(nobody -- nobody can sign in)"))
+    for name in PROVIDERS:
+        cfg = data.get(name) or {}
+        if not cfg:
+            print("%-11s not configured" % name)
+            continue
+        cid = str(cfg.get("client_id") or "")
+        print("%-11s client_id  %s" % (name, ("..." + cid[-28:]) if cid else "(missing)"))
+        print("            secret     %s" % ("set" if cfg.get("client_secret") else "(missing)"))
+        print("            redirect   %s" % (cfg.get("redirect_uri") or "(missing)"))
+        allowed = cfg.get("allowed_emails") or []
+        if isinstance(allowed, str):
+            allowed = [allowed]
+        print("            allowed    %s"
+              % (", ".join(allowed) if allowed else "(nobody -- this provider is off)"))
 
 
 def cmd_setup(argv) -> None:
-    if len(argv) < 2:
-        die("setup needs a client id and a redirect uri")
-    client_id, redirect_uri = argv[0].strip(), argv[1].strip()
-    emails = [norm(e) for e in argv[2:]]
+    if len(argv) < 3:
+        die("setup needs a provider, a client id and a redirect uri")
+    name = check_provider(argv[0])
+    client_id, redirect_uri = argv[1].strip(), argv[2].strip()
+    emails = [norm(e) for e in argv[3:]]
     if not redirect_uri.startswith("https://"):
-        # Google only accepts https redirect URIs outside localhost, and this
-        # service is reached through the tunnel even from the LAN, so a plain
-        # http URI here is always a typo rather than a deliberate choice.
-        die("redirect uri must be https (Google rejects anything else here)")
-    secret = getpass.getpass("Google client secret: ").strip()
+        # Every provider here refuses a plain-http redirect outside localhost,
+        # and this service is reached through the tunnel even from the LAN, so
+        # an http URI is always a typo rather than a deliberate choice.
+        die("redirect uri must be https")
+    if not redirect_uri.endswith("/auth/%s/callback" % name):
+        die("redirect uri should end with /auth/%s/callback -- that is the route "
+            "that handles it" % name)
+    secret = getpass.getpass("%s client secret: " % name).strip()
     if not secret:
         die("no client secret given")
 
     data = load()
-    google = data.get("google") or {}
-    google.update({
-        "client_id": client_id,
-        "client_secret": secret,
-        "redirect_uri": redirect_uri,
-    })
+    cfg = data.get(name) or {}
+    cfg.update({"client_id": client_id, "client_secret": secret,
+                "redirect_uri": redirect_uri})
     if emails:
-        google["allowed_emails"] = emails
-    google.setdefault("allowed_emails", [])
-    data["google"] = google
+        cfg["allowed_emails"] = emails
+    cfg.setdefault("allowed_emails", [])
+    data[name] = cfg
     save(data)
-    if not google["allowed_emails"]:
-        print("note: the allowlist is empty, so nobody can sign in yet.")
-        print("      add yourself with:  manage_auth.py allow you@example.com")
+    if not cfg["allowed_emails"]:
+        print("note: the allowlist is empty, so %s sign-in stays off." % name)
+        print("      add yourself with:  manage_auth.py allow %s you@example.com" % name)
     cmd_status()
 
 
 def cmd_allow(argv, add: bool) -> None:
-    if not argv:
-        die("give at least one e-mail address")
+    if len(argv) < 2:
+        die("give a provider and at least one e-mail address")
+    name = check_provider(argv[0])
     data = load()
-    google = data.get("google")
-    if not google:
-        die("Google sign-in is not configured; run setup first")
-    current = [str(e).strip().lower() for e in (google.get("allowed_emails") or [])]
-    for email in (norm(e) for e in argv):
+    cfg = data.get(name)
+    if not cfg:
+        die("%s is not configured; run setup first" % name)
+    current = cfg.get("allowed_emails") or []
+    if isinstance(current, str):
+        current = [current]
+    current = [str(e).strip().lower() for e in current]
+    for email in (norm(e) for e in argv[1:]):
         if add and email not in current:
             current.append(email)
         elif not add and email in current:
             current.remove(email)
-    google["allowed_emails"] = current
-    data["google"] = google
+    cfg["allowed_emails"] = current
+    data[name] = cfg
     save(data)
     cmd_status()
 
 
-def cmd_disable_google() -> None:
+def cmd_disable(argv) -> None:
+    if not argv:
+        die("say which provider to disable: %s" % ", ".join(PROVIDERS))
+    name = check_provider(argv[0])
     data = load()
-    if not data.pop("google", None):
-        print("Google sign-in was not configured; nothing to do")
+    if not data.pop(name, None):
+        print("%s was not configured; nothing to do" % name)
         return
     save(data)
-    print("Google sign-in disabled. The API token still signs in at /.")
+    print("%s sign-in disabled. The API token still signs in at /." % name)
 
 
 def cmd_sign_out_everyone() -> None:
@@ -185,8 +211,8 @@ def main(argv) -> int:
         cmd_allow(rest, True)
     elif cmd == "deny":
         cmd_allow(rest, False)
-    elif cmd == "disable-google":
-        cmd_disable_google()
+    elif cmd == "disable":
+        cmd_disable(rest)
     elif cmd == "sign-out-everyone":
         cmd_sign_out_everyone()
     else:

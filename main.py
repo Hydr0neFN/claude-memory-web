@@ -743,19 +743,19 @@ def html_escape(text: str) -> str:
             .replace(">", "&gt;").replace('"', "&quot;"))
 
 
-@app.get("/auth/google")
-def google_start(request: Request):
-    """Begin the Google handshake. GET, because it is a top-level navigation."""
-    if not creds.google_enabled:
-        return oauth_error("Google sign-in is not configured on this server.", 503)
+def oauth_start(name: str, request: Request):
+    """Begin a handshake. GET, because it is a top-level navigation."""
+    if not creds.enabled(name):
+        return oauth_error("%s sign-in is not configured on this server."
+                           % webauth.PROVIDERS[name]["label"], 503)
     if not oauth_throttle.allow(webauth.client_key(request)):
         return oauth_error("Too many sign-in attempts. Wait a few minutes.", 429)
 
-    google = creds.google
+    cfg = creds.provider(name)
     verifier, challenge = webauth.pkce_pair()
-    cookie_value, state = session.issue_oauth_state(verifier, creds.keyver)
+    cookie_value, state = session.issue_oauth_state(verifier, creds.keyver, name)
     response = RedirectResponse(
-        webauth.auth_url(google["client_id"], google["redirect_uri"], state, challenge),
+        webauth.auth_url(name, cfg["client_id"], cfg["redirect_uri"], state, challenge),
         status_code=302,
     )
     response.set_cookie(
@@ -764,27 +764,29 @@ def google_start(request: Request):
         max_age=webauth.OAUTH_SECONDS,
         httponly=True,
         secure=webauth.cookie_secure(request),
-        # Lax, not Strict: this cookie has to survive Google's top-level
+        # Lax, not Strict: this cookie has to survive the provider's top-level
         # redirect back here, and Strict would withhold it on exactly that
         # request. It carries only a PKCE verifier and expires in ten minutes.
         samesite="lax",
-        path="/auth/google",
+        path="/auth",
     )
     return response
 
 
-@app.get("/auth/google/callback")
-def google_callback(request: Request, code: str = "", state: str = "", error: str = ""):
-    if not creds.google_enabled:
-        return oauth_error("Google sign-in is not configured on this server.", 503)
+def oauth_callback(name: str, request: Request, code: str, state: str, error: str):
+    label = webauth.PROVIDERS[name]["label"]
+    if not creds.enabled(name):
+        return oauth_error("%s sign-in is not configured on this server." % label, 503)
     key = webauth.client_key(request)
     if not oauth_throttle.allow(key):
         return oauth_error("Too many sign-in attempts. Wait a few minutes.", 429)
     if error:
-        return oauth_error("Google reported: %s" % error)
+        return oauth_error("%s reported: %s" % (label, error))
 
+    # The provider name is inside the signed state cookie, so a callback cannot
+    # be replayed against the other provider's endpoint.
     verifier = session.read_oauth_state(
-        request.cookies.get(webauth.OAUTH_COOKIE), state, creds.keyver)
+        request.cookies.get(webauth.OAUTH_COOKIE), state, creds.keyver, name)
     if not verifier or not code:
         oauth_throttle.record(key)
         return oauth_error(
@@ -792,29 +794,55 @@ def google_callback(request: Request, code: str = "", state: str = "", error: st
             "the sign-in page.")
 
     try:
-        email = webauth.exchange_code(creds.google, code, verifier)
+        emails = webauth.exchange_code(name, creds.provider(name), code, verifier)
     except webauth.AuthError as exc:
         oauth_throttle.record(key)
         return oauth_error(str(exc))
 
-    if not creds.allows(email):
+    email = creds.allowed(name, emails)
+    if not email:
         oauth_throttle.record(key)
-        sys.stderr.write("memory: rejected google sign-in for %s\n" % email)
-        return oauth_error("%s is not allowed to sign in here." % email)
+        sys.stderr.write("memory: rejected %s sign-in for %s\n" % (name, ", ".join(emails)))
+        return oauth_error("%s is not allowed to sign in here." % html_escape(emails[0]))
 
     # An HTML hop rather than a 302: the session cookie is SameSite=Strict, and
-    # a redirect issued while still inside Google's cross-site navigation would
-    # not carry it to the page it lands on. A same-site navigation started by
-    # this page does.
+    # a redirect issued while still inside the provider's cross-site navigation
+    # would not carry it to the page it lands on. A same-site navigation
+    # started by this page does.
     response = HTMLResponse(
         "<!doctype html><meta charset=utf-8><title>Signed in</title>"
         "<script>location.replace('/')</script>"
         "<body style='font:14px system-ui;margin:3rem auto;max-width:32rem'>"
         "<p>Signed in as %s. <a href='/'>Continue</a>.</p>" % html_escape(email)
     )
-    set_session_cookie(response, request, webauth.SUBJECT_GOOGLE, email)
-    response.delete_cookie(webauth.OAUTH_COOKIE, path="/auth/google")
+    set_session_cookie(response, request, webauth.PROVIDERS[name]["subject"], email)
+    response.delete_cookie(webauth.OAUTH_COOKIE, path="/auth")
     return response
+
+
+# One pair of routes per provider rather than /auth/{provider}: the redirect URI
+# is registered with the provider by hand, and a literal path is what a person
+# reads back off the console screen to check it.
+
+
+@app.get("/auth/google")
+def google_start(request: Request):
+    return oauth_start("google", request)
+
+
+@app.get("/auth/google/callback")
+def google_callback(request: Request, code: str = "", state: str = "", error: str = ""):
+    return oauth_callback("google", request, code, state, error)
+
+
+@app.get("/auth/github")
+def github_start(request: Request):
+    return oauth_start("github", request)
+
+
+@app.get("/auth/github/callback")
+def github_callback(request: Request, code: str = "", state: str = "", error: str = ""):
+    return oauth_callback("github", request, code, state, error)
 
 
 @app.post("/auth/logout")
@@ -829,14 +857,19 @@ def whoami(request: Request):
     """Deliberately never 401s — the shell asks this to decide which view to
     render, and a 401 there would be an error the UI has to swallow anyway.
 
-    It also reports whether Google sign-in is configured, so the login page can
-    show the button only when pressing it would work."""
+    It also reports which OAuth providers are configured, so the login page
+    shows a button only when pressing it would work."""
     info = session.read(request.cookies.get(webauth.COOKIE_NAME), creds.keyver)
+    via = {webauth.SUBJECT_TOKEN: "token"}
+    via.update({spec["subject"]: name for name, spec in webauth.PROVIDERS.items()})
     return JSONResponse({
         "authenticated": bool(info),
-        "via": ({"web": "token", "ggl": "google"}.get(info.subject) if info else None),
+        "via": (via.get(info.subject) if info else None),
         "email": (info.email if info else ""),
-        "google": creds.google_enabled,
+        "providers": creds.enabled_providers,
+        # Kept for the older shell that only knew about Google, so a browser
+        # holding a cached app.js does not lose its sign-in button.
+        "google": creds.enabled("google"),
     })
 
 

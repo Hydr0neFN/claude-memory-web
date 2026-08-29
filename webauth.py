@@ -9,21 +9,29 @@ Two ways in, deliberately asymmetric:
                  the only secret that matters, so it is never asked for a
                  second factor.
 
-  Google         the human credential, added 2026-08-30 so a phone can read
-                 the store without holding the token. The second factor lives
-                 on the Google account, which already has one; re-implementing
-                 TOTP here would add a secret to guard for no gain in strength.
-                 An allowlist of e-mail addresses is the authorization step --
+  Google or      the human credential, added 2026-08-30 so a phone can read
+  GitHub         the store without holding the token. The second factor lives
+                 on that account, which already has one; re-implementing TOTP
+                 here would add a secret to guard for no gain in strength. An
+                 allowlist of e-mail addresses is the authorization step --
                  "signed in with Google" alone authorizes nobody.
+
+                 Either provider, or both, can be configured; whichever has a
+                 client id, a secret, a redirect URI and a non-empty allowlist
+                 in auth.json is offered on the login page. Both were kept
+                 because Google now puts an app through review before it will
+                 serve a consent screen, and a GitHub OAuth App is issued on
+                 the spot -- which of the two is available is a fact about the
+                 provider on the day, not a design decision.
 
 Both end at the same HMAC-signed, HttpOnly cookie: JavaScript can never read
 it, and the signing key is derived from the API token, so there is no second
 secret to store or back up, and rotating the API token logs every browser out.
 
-The Google path talks to Google over a direct back-channel call, so the ID
-token's signature never has to be checked here: nothing between us and the
-token endpoint can substitute a response, which is the property JWT
-verification exists to establish. That is what keeps this dependency-free.
+Both paths read the identity over a direct back-channel call, so no token
+signature has to be verified here: nothing between us and the provider's token
+endpoint can substitute a response, which is the property JWT verification
+exists to establish. That is what keeps this dependency-free.
 """
 import base64
 import hashlib
@@ -52,12 +60,39 @@ KEY_CONTEXT = b"memory-webui-v1"
 
 SUBJECT_TOKEN = "web"   # signed in by presenting the API token
 SUBJECT_GOOGLE = "ggl"  # signed in with Google
-SUBJECTS = (SUBJECT_TOKEN, SUBJECT_GOOGLE)
+SUBJECT_GITHUB = "ghb"  # signed in with GitHub
+SUBJECTS = (SUBJECT_TOKEN, SUBJECT_GOOGLE, SUBJECT_GITHUB)
 
-GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
-GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+# One row per provider. `pkce` records whether the provider honours a
+# code_challenge: GitHub's OAuth Apps ignore it, so for GitHub the handshake is
+# protected by the signed state cookie and the client secret alone. Sending the
+# parameter anyway would only make the code look safer than it is.
+PROVIDERS = {
+    "google": {
+        "subject": SUBJECT_GOOGLE,
+        "label": "Google",
+        "auth_url": "https://accounts.google.com/o/oauth2/v2/auth",
+        "token_url": "https://oauth2.googleapis.com/token",
+        "scope": "openid email",
+        "pkce": True,
+        # Google's own consent screen remembers the last account and signs the
+        # user straight back in otherwise, which is wrong on a shared phone.
+        "extra_auth": {"access_type": "online", "prompt": "select_account"},
+    },
+    "github": {
+        "subject": SUBJECT_GITHUB,
+        "label": "GitHub",
+        "auth_url": "https://github.com/login/oauth/authorize",
+        "token_url": "https://github.com/login/oauth/access_token",
+        "scope": "user:email",
+        "pkce": False,
+        "extra_auth": {},
+    },
+}
+PROVIDER_NAMES = tuple(PROVIDERS)
+
 GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
-GOOGLE_SCOPE = "openid email"
+GITHUB_EMAILS_URL = "https://api.github.com/user/emails"
 HTTP_TIMEOUT = 10
 
 
@@ -128,16 +163,24 @@ class Credentials:
                 self._raw = None
         return self._data
 
-    @property
-    def google(self) -> dict:
-        g = self.load().get("google") or {}
+    def provider(self, name: str) -> dict:
+        g = self.load().get(name) or {}
         return g if isinstance(g, dict) else {}
 
-    @property
-    def google_enabled(self) -> bool:
-        g = self.google
+    def enabled(self, name: str) -> bool:
+        """Configured means usable: a provider with an empty allowlist would
+        show a button that can only ever end on the "not allowed" page."""
+        g = self.provider(name)
         return bool(g.get("client_id") and g.get("client_secret")
-                    and g.get("redirect_uri") and g.get("allowed_emails"))
+                    and g.get("redirect_uri") and self._allowlist(g))
+
+    @property
+    def enabled_providers(self) -> list:
+        return [n for n in PROVIDER_NAMES if self.enabled(n)]
+
+    @property
+    def any_enabled(self) -> bool:
+        return bool(self.enabled_providers)
 
     @property
     def keyver(self) -> int:
@@ -146,23 +189,37 @@ class Credentials:
         except (TypeError, ValueError):
             return 1
 
-    def allows(self, email: str) -> bool:
-        """Allowlist match. Case-insensitive because Google reports the address
-        in whatever case the user typed it, and lowercase-only comparison is
-        what every other consumer of a Gmail address does."""
-        want = (email or "").strip().lower()
-        if not want:
-            return False
-        raw = self.google.get("allowed_emails") or []
+    @staticmethod
+    def _allowlist(cfg: dict) -> list:
+        raw = cfg.get("allowed_emails") or []
         # A hand-edited auth.json is likely to say "a@b.c" where it means
         # ["a@b.c"], and iterating a string yields its characters: the real
         # address would be refused and the single letter "a" admitted.
         if isinstance(raw, str):
             raw = [raw]
         elif not isinstance(raw, (list, tuple)):
-            return False
-        allowed = [str(a).strip().lower() for a in raw]
-        return any(hmac.compare_digest(want, a) for a in allowed if a)
+            return []
+        return [a for a in (str(x).strip().lower() for x in raw) if a]
+
+    def allowed(self, name: str, emails):
+        """Return the first address of `emails` that the provider's allowlist
+        admits, or None.
+
+        A list rather than one address because GitHub hands back every e-mail
+        on the account; any one of them being both verified and listed is a
+        match. Comparison is case-insensitive: providers report the address in
+        whatever case the user typed it.
+        """
+        allowed = self._allowlist(self.provider(name))
+        if not allowed:
+            return None
+        if isinstance(emails, str):
+            emails = [emails]
+        for email in emails:
+            want = (email or "").strip().lower()
+            if want and any(hmac.compare_digest(want, a) for a in allowed):
+                return email
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -175,21 +232,27 @@ def pkce_pair():
     return verifier, challenge
 
 
-def auth_url(client_id: str, redirect_uri: str, state: str, challenge: str) -> str:
-    return GOOGLE_AUTH_URL + "?" + urllib.parse.urlencode({
+def auth_url(name: str, client_id: str, redirect_uri: str, state: str, challenge: str) -> str:
+    """The consent-screen URL for one provider.
+
+    No refresh token is ever requested: this is a login, not an ongoing API
+    grant. Nothing here calls the provider again after the handshake, so a
+    stored refresh token would be a credential with no use and a lifetime
+    measured in months.
+    """
+    spec = PROVIDERS[name]
+    params = {
         "client_id": client_id,
         "redirect_uri": redirect_uri,
         "response_type": "code",
-        "scope": GOOGLE_SCOPE,
+        "scope": spec["scope"],
         "state": state,
-        "code_challenge": challenge,
-        "code_challenge_method": "S256",
-        # No refresh token: this is a login, not an ongoing API grant. Nothing
-        # here ever calls a Google API again, so a stored refresh token would
-        # be a credential with no use and a lifetime measured in months.
-        "access_type": "online",
-        "prompt": "select_account",
-    })
+    }
+    if spec["pkce"]:
+        params["code_challenge"] = challenge
+        params["code_challenge_method"] = "S256"
+    params.update(spec["extra_auth"])
+    return spec["auth_url"] + "?" + urllib.parse.urlencode(params)
 
 
 def _post_form(url: str, fields: dict) -> dict:
@@ -205,76 +268,111 @@ def _post_form(url: str, fields: dict) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _get_json(url: str, bearer: str) -> dict:
+def _get_json(url: str, bearer: str, headers: dict = None):
     req = urllib.request.Request(
         url,
-        headers={"Authorization": "Bearer " + bearer,
-                 "Accept": "application/json",
-                 "User-Agent": "claude-memory-web/1.0"},
+        headers=headers or {"Authorization": "Bearer " + bearer,
+                            "Accept": "application/json",
+                            "User-Agent": "claude-memory-web/1.0"},
     )
     with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def exchange_code(google: dict, code: str, verifier: str) -> str:
-    """Authorization code -> verified e-mail address.
+def _github_headers(bearer: str) -> dict:
+    return {"Authorization": "Bearer " + bearer,
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "claude-memory-web/1.0"}
+
+
+def exchange_code(name: str, cfg: dict, code: str, verifier: str) -> list:
+    """Authorization code -> the list of verified e-mail addresses it proves.
+
+    A list, not one address, because GitHub hands back every address on the
+    account and any verified one of them may be the one on the allowlist.
+    Google returns exactly one, so its list has one element.
 
     Raises AuthError with a message meant for a human on the login page. The
-    messages distinguish "Google said no" from "you are not on the list"
-    because those need completely different fixes and there is no secret to
+    messages distinguish "the provider said no" from "you are not on the list"
+    because those need completely different fixes, and there is no secret to
     protect by conflating them: the allowlist is the user's own address.
     """
+    spec = PROVIDERS[name]
+    label = spec["label"]
+
     # Read the config before the network call, so a missing key is reported as
     # a missing key rather than being swallowed by the except below and shown
-    # to the user as "could not reach Google" -- a diagnosis pointing at the
-    # one part of the system that is fine.
-    missing = [k for k in ("client_id", "client_secret", "redirect_uri") if not google.get(k)]
+    # to the user as "could not reach <provider>" -- a diagnosis pointing at
+    # the one part of the system that is fine.
+    missing = [k for k in ("client_id", "client_secret", "redirect_uri") if not cfg.get(k)]
     if missing:
         raise AuthError("server config incomplete: %s" % ", ".join(missing))
 
+    fields = {
+        "code": code,
+        "client_id": cfg["client_id"],
+        "client_secret": cfg["client_secret"],
+        "redirect_uri": cfg["redirect_uri"],
+        "grant_type": "authorization_code",
+    }
+    if spec["pkce"]:
+        fields["code_verifier"] = verifier
+
     try:
-        tokens = _post_form(GOOGLE_TOKEN_URL, {
-            "code": code,
-            "client_id": google["client_id"],
-            "client_secret": google["client_secret"],
-            "redirect_uri": google["redirect_uri"],
-            "grant_type": "authorization_code",
-            "code_verifier": verifier,
-        })
+        tokens = _post_form(spec["token_url"], fields)
     except urllib.error.HTTPError as exc:
         detail = ""
         try:
             detail = json.loads(exc.read().decode("utf-8")).get("error", "")
         except Exception:
             pass
-        raise AuthError("Google rejected the sign-in%s" % (" (%s)" % detail if detail else ""))
+        raise AuthError("%s rejected the sign-in%s"
+                        % (label, " (%s)" % detail if detail else ""))
     except Exception:
-        raise AuthError("could not reach Google")
+        raise AuthError("could not reach %s" % label)
 
     # Well-formed JSON that is not an object is still a valid response as far
     # as json.loads is concerned; .get() on a list raises AttributeError, which
     # would escape as a 500 from a code path whose whole job is to fail closed.
-    # Google will not send one, but a captive portal or an intercepting proxy
-    # between the Pi and Google might.
+    # Neither provider will send one, but a captive portal or an intercepting
+    # proxy between the Pi and the provider might.
     if not isinstance(tokens, dict):
-        raise AuthError("Google returned an unexpected token response")
+        raise AuthError("%s returned an unexpected token response" % label)
+    # GitHub reports a refused exchange as 200 with an error body, so the HTTP
+    # status is not enough to tell success from failure here.
+    if tokens.get("error"):
+        raise AuthError("%s rejected the sign-in (%s)" % (label, tokens.get("error")))
     access = tokens.get("access_token")
     if not access or not isinstance(access, str):
-        raise AuthError("Google returned no access token")
+        raise AuthError("%s returned no access token" % label)
+
+    if name == "google":
+        try:
+            info = _get_json(GOOGLE_USERINFO_URL, access)
+        except Exception:
+            raise AuthError("could not read the Google profile")
+        if not isinstance(info, dict):
+            raise AuthError("Google returned an unexpected profile response")
+        email = str(info.get("email") or "").strip()
+        # email_verified false means Google itself does not vouch for the
+        # address, which is exactly the claim the allowlist is matched against.
+        if not email or not info.get("email_verified"):
+            raise AuthError("Google did not return a verified e-mail address")
+        return [email]
 
     try:
-        info = _get_json(GOOGLE_USERINFO_URL, access)
+        rows = _get_json(GITHUB_EMAILS_URL, access, headers=_github_headers(access))
     except Exception:
-        raise AuthError("could not read the Google profile")
-    if not isinstance(info, dict):
-        raise AuthError("Google returned an unexpected profile response")
-
-    email = str(info.get("email") or "").strip()
-    # email_verified false means Google itself does not vouch for the address,
-    # which is exactly the claim the allowlist is matched against.
-    if not email or not info.get("email_verified"):
-        raise AuthError("Google did not return a verified e-mail address")
-    return email
+        raise AuthError("could not read the GitHub e-mail addresses")
+    if not isinstance(rows, list):
+        raise AuthError("GitHub returned an unexpected profile response")
+    emails = [str(r.get("email") or "").strip() for r in rows
+              if isinstance(r, dict) and r.get("verified")]
+    emails = [e for e in emails if e]
+    if not emails:
+        raise AuthError("GitHub returned no verified e-mail address")
+    return emails
 
 
 # --------------------------------------------------------------------------
@@ -380,23 +478,31 @@ class Session:
 
     # -- the short-lived handshake cookie ----------------------------------
 
-    def issue_oauth_state(self, verifier: str, keyver: int = 1) -> tuple:
+    def issue_oauth_state(self, verifier: str, keyver: int = 1,
+                          provider: str = "google") -> tuple:
         """(cookie_value, state). The PKCE verifier travels in the signed
-        cookie and the state is derived from it, so a callback can only be
-        completed by the browser that started the handshake."""
+        cookie and the state is bound to it, so a callback can only be
+        completed by the browser that started the handshake.
+
+        The provider name is signed in too. Both callbacks share one cookie, so
+        without it a code obtained from one provider could be presented to the
+        other provider's callback -- which would fail at the token endpoint,
+        but should be refused before a request leaves the box at all."""
         issued = int(time.time())
         state = secrets.token_urlsafe(16)
-        value = "oa:%d:%d:%s:%s" % (keyver, issued, state, verifier)
+        value = "oa:%d:%d:%s:%s:%s" % (keyver, issued, provider, state, verifier)
         return self.sign(value, keyver), state
 
-    def read_oauth_state(self, cookie, state: str, keyver: int = 1):
-        """Return the PKCE verifier if the cookie matches the state Google sent
-        back and has not expired; otherwise None."""
+    def read_oauth_state(self, cookie, state: str, keyver: int = 1,
+                         provider: str = "google"):
+        """Return the PKCE verifier if the cookie matches the state the
+        provider sent back, names that same provider, and has not expired;
+        otherwise None."""
         if not cookie or "." not in cookie or not state:
             return None
         value, mac = cookie.rsplit(".", 1)
         parts = value.split(":")
-        if len(parts) != 5 or parts[0] != "oa":
+        if len(parts) != 6 or parts[0] != "oa":
             return None
         try:
             cookie_kv, issued = int(parts[1]), int(parts[2])
@@ -409,9 +515,11 @@ class Session:
             return None
         if not (0 <= time.time() - issued <= OAUTH_SECONDS):
             return None
-        if not hmac.compare_digest(parts[3], state):
+        if not hmac.compare_digest(parts[3], provider):
             return None
-        return parts[4]
+        if not hmac.compare_digest(parts[4], state):
+            return None
+        return parts[5]
 
 
 class Throttle:
