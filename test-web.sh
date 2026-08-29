@@ -823,6 +823,89 @@ trap - EXIT
 code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$BASE/memory/index")
 check "bearer still works after restoring auth.json" 200 "$code"
 
+echo "=== 9. minted API keys ==="
+# The point of a minted key is that it is a bearer credential which cannot mint
+# more of itself: a leaked key that could issue successors would survive its own
+# revocation, and revocation is the only reason these exist.
+KEYFILE=./apikeys.json
+KEYBAK=$(mktemp)
+HADKEYS=no
+[ -f "$KEYFILE" ] && { cp -p "$KEYFILE" "$KEYBAK"; HADKEYS=yes; }
+restore_keys() {
+  if [ "$HADKEYS" = yes ]; then cp -p "$KEYBAK" "$KEYFILE"; else rm -f "$KEYFILE"; fi
+  rm -f "$KEYBAK"
+}
+trap restore_keys EXIT
+
+# A browser session, on a throttle bucket section 6 has not burned.
+KJAR=$(mktemp)
+curl -s -o /dev/null -c "$KJAR" -X POST -H "Content-Type: application/json" \
+  -H "CF-Connecting-IP: 203.0.113.9" \
+  -d "{\"token\":\"$TOKEN\"}" "$BASE/auth/login"
+
+code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$BASE/auth/keys")
+check "the master token cannot list keys" 403 "$code"
+code=$(curl -s -o /dev/null -w "%{http_code}" -b "$KJAR" "$BASE/auth/keys")
+check "a cookie without X-Memory-Actor cannot list keys" 403 "$code"
+code=$(curl -s -o /dev/null -w "%{http_code}" -b "$KJAR" -H "X-Memory-Actor: test" "$BASE/auth/keys")
+check "a signed-in browser can list keys" 200 "$code"
+
+NEW=$(curl -s -b "$KJAR" -H "X-Memory-Actor: test" -H "Content-Type: application/json" \
+  -X POST -d '{"name":"suite-scratch"}' "$BASE/auth/keys")
+contains "create returns the secret once" '"value":"mem_' "$NEW"
+KEY=$(printf '%s' "$NEW" | sed -n 's/.*"value":"\([^"]*\)".*/\1/p')
+KEYID=$(printf '%s' "$NEW" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+
+code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $KEY" "$BASE/memory/index")
+check "the new key reads the store" 200 "$code"
+code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $KEY" \
+  -H "If-None-Match: *" --data-binary $'## Scratch\n\n- k\n' "$BASE/memory/webui-key-test")
+check "the new key writes the store" 200 "$code"
+code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Bearer $KEY" \
+  -H "If-Match: *" "$BASE/memory/webui-key-test")
+check "the new key deletes what it wrote" 200 "$code"
+
+# The escalation this design exists to prevent.
+code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $KEY" \
+  -H "X-Memory-Actor: test" -H "Content-Type: application/json" \
+  -X POST -d '{"name":"successor"}' "$BASE/auth/keys")
+check "a key cannot mint another key" 403 "$code"
+code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Bearer $KEY" \
+  -H "X-Memory-Actor: test" "$BASE/auth/keys/$KEYID")
+check "a key cannot delete a key" 403 "$code"
+
+dup=$(curl -s -b "$KJAR" -H "X-Memory-Actor: test" -H "Content-Type: application/json" \
+  -X POST -d '{"name":"suite-scratch"}' "$BASE/auth/keys")
+contains "a duplicate name is refused" "already exists" "$dup"
+bad=$(curl -s -b "$KJAR" -H "X-Memory-Actor: test" -H "Content-Type: application/json" \
+  -X POST -d '{"name":""}' "$BASE/auth/keys")
+contains "an empty name is refused" "name must be" "$bad"
+
+listed=$(curl -s -b "$KJAR" -H "X-Memory-Actor: test" "$BASE/auth/keys")
+contains "the key is listed" '"name":"suite-scratch"' "$listed"
+case "$listed" in *'"hash"'*) echo "FAIL: the listing leaks the hash"; FAIL=$((FAIL+1)) ;;
+  *) echo "PASS: the listing does not leak the hash"; PASS=$((PASS+1)) ;; esac
+case "$listed" in *"$KEY"*) echo "FAIL: the listing leaks the secret"; FAIL=$((FAIL+1)) ;;
+  *) echo "PASS: the listing does not leak the secret"; PASS=$((PASS+1)) ;; esac
+
+code=$(curl -s -o /dev/null -w "%{http_code}" -b "$KJAR" -H "X-Memory-Actor: test" \
+  -X DELETE "$BASE/auth/keys/$KEYID")
+check "the browser deletes the key" 200 "$code"
+code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $KEY" "$BASE/memory/index")
+check "the deleted key stops working immediately" 401 "$code"
+code=$(curl -s -o /dev/null -w "%{http_code}" -b "$KJAR" -H "X-Memory-Actor: test" \
+  -X DELETE "$BASE/auth/keys/$KEYID")
+check "deleting it twice is a 404" 404 "$code"
+code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$BASE/memory/index")
+check "the master token is unaffected throughout" 200 "$code"
+if [ -f "$KEYFILE" ]; then
+  mode=$(stat -c "%a" "$KEYFILE")
+  check "apikeys.json is 600" 600 "$mode"
+fi
+rm -f "$KJAR"
+restore_keys
+trap - EXIT
+
 echo "=== cleanup ==="
 code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Bearer $TOKEN" \
   -H "If-Match: *" "$BASE/memory/$CAT")

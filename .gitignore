@@ -13,4 +13,6 @@ __pycache__/
 # checkout.
 auth.json
 auth.json.tmp
+apikeys.json
+apikeys.json*.tmp
 .env

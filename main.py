@@ -25,6 +25,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
+import apikeys
 import webauth
 
 load_dotenv()
@@ -87,6 +88,7 @@ app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
 session = webauth.Session(TOKEN)
 creds = webauth.Credentials()
+keystore = apikeys.KeyStore()
 login_throttle = webauth.Throttle(max_attempts=5, window_sec=300)
 # The Google path is slower and involves a third party, so it gets its own
 # budget: exhausting one must not lock the other out, and the token path is the
@@ -106,8 +108,17 @@ def check_auth(request: Request) -> str:
     the browser path; callers that write care about the difference.
     """
     auth = request.headers.get("authorization", "")
-    if auth.startswith("Bearer ") and secrets.compare_digest(auth[7:], TOKEN):
-        return "bearer"
+    if auth.startswith("Bearer "):
+        presented = auth[7:]
+        if secrets.compare_digest(presented, TOKEN):
+            return "bearer"
+        # A minted key is a bearer credential exactly like the master token and
+        # gets the same read and write rights. The only thing it cannot do is
+        # manage keys -- see require_browser().
+        rec = keystore.verify(presented)
+        if rec:
+            keystore.touch(rec)
+            return "bearer"
     if session.read(request.cookies.get(webauth.COOKIE_NAME), creds.keyver):
         return "cookie"
     raise HTTPException(status_code=401, detail="unauthorized")
@@ -843,6 +854,62 @@ def github_start(request: Request):
 @app.get("/auth/github/callback")
 def github_callback(request: Request, code: str = "", state: str = "", error: str = ""):
     return oauth_callback("github", request, code, state, error)
+
+
+def require_browser(request: Request) -> None:
+    """Key management is cookie-only, and deliberately so.
+
+    A minted key that could mint more keys would be able to issue itself
+    successors that outlive its own revocation, which is the one property that
+    makes revoking a key meaningless. Signing in -- with GitHub, or with the
+    master token -- is the gate for handing out credentials.
+
+    The X-Memory-Actor requirement from check_write_auth applies here too: a
+    cookie alone does not prove the request came from our own page.
+    """
+    if check_auth(request) != "cookie":
+        raise HTTPException(
+            status_code=403,
+            detail="API keys can only be managed from a signed-in browser session",
+        )
+    if not request.headers.get("x-memory-actor"):
+        raise HTTPException(
+            status_code=403,
+            detail="X-Memory-Actor header required",
+        )
+
+
+@app.get("/auth/keys")
+def list_keys(request: Request):
+    require_browser(request)
+    return JSONResponse({"keys": keystore.listing()})
+
+
+@app.post("/auth/keys")
+async def create_key(request: Request):
+    require_browser(request)
+    try:
+        name = str((await request.json()).get("name") or "")
+    except Exception:
+        name = ""
+    try:
+        rec, secret = keystore.create(name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    sys.stderr.write("memory: minted api key %s (%s)\n" % (rec["id"], rec["name"]))
+    # The secret appears in this one response and is never recoverable: only its
+    # SHA-256 is stored.
+    return JSONResponse({"id": rec["id"], "name": rec["name"],
+                         "created": rec["created"], "value": secret})
+
+
+@app.delete("/auth/keys/{key_id}")
+def delete_key(request: Request, key_id: str):
+    require_browser(request)
+    if not keystore.delete(key_id):
+        raise HTTPException(status_code=404, detail="no such key")
+    sys.stderr.write("memory: deleted api key %s\n" % key_id)
+    return JSONResponse({"deleted": key_id})
 
 
 @app.post("/auth/logout")

@@ -1398,6 +1398,119 @@
     try { localStorage.setItem('mem.staleThreshold', String(v)); } catch (_) { /* private mode */ }
   }
 
+  /* --------------------------------------------------------------- keys */
+
+  function viewKeys() {
+    state.cat = null;
+    state.doc = null;
+    state.kind = null;
+    state.editing = false;
+    renderSidebar();
+    loading();
+    api('/auth/keys').then(function (res) {
+      if (!res.ok) {
+        return res.text().then(function (t) {
+          main('<div class="vhead"><h1>API keys</h1></div>' +
+               '<p class="vsub error">' + e(detail(t, res.status)) + '</p>');
+        });
+      }
+      return res.json().then(renderKeys);
+    }).catch(function (err) { toast(err.message, true); });
+  }
+
+  function renderKeys(data) {
+    var rows = data.keys || [];
+    var html = ['<div class="vhead"><h1>API keys</h1></div>',
+      '<p class="vsub">A key is a bearer credential for one device or agent: it ' +
+      'reads and writes the store exactly as the master token does, but deleting ' +
+      'it disturbs nothing else. Keys cannot mint or delete other keys \u2014 that ' +
+      'needs a signed-in browser.</p>',
+      '<form id="key-new" class="keyform">',
+      '  <input id="key-name" type="text" placeholder="Name this key (e.g. phone, laptop)" ' +
+      'maxlength="40" spellcheck="false">',
+      '  <button type="submit" class="btn primary">Create key</button>',
+      '</form>',
+      '<p id="key-err" class="error small hidden"></p>',
+      '<div id="key-fresh"></div>'];
+
+    if (!rows.length) {
+      html.push('<p class="vsub">No keys yet.</p>');
+    } else {
+      html.push('<table class="keytable"><thead><tr><th>Name</th><th>Created</th>' +
+                '<th>Last used</th><th></th></tr></thead><tbody>');
+      rows.forEach(function (k) {
+        html.push('<tr><td>' + e(k.name) + '</td><td class="muted small">' +
+          e((k.created || '').slice(0, 10)) + '</td><td class="muted small">' +
+          e(k.last_used ? k.last_used.slice(0, 10) : 'never') +
+          '</td><td><button class="btn small danger" data-del="' + e(k.id) +
+          '" data-name="' + e(k.name) + '">Delete</button></td></tr>');
+      });
+      html.push('</tbody></table>');
+    }
+    main(html.join(''));
+
+    $('key-new').addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      var err = $('key-err');
+      err.classList.add('hidden');
+      api('/auth/keys', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: $('key-name').value })
+      }).then(function (res) {
+        if (!res.ok) {
+          return res.text().then(function (t) {
+            err.textContent = detail(t, res.status);
+            err.classList.remove('hidden');
+          });
+        }
+        return res.json().then(function (k) {
+          // Shown once and never again: only the hash is stored. Rendering it
+          // here rather than in a toast is deliberate -- it has to survive long
+          // enough to be copied onto another machine.
+          $('key-fresh').innerHTML =
+            '<div class="keyshow"><p><strong>' + e(k.name) + '</strong> created. ' +
+            'Copy it now \u2014 it is never shown again.</p>' +
+            '<code id="key-val">' + e(k.value) + '</code>' +
+            '<p class="muted small">Use it as <code>Authorization: Bearer &lt;key&gt;</code>, ' +
+            'or put it in <code>MEMORY_API_TOKEN</code> / <code>~/.claude/.memory-token</code> ' +
+            'for <code>memapi.py</code>.</p></div>';
+          viewKeysRefresh();
+        });
+      }).catch(function (e2) {
+        err.textContent = e2.message;
+        err.classList.remove('hidden');
+      });
+    });
+
+    Array.prototype.forEach.call(document.querySelectorAll('[data-del]'), function (b) {
+      b.onclick = function () {
+        if (!confirm('Delete key "' + b.getAttribute('data-name') +
+                     '"? Anything using it stops working immediately.')) return;
+        api('/auth/keys/' + encodeURIComponent(b.getAttribute('data-del')),
+            { method: 'DELETE' })
+          .then(function (res) {
+            if (!res.ok) return res.text().then(function (t) { throw new Error(detail(t, res.status)); });
+            toast('Key deleted');
+            viewKeys();
+          })
+          .catch(function (err2) { toast(err2.message, true); });
+      };
+    });
+  }
+
+  // Re-list without wiping the freshly shown secret above it.
+  function viewKeysRefresh() {
+    api('/auth/keys').then(function (res) {
+      if (!res.ok) return;
+      return res.json().then(function (data) {
+        var fresh = $('key-fresh').innerHTML;
+        renderKeys(data);
+        $('key-fresh').innerHTML = fresh;
+      });
+    });
+  }
+
   function viewStale() {
     state.cat = null;
     state.doc = null;
@@ -1490,6 +1603,7 @@
     if (parts[0] === 'search') return viewSearch(decodeURIComponent(parts.slice(1).join('/')));
 
     if (parts[0] === 'pins') return viewPins();
+    if (parts[0] === 'keys') return viewKeys();
     if (parts[0] === 'stale') return viewStale();
 
     if (parts[0] === 'c' && parts[1]) {

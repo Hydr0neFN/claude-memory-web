@@ -106,6 +106,22 @@ manage. `keyver` in `auth.json` is the same lever without touching the token:
 bump it and every browser session dies while every agent keeps working
 (`manage_auth.py sign-out-everyone`).
 
+### API keys
+
+A signed-in browser can mint named bearer keys at `/#/keys` — one per device or
+agent. A key reads and writes the store exactly as the master token does, but
+deleting it disturbs nothing else, which is what makes a lost phone answerable
+without rotating the token and signing every browser and agent out at once.
+
+Keys cannot mint or delete keys. That is cookie-only, so a leaked key cannot
+issue itself successors that outlive its own revocation. The secret is shown
+once and never stored — `apikeys.json` (mode 600, beside `main.py`, never inside
+`data/`) holds only its SHA-256. A 256-bit `secrets.token_urlsafe` needs no slow
+KDF; there is nothing to brute-force.
+
+Use one as `Authorization: Bearer <key>`, or put it in `MEMORY_API_TOKEN` or
+`~/.claude/.memory-token` for `memapi.py`.
+
 ### Configuring a provider
 
 For GitHub, register an OAuth App at <https://github.com/settings/developers>
@@ -149,6 +165,7 @@ described above.
 | `main.py` | `$APP_DIR/main.py` | the API, plus `/auth/*` and the static mount |
 | `webauth.py` | `$APP_DIR/webauth.py` | HMAC cookie sessions, the OAuth provider table, login throttle |
 | `manage_auth.py` | `$APP_DIR/manage_auth.py` | administers `auth.json`: provider clients, allowlists, `keyver` |
+| `apikeys.py` | `$APP_DIR/apikeys.py` | named revocable bearer keys, minted from the browser |
 | `web/` | `$APP_DIR/web/` | `index.html`, `app.css`, `app.js`, `md.js`, `diff.js` |
 | `test-web.sh` | `$APP_DIR/test-web.sh` | server test suite, run on the box |
 | `tests/` | `$APP_DIR/tests/` | unit tests: `test_webauth.py` (offline), `test_etag_regression.py` |
@@ -163,6 +180,7 @@ described above.
 python devstub.py     # serves web/ on :8123 with a fake API, no token needed
 node rendertest.js    # markdown + diff checks
 python tests/test_webauth.py   # sessions, keyver, PKCE state, allowlist; no network
+python tests/test_apikeys.py   # minting, verifying, revoking; no network
 ```
 
 `devstub.py` fakes the whole API from in-memory fixtures, including a category

@@ -40,6 +40,14 @@
 
 該 Cookie 為 HttpOnly，並以 API Token 衍生的金鑰簽署，因此輪替 Token 會將所有瀏覽器登出，且無需管理第二個密鑰。`auth.json` 中的 `keyver` 是同一個開關，但不必動到 Token：將它加一，所有瀏覽器工作階段立即失效，而所有 Agent 完全不受影響（`manage_auth.py sign-out-everyone`）。
 
+### API 金鑰
+
+已登入的瀏覽器可在 `/#/keys` 簽發具名稱的 bearer 金鑰 —— 一台裝置或一個 agent 一把。金鑰的讀寫權限與 master token 相同，但刪除它不會影響其他任何東西——這正是「手機不見了」能夠單獨處理、而不必輪替 token 把所有瀏覽器與 agent 一起斷掉的原因。
+
+金鑰無法簽發或刪除金鑰，那只能透過 cookie 完成；否則一把外洩的金鑰可以自行簽出接班者，比它自己被撤销還活得久。秘密只顯示一次且不儲存 —— `apikeys.json`（600、在 `main.py` 旁邊、絕不在 `data/` 內）只存它的 SHA-256。256 位元的 `secrets.token_urlsafe` 不需要慢速 KDF，因為沒有可暴力破解的空間。
+
+使用方式：`Authorization: Bearer <key>`，或放進 `MEMORY_API_TOKEN` / `~/.claude/.memory-token` 給 `memapi.py` 用。
+
 ### 設定登入提供者
 
 GitHub：在 <https://github.com/settings/developers> 註冊一個 OAuth App，callback URL 填 `https://<你的主機>/auth/github/callback`，client id 與 secret 當場發給。Google：在 <https://console.cloud.google.com/apis/credentials> 建立 OAuth **Web application** 用戶端，重新導向 URI 填 `https://<你的主機>/auth/google/callback`（這邊要先過同意畫面表單）。然後在機器上執行：
@@ -63,6 +71,7 @@ sudo -u claudemem $APP_DIR/venv/bin/python $APP_DIR/manage_auth.py \
 |---|---|---|
 | `main.py` | `$APP_DIR/main.py` | API，加上 `/auth/*` 與靜態掛載 |
 | `webauth.py` | `$APP_DIR/webauth.py` | HMAC Cookie 工作階段 + 登入速率限制 |
+| `apikeys.py` | `$APP_DIR/apikeys.py` | 具名稱、可撤销的 bearer 金鑰，由瀏覽器簽發 |
 | `manage_auth.py` | `$APP_DIR/manage_auth.py` | 管理 `auth.json`：Google 用戶端、允許清單、`keyver` |
 | `web/` | `$APP_DIR/web/` | `index.html`、`app.css`、`app.js`、`md.js`、`diff.js` |
 | `test-web.sh` | `$APP_DIR/test-web.sh` | 伺服器測試套件，於主機上執行 |

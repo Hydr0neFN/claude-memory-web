@@ -457,3 +457,29 @@ input:focus, textarea:focus { outline: 2px solid var(--accent-line); outline-off
   border-radius: 5px; padding: 0 5px;
   cursor: help;
 }
+
+/* api keys --------------------------------------------------------------- */
+.keyform { display: flex; gap: 8px; margin: 14px 0 4px; flex-wrap: wrap; }
+.keyform input { flex: 1; min-width: 220px; }
+.keytable { width: 100%; border-collapse: collapse; margin-top: 18px; }
+.keytable th {
+  text-align: left; font-size: 11px; letter-spacing: .06em; text-transform: uppercase;
+  color: var(--ink-3); font-weight: 600; padding: 0 10px 6px 0;
+  border-bottom: 1px solid var(--line);
+}
+.keytable td { padding: 9px 10px 9px 0; border-bottom: 1px solid var(--line-2); }
+.keytable td:last-child, .keytable th:last-child { text-align: right; padding-right: 0; }
+.keyshow {
+  margin: 16px 0; padding: 14px 16px; border-radius: 12px;
+  background: var(--ok-bg); border: 1px solid var(--ok-line);
+}
+.keyshow p { margin: 0 0 8px; }
+.keyshow p:last-child { margin: 8px 0 0; }
+/* the one place a secret is on screen: it must be selectable in full, and must
+   not be silently truncated by an ellipsis */
+.keyshow > code {
+  display: block; padding: 10px 12px; border-radius: 8px;
+  background: var(--card); border: 1px solid var(--line);
+  font-family: var(--mono); font-size: 13px;
+  word-break: break-all; user-select: all;
+}
