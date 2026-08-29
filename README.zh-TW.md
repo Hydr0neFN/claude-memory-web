@@ -30,7 +30,28 @@
 
 ## 驗證機制
 
-Agent 繼續使用 Bearer Token —— 保持不變。瀏覽器使用 Token 執行一次 `POST /auth/login`，並取得由 Token 本身衍生金鑰簽署的 HttpOnly Cookie，因此輪替 Token 會將所有瀏覽器登出，且無需管理第二個密鑰。
+入口有兩種，兩者刻意不對稱。
+
+**Agent** 繼續使用 Bearer Token —— 保持不變，且永遠不會被要求第二因子。持有 Token 者本來就能透過 API 讀寫整個儲存區，因此在瀏覽器這道門加上第二因子並不會守住任何東西。
+
+**人** 使用 Google 登入，讓手機不必持有 Token 也能讀取儲存區。第二因子就是 Google 帳號本身已有的那一個；授權判斷則來自 `auth.json` 裡的電子郵件允許清單，因為「用 Google 登入了」本身只證明對方擁有一個 Google 帳號。`GET /auth/google` 會啟動帶 PKCE 的 authorization-code 交握，callback 則透過直連 Google 的後端通道交換授權碼。這也是此處不驗證 ID token 簽章、且整個流程不需要任何新依賴的原因：本服務與 Google token endpoint 之間沒有任何中介，而這正是 JWT 驗簽所要建立的性質。
+
+兩條路徑最終都通往同一個 Cookie。以 Token 執行 `POST /auth/login` 依然可用，並且是 Google 無法連線、允許清單設錯、或手邊沒有瀏覽器可跑同意畫面時的退路。
+
+該 Cookie 為 HttpOnly，並以 API Token 衍生的金鑰簽署，因此輪替 Token 會將所有瀏覽器登出，且無需管理第二個密鑰。`auth.json` 中的 `keyver` 是同一個開關，但不必動到 Token：將它加一，所有瀏覽器工作階段立即失效，而所有 Agent 完全不受影響（`manage_auth.py sign-out-everyone`）。
+
+### 設定 Google 登入
+
+在 <https://console.cloud.google.com/apis/credentials> 建立一組 OAuth **Web application** 用戶端，授權重新導向 URI 設為 `https://<你的主機>/auth/google/callback`，然後在機器上執行：
+
+```bash
+sudo -u claudemem $APP_DIR/venv/bin/python $APP_DIR/manage_auth.py \
+     setup <client-id> https://<你的主機>/auth/google/callback you@example.com
+```
+
+它會在終端機提示輸入 client secret，而不是從 `argv` 讀取，並將 `auth.json` 以 600 權限寫在 `main.py` 旁邊 —— 絕不放進 `data/`，那是一個會永久保留每個檔案每一版的 git repo。不需要重啟：該檔案內容變動時會自動重新讀取。
+
+不設定 Google 時，服務的行為與先前完全相同 —— 登入頁提供 Token 欄位，`/auth/google` 回應 503。
 
 透過 Cookie 授權的寫入請求還必須發送 `X-Memory-Actor`；跨站請求無法設定自訂標頭，此外 Cookie 還設有 `SameSite=strict`。該標頭同時兼作 git commit 中的作者（`PUT infra via memory-web`）。
 
@@ -42,6 +63,7 @@ Agent 繼續使用 Bearer Token —— 保持不變。瀏覽器使用 Token 執�
 |---|---|---|
 | `main.py` | `$APP_DIR/main.py` | API，加上 `/auth/*` 與靜態掛載 |
 | `webauth.py` | `$APP_DIR/webauth.py` | HMAC Cookie 工作階段 + 登入速率限制 |
+| `manage_auth.py` | `$APP_DIR/manage_auth.py` | 管理 `auth.json`：Google 用戶端、允許清單、`keyver` |
 | `web/` | `$APP_DIR/web/` | `index.html`、`app.css`、`app.js`、`md.js`、`diff.js` |
 | `test-web.sh` | `$APP_DIR/test-web.sh` | 伺服器測試套件，於主機上執行 |
 | `memapi.py` | 用戶端任意位置 | 此 API 的命令列用戶端 |
