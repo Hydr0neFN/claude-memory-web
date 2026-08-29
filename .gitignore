@@ -7,3 +7,10 @@
 __pycache__/
 *.pyc
 .DS_Store
+
+# Never: the OAuth client secret and the API token live here on a deployed box,
+# and this repo is public. auth.json is created by manage_auth.py, not by a
+# checkout.
+auth.json
+auth.json.tmp
+.env

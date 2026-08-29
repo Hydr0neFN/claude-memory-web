@@ -126,10 +126,25 @@
 
   /* ----------------------------------------------------------------- auth */
 
-  function showLogin() {
+  // Last answer from /auth/me, so a session that expires mid-use returns to a
+  // login page that still offers the button the user actually signs in with.
+  var authInfo = { google: false };
+
+  function showLogin(me) {
+    if (me && typeof me.google === 'boolean') authInfo = me;
+    me = authInfo;
     $('app').classList.add('hidden');
     $('login').classList.remove('hidden');
-    setTimeout(function () { $('login-token').focus(); }, 30);
+    // The Google button is shown only when the server says the handshake is
+    // configured -- offering a button that answers 503 is worse than not
+    // offering it, because the token field below is the actual way in.
+    var google = !!(me && me.google);
+    $('login-google').classList.toggle('hidden', !google);
+    $('login-google-note').classList.toggle('hidden', !google);
+    if (!google) {
+      $('login-token-wrap').open = true;
+      setTimeout(function () { $('login-token').focus(); }, 30);
+    }
   }
 
   function showApp() {
@@ -166,7 +181,7 @@
     // it sits a thumb's width from "+ New" on a phone, and there is no undo:
     // an accidental tap ends the session and any open edit with it
     if (state.dirty && !confirm('You have unsaved changes. Sign out anyway?')) return;
-    if (!confirm('Sign out? You will need the API token again.')) return;
+    if (!confirm('Sign out? You will need to sign in again.')) return;
     fetch('/auth/logout', { method: 'POST', credentials: 'same-origin' })
       .then(function () { location.hash = ''; showLogin(); });
   });
@@ -1514,6 +1529,13 @@
 
   fetch('/auth/me', { credentials: 'same-origin', cache: 'no-store' })
     .then(function (r) { return r.json(); })
-    .then(function (me) { return me.authenticated ? showApp() : showLogin(); })
-    .catch(showLogin);
+    .then(function (me) {
+      // Remember it even when signed in: this is the only time the page learns
+      // whether Google is configured, and showLogin() needs it later if the
+      // session expires while the tab is open.
+      if (me && typeof me.google === 'boolean') authInfo = me;
+      if (me.email) $('logout-btn').title = 'Signed in as ' + me.email;
+      return me.authenticated ? showApp() : showLogin(me);
+    })
+    .catch(function () { showLogin(); });
 })();

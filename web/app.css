@@ -108,6 +108,9 @@ input:focus, textarea:focus { outline: 2px solid var(--accent-line); outline-off
 .login-card h1 { margin: 0; font-size: 22px; }
 .login-card p { margin: 0; }
 .login-card input { width: 100%; }
+.login-card .block { display: block; text-align: center; text-decoration: none; }
+.login-alt summary { cursor: pointer; }
+.login-alt form { display: grid; gap: 10px; margin-top: 12px; }
 
 /* shell ------------------------------------------------------------------ */
 .app {

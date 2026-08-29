@@ -22,7 +22,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 import webauth
@@ -86,7 +86,12 @@ DOCS_DIR.mkdir(parents=True, exist_ok=True)
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
 session = webauth.Session(TOKEN)
+creds = webauth.Credentials()
 login_throttle = webauth.Throttle(max_attempts=5, window_sec=300)
+# The Google path is slower and involves a third party, so it gets its own
+# budget: exhausting one must not lock the other out, and the token path is the
+# way back in when Google is the thing that is broken.
+oauth_throttle = webauth.Throttle(max_attempts=10, window_sec=300)
 
 
 # --------------------------------------------------------------------------
@@ -103,7 +108,7 @@ def check_auth(request: Request) -> str:
     auth = request.headers.get("authorization", "")
     if auth.startswith("Bearer ") and secrets.compare_digest(auth[7:], TOKEN):
         return "bearer"
-    if session.read(request.cookies.get(webauth.COOKIE_NAME)):
+    if session.read(request.cookies.get(webauth.COOKIE_NAME), creds.keyver):
         return "cookie"
     raise HTTPException(status_code=401, detail="unauthorized")
 
@@ -685,6 +690,12 @@ def claim_line_for_marker(lines: list, i: int, mask: list) -> int:
 
 @app.post("/auth/login")
 async def login(request: Request):
+    """Break-glass: trade the API token itself for a session cookie.
+
+    Kept as the way in when Google is unreachable, when the allowlist is wrong,
+    or when there is no browser to run a consent screen. It asks for no second
+    factor by design -- whoever holds the token can already read and write the
+    whole store through the API, so demanding one here would guard nothing."""
     key = webauth.client_key(request)
     if not login_throttle.allow(key):
         raise HTTPException(status_code=429, detail="too many attempts; wait a few minutes")
@@ -698,16 +709,111 @@ async def login(request: Request):
         login_throttle.record(key)
         raise HTTPException(status_code=401, detail="invalid token")
 
-    response = JSONResponse({"authenticated": True})
+    response = JSONResponse({"authenticated": True, "via": "token"})
+    set_session_cookie(response, request, webauth.SUBJECT_TOKEN)
+    return response
+
+
+def set_session_cookie(response, request: Request, subject: str, email: str = "") -> None:
     response.set_cookie(
         webauth.COOKIE_NAME,
-        session.issue(),
+        session.issue(subject, creds.keyver, email),
         max_age=webauth.SESSION_SECONDS,
         httponly=True,
         secure=webauth.cookie_secure(request),
         samesite="strict",
         path="/",
     )
+
+
+def oauth_error(message: str, status: int = 403):
+    """A dead end a human has landed on, so it answers in HTML rather than the
+    JSON detail every other error here uses."""
+    return HTMLResponse(
+        "<!doctype html><meta charset=utf-8><title>Sign-in failed</title>"
+        "<body style='font:14px system-ui;margin:3rem auto;max-width:32rem'>"
+        "<h1 style='font-size:1.1rem'>Sign-in failed</h1><p>%s</p>"
+        "<p><a href='/'>Back</a></p>" % html_escape(message),
+        status_code=status,
+    )
+
+
+def html_escape(text: str) -> str:
+    return (text.replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+@app.get("/auth/google")
+def google_start(request: Request):
+    """Begin the Google handshake. GET, because it is a top-level navigation."""
+    if not creds.google_enabled:
+        return oauth_error("Google sign-in is not configured on this server.", 503)
+    if not oauth_throttle.allow(webauth.client_key(request)):
+        return oauth_error("Too many sign-in attempts. Wait a few minutes.", 429)
+
+    google = creds.google
+    verifier, challenge = webauth.pkce_pair()
+    cookie_value, state = session.issue_oauth_state(verifier, creds.keyver)
+    response = RedirectResponse(
+        webauth.auth_url(google["client_id"], google["redirect_uri"], state, challenge),
+        status_code=302,
+    )
+    response.set_cookie(
+        webauth.OAUTH_COOKIE,
+        cookie_value,
+        max_age=webauth.OAUTH_SECONDS,
+        httponly=True,
+        secure=webauth.cookie_secure(request),
+        # Lax, not Strict: this cookie has to survive Google's top-level
+        # redirect back here, and Strict would withhold it on exactly that
+        # request. It carries only a PKCE verifier and expires in ten minutes.
+        samesite="lax",
+        path="/auth/google",
+    )
+    return response
+
+
+@app.get("/auth/google/callback")
+def google_callback(request: Request, code: str = "", state: str = "", error: str = ""):
+    if not creds.google_enabled:
+        return oauth_error("Google sign-in is not configured on this server.", 503)
+    key = webauth.client_key(request)
+    if not oauth_throttle.allow(key):
+        return oauth_error("Too many sign-in attempts. Wait a few minutes.", 429)
+    if error:
+        return oauth_error("Google reported: %s" % error)
+
+    verifier = session.read_oauth_state(
+        request.cookies.get(webauth.OAUTH_COOKIE), state, creds.keyver)
+    if not verifier or not code:
+        oauth_throttle.record(key)
+        return oauth_error(
+            "This sign-in link has expired or did not start here. Try again from "
+            "the sign-in page.")
+
+    try:
+        email = webauth.exchange_code(creds.google, code, verifier)
+    except webauth.AuthError as exc:
+        oauth_throttle.record(key)
+        return oauth_error(str(exc))
+
+    if not creds.allows(email):
+        oauth_throttle.record(key)
+        sys.stderr.write("memory: rejected google sign-in for %s\n" % email)
+        return oauth_error("%s is not allowed to sign in here." % email)
+
+    # An HTML hop rather than a 302: the session cookie is SameSite=Strict, and
+    # a redirect issued while still inside Google's cross-site navigation would
+    # not carry it to the page it lands on. A same-site navigation started by
+    # this page does.
+    response = HTMLResponse(
+        "<!doctype html><meta charset=utf-8><title>Signed in</title>"
+        "<script>location.replace('/')</script>"
+        "<body style='font:14px system-ui;margin:3rem auto;max-width:32rem'>"
+        "<p>Signed in as %s. <a href='/'>Continue</a>.</p>" % html_escape(email)
+    )
+    set_session_cookie(response, request, webauth.SUBJECT_GOOGLE, email)
+    response.delete_cookie(webauth.OAUTH_COOKIE, path="/auth/google")
     return response
 
 
@@ -721,8 +827,17 @@ def logout(request: Request):
 @app.get("/auth/me")
 def whoami(request: Request):
     """Deliberately never 401s — the shell asks this to decide which view to
-    render, and a 401 there would be an error the UI has to swallow anyway."""
-    return JSONResponse({"authenticated": session.read(request.cookies.get(webauth.COOKIE_NAME))})
+    render, and a 401 there would be an error the UI has to swallow anyway.
+
+    It also reports whether Google sign-in is configured, so the login page can
+    show the button only when pressing it would work."""
+    info = session.read(request.cookies.get(webauth.COOKIE_NAME), creds.keyver)
+    return JSONResponse({
+        "authenticated": bool(info),
+        "via": ({"web": "token", "ggl": "google"}.get(info.subject) if info else None),
+        "email": (info.email if info else ""),
+        "google": creds.google_enabled,
+    })
 
 
 # --------------------------------------------------------------------------

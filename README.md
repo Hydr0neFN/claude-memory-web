@@ -70,10 +70,50 @@ name.
 
 ## Auth
 
-Agents keep using the bearer token — unchanged. Browsers `POST /auth/login`
-once with the token and get an HttpOnly cookie signed with a key derived from
-the token itself, so rotating the token logs every browser out and there is no
-second secret to manage.
+Two ways in, deliberately asymmetric.
+
+**Agents** keep using the bearer token — unchanged, and never asked for a second
+factor. Whoever holds the token can already read and write the whole store
+through the API, so a second factor at the browser door would guard nothing.
+
+**People** sign in with Google, so a phone can read the store without holding
+the token. The second factor is the one already on the Google account; an
+allowlist of addresses in `auth.json` is the authorization step, because
+"signed in with Google" by itself authorizes anybody with a Google account.
+`GET /auth/google` starts an authorization-code handshake with PKCE, and the
+callback exchanges the code over a direct back-channel call to Google. That is
+why the ID token's signature is never verified here and why the whole flow adds
+no dependency: nothing sits between this service and Google's token endpoint,
+which is the property JWT verification exists to establish.
+
+Both paths end at the same cookie. `POST /auth/login` with the token still
+works and is the way back in when Google is unreachable, when the allowlist is
+wrong, or when there is no browser to run a consent screen.
+
+The cookie is HttpOnly and signed with a key derived from the API token, so
+rotating the token logs every browser out and there is no second secret to
+manage. `keyver` in `auth.json` is the same lever without touching the token:
+bump it and every browser session dies while every agent keeps working
+(`manage_auth.py sign-out-everyone`).
+
+### Configuring Google sign-in
+
+Create an OAuth **Web application** client at
+<https://console.cloud.google.com/apis/credentials>, with the authorized
+redirect URI set to `https://<your host>/auth/google/callback`, then on the box:
+
+```bash
+sudo -u claudemem $APP_DIR/venv/bin/python $APP_DIR/manage_auth.py \
+     setup <client-id> https://<your host>/auth/google/callback you@example.com
+```
+
+It prompts for the client secret on the terminal rather than taking it in
+`argv`, and writes `auth.json` mode 600 next to `main.py` — never inside
+`data/`, which is a git repo that keeps every version of every file in it
+forever. No restart is needed: the file is re-read when its contents change.
+
+Leave Google unconfigured and the service behaves exactly as it did before —
+the login page offers the token field and `/auth/google` answers 503.
 
 Cookie-authorized writes must also send `X-Memory-Actor`; a cross-site request
 cannot set a custom header, and the cookie is `SameSite=strict` on top of that.
@@ -89,9 +129,11 @@ described above.
 | Path | Deployed to | What |
 |---|---|---|
 | `main.py` | `$APP_DIR/main.py` | the API, plus `/auth/*` and the static mount |
-| `webauth.py` | `$APP_DIR/webauth.py` | HMAC cookie sessions + login throttle |
+| `webauth.py` | `$APP_DIR/webauth.py` | HMAC cookie sessions, Google OAuth, login throttle |
+| `manage_auth.py` | `$APP_DIR/manage_auth.py` | administers `auth.json`: Google client, allowlist, `keyver` |
 | `web/` | `$APP_DIR/web/` | `index.html`, `app.css`, `app.js`, `md.js`, `diff.js` |
 | `test-web.sh` | `$APP_DIR/test-web.sh` | server test suite, run on the box |
+| `tests/` | `$APP_DIR/tests/` | unit tests: `test_webauth.py` (offline), `test_etag_regression.py` |
 | `memapi.py` | anywhere on a client | command-line client for this API |
 | `devstub.py` | — | fake backend for local UI work, dev only |
 | `rendertest.js` | — | 28 checks over `md.js` / `diff.js`, dev only |
@@ -102,6 +144,7 @@ described above.
 ```bash
 python devstub.py     # serves web/ on :8123 with a fake API, no token needed
 node rendertest.js    # markdown + diff checks
+python tests/test_webauth.py   # sessions, keyver, PKCE state, allowlist; no network
 ```
 
 `devstub.py` fakes the whole API from in-memory fixtures, including a category
