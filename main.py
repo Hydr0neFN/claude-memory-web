@@ -16,6 +16,7 @@ import re
 import secrets
 import subprocess
 import sys
+import threading
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,6 +27,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse, Red
 from fastapi.staticfiles import StaticFiles
 
 import apikeys
+import searchrank
 import webauth
 
 load_dotenv()
@@ -79,6 +81,7 @@ SEARCH_LIMIT_MAX = 100
 SNIPPET_CHARS = 240
 NOTE_MAX = 60
 SEARCH_SCOPES = ("memory", "docs", "all")
+SEARCH_MODES = ("and", "rank")
 
 DOCS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -486,6 +489,25 @@ def section_body(lines: list, idx: int) -> str:
     section_bounds_at_index for exactly what "full text" excludes)."""
     start, end = section_bounds_at_index(lines, idx)
     return "\n".join(lines[start:end])
+
+
+def section_spans(lines: list) -> list:
+    """[(start, end, name)] for every real '## ' section, bounds identical
+    to section_bounds_at_index. Non-blank preamble above the first heading
+    becomes its own span with name "", so text there is still searchable."""
+    headers = section_headers(lines)
+    raw = []
+    first = headers[0][0] if headers else len(lines)
+    if any(line.strip() for line in lines[:first]):
+        raw.append((0, first, ""))
+    for pos, (i, name) in enumerate(headers):
+        raw.append((i, headers[pos + 1][0] if pos + 1 < len(headers) else len(lines), name))
+    spans = []
+    for start, end, name in raw:
+        while end > start + 1 and lines[end - 1].strip() == "":
+            end -= 1
+        spans.append((start, end, name))
+    return spans
 
 
 def find_section_bounds(lines: list, name: str):
@@ -976,6 +998,45 @@ def index(request: Request):
     return JSONResponse(out)
 
 
+_rank_cache = {}   # scope -> (signature of the files it was built from, searchrank.Index)
+_rank_lock = threading.Lock()   # sync routes run in a threadpool; build once, not per request
+
+
+def rank_index(scope: str) -> searchrank.Index:
+    """The ranked-search index for a scope, rebuilt only when a file in it
+    has been added, removed or changed (name, mtime, size). It is derived
+    and disposable -- the markdown on disk stays the only source of truth.
+    A file deleted between the glob and the read is skipped, not a 500."""
+    globbed = []
+    if scope in ("memory", "all"):
+        globbed += [("memory", p) for p in sorted(DATA_DIR.glob("*.md"))]
+    if scope in ("docs", "all"):
+        globbed += [("doc", p) for p in sorted(DOCS_DIR.glob("*.md"))]
+    with _rank_lock:
+        paths, sig = [], []
+        for kind, p in globbed:
+            try:
+                st = p.stat()
+            except FileNotFoundError:
+                continue
+            paths.append((kind, p))
+            sig.append((kind, p.name, st.st_mtime_ns, st.st_size))
+        sig = tuple(sig)
+        cached = _rank_cache.get(scope)
+        if cached and cached[0] == sig:
+            return cached[1]
+        units = []
+        for kind, p in paths:
+            try:
+                lines = p.read_text(encoding="utf-8").splitlines()
+            except FileNotFoundError:
+                continue
+            units += searchrank.make_units(kind, p.stem, lines, section_spans(lines))
+        index = searchrank.Index(units)
+        _rank_cache[scope] = (sig, index)
+        return index
+
+
 @app.get("/memory/search")
 def search(
     request: Request,
@@ -983,22 +1044,49 @@ def search(
     limit: int = SEARCH_LIMIT_DEFAULT,
     full: int = 0,
     scope: str = "memory",
+    mode: str = "and",
 ):
     """AND-match over space-separated terms, case-insensitive.
 
     scope=memory (default) searches only /memory, byte-identical to the
     response shape from before docs existed -- no 'kind' key, no doc hits.
     scope=docs searches only /docs; scope=all searches both, memory first.
+
+    mode=rank instead ranks whole sections by BM25 with OR semantics (see
+    searchrank.py): one hit per section, best first, each carrying 'score'
+    and 'matched' -- the query terms that section actually contains, so a
+    partial match is visible as one. mode=and (default) is unchanged.
     """
     check_auth(request)
     if scope not in SEARCH_SCOPES:
         raise HTTPException(status_code=400, detail="invalid scope")
+    if mode not in SEARCH_MODES:
+        raise HTTPException(status_code=400, detail="invalid mode")
     terms = [t.lower() for t in q.split() if t]
     if not terms:
         raise HTTPException(status_code=400, detail="q is required")
     limit = max(1, min(limit, SEARCH_LIMIT_MAX))
 
     hits = []
+
+    if mode == "rank":
+        for h in rank_index(scope).search(q, limit):
+            u = h.unit
+            hit = {
+                "category" if u.kind == "memory" else "doc": u.name,
+                "section": u.section,
+                "line": h.line + 1,
+                "score": round(h.score, 3),
+                "matched": h.matched,
+            }
+            if scope != "memory":
+                hit["kind"] = u.kind
+            if full:
+                hit["body"] = "\n".join(u.lines[u.start : u.end])
+            else:
+                hit["snippet"] = u.lines[h.line].strip()[:SNIPPET_CHARS]
+            hits.append(hit)
+        return JSONResponse(hits)
 
     def scan(paths, kind):
         for path in paths:

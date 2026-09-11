@@ -24,8 +24,12 @@ Usage:
                                           block (heading through EOF/next
                                           heading); ETag cached is always the
                                           whole-file ETag
-  memapi.py search <terms...> [--full] [--scope memory|docs|all]
-                                       -> JSON hits (AND over terms)
+  memapi.py search <terms...> [--full] [--scope memory|docs|all] [--rank]
+                                       -> JSON hits (AND over terms; if that
+                                          finds nothing, retried ranked)
+                                          --rank: sections ranked by BM25,
+                                          OR over terms, each hit with
+                                          'score' and 'matched'
   memapi.py history <cat>             -> JSON revision list
   memapi.py pins                      -> JSON: retraction/decision markers
                                           across the whole store (explicit
@@ -597,7 +601,8 @@ def main(argv):
     full = "--full" in args
     upsert = "--upsert" in args
     diff_flag = "--diff" in args
-    args = [a for a in args if a not in ("--force", "--full", "--upsert", "--diff")]
+    rank = "--rank" in args
+    args = [a for a in args if a not in ("--force", "--full", "--upsert", "--diff", "--rank")]
     args = args + literal_tail
 
     if cmd == "list":
@@ -647,7 +652,27 @@ def main(argv):
         params = {"q": " ".join(args), "full": 1 if full else 0}
         if scope:
             params["scope"] = scope
-        return read_or_die("GET", "/memory/search?" + urllib.parse.urlencode(params))
+        if rank:
+            params["mode"] = "rank"
+            return read_or_die("GET", "/memory/search?" + urllib.parse.urlencode(params))
+        # AND is exact but has a cliff: one term the text doesn't use and
+        # nothing comes back, which reads as "the store knows nothing". Retry
+        # ranked before reporting that; the note goes to stderr so stdout
+        # stays parseable JSON either way.
+        path = "/memory/search?" + urllib.parse.urlencode(params)
+        status, body, _headers = call("GET", path)
+        if status == 200 and json.loads(body) == []:
+            sys.stderr.write(
+                "note: no line matched every term; retried ranked (OR) -- "
+                "each hit's 'matched' lists the terms it actually contains\n"
+            )
+            params["mode"] = "rank"
+            return read_or_die("GET", "/memory/search?" + urllib.parse.urlencode(params))
+        if status // 100 != 2:
+            sys.stderr.write("error: GET %s -> %s %s\n" % (path, status, body))
+            return 1
+        sys.stdout.write(body)
+        return 0
     elif cmd == "history":
         return read_or_die("GET", "/memory/%s/history" % args[0])
     elif cmd == "put":

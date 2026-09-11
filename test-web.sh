@@ -35,6 +35,13 @@ code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" 
 check "GET /memory/index" 200 "$code"
 code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$BASE/memory/search?q=memory")
 check "GET /memory/search" 200 "$code"
+body=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/search?q=memory&mode=rank&limit=3")
+contains "GET /memory/search?mode=rank carries a score" '"score":' "$body"
+contains "GET /memory/search?mode=rank carries matched terms" '"matched":["memory"]' "$body"
+body=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/search?q=memory+zzqxnotaword&mode=rank&limit=1")
+contains "mode=rank: an absent term no longer empties the result" '"matched":["memory"]' "$body"
+code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$BASE/memory/search?q=memory&mode=bogus")
+check "GET /memory/search?mode=bogus" 400 "$code"
 code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer wrong" "$BASE/memory")
 check "wrong bearer rejected" 401 "$code"
 code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" -X PUT --data-binary x "$BASE/memory/UPPER")

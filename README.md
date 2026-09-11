@@ -37,6 +37,14 @@ live in `data/docs/`, which every `/memory` endpoint is blind to because its
 glob is non-recursive. `/memory/search` skips docs unless you pass
 `&scope=docs|all`, so handoff prose never swamps a fact lookup.
 
+By default search returns every line containing all the terms. `&mode=rank`
+instead ranks whole sections by BM25 with OR semantics, light stemming and CJK
+bigrams (`searchrank.py`, pure Python), so one term the text happens not to use
+no longer empties the result, and each hit lists the terms it `matched`. The
+index is derived from the markdown and rebuilt when a file changes. Dense
+embeddings were considered and deferred: a ~150 MB runtime on a shared Pi buys
+little over BM25 for a ~1 MB corpus whose reader can rephrase its own query.
+
 Both namespaces support `?section=<name>` on GET, PUT and DELETE, addressing a
 single `## ` block: read three lines out of a 20 KB file, or splice three lines
 back in without touching another byte. The locking unit stays the whole file —
