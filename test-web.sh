@@ -913,6 +913,26 @@ rm -f "$KJAR"
 restore_keys
 trap - EXIT
 
+echo "=== 13. roster gate on category creation ==="
+# A category the roster does not list cannot be created: nothing would be able
+# to route to it. Editing an already-existing unlisted category stays allowed,
+# or the gate would strand every category that predates it.
+code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN"   -H "If-None-Match: *" -H "Content-Type: text/plain"   --data-binary "# x" "$BASE/memory/unrostered-probe")
+check "create of an unrostered category is refused" 422 "$code"
+body=$(curl -s -X PUT -H "Authorization: Bearer $TOKEN"   -H "If-None-Match: *" -H "Content-Type: text/plain"   --data-binary "# x" "$BASE/memory/unrostered-probe")
+contains "refusal names the roster" "protocol-roster" "$body"
+# If the gate is ever off, the probe above creates the category -- clear it so
+# the next run does not meet a stale 412 instead of the refusal it is testing.
+curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $TOKEN" -H "If-Match: *"   "$BASE/memory/unrostered-probe"
+
+code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN"   -H "If-None-Match: *" -H "Content-Type: text/plain"   --data-binary "# x" "$BASE/docs/gate-probe-doc")
+check "/docs is not gated" 200 "$code"
+curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $TOKEN" -H "If-Match: *"   "$BASE/docs/gate-probe-doc"
+
+# $CAT itself proves the fixture exemption: every section above created it.
+code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT")
+check "exempt fixture category was creatable" 200 "$code"
+
 echo "=== cleanup ==="
 code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Bearer $TOKEN" \
   -H "If-Match: *" "$BASE/memory/$CAT")

@@ -168,6 +168,45 @@ def validate_category(category: str) -> Path:
     return DATA_DIR / f"{category}.md"
 
 
+# The roster is the map from topic to category. Without it a session cannot
+# route, and routing is the whole point: read one 5 KB category instead of the
+# ~1 MB store. "Remember to update the roster" drifted it to 48 of 110 entries,
+# so registration is a precondition of creation rather than a convention.
+# Exempt: protocol-* (the roster cannot require itself) and /docs (a separate
+# namespace the roster does not index).
+ROSTER_CATEGORY = "protocol-roster"
+
+
+# test-web.sh creates and deletes scratch categories on every run. They are
+# fixtures, not real categories, and must not have to be written into the
+# roster to satisfy the gate -- so the suite's naming conventions are exempt:
+# a leading `zz-` or `webui-`, or a trailing `-scratch`.
+# Keep this in step with the fixture names in test-web.sh.
+TEST_FIXTURE_RE = re.compile(r"^(?:zz|webui)-|-scratch$")
+
+
+def require_rostered(category: str) -> None:
+    """Refuse to create a category that the roster does not list."""
+    if category.startswith("protocol") or TEST_FIXTURE_RE.search(category):
+        return
+    roster = DATA_DIR / f"{ROSTER_CATEGORY}.md"
+    try:
+        listed = f"`{category}`" in roster.read_text(encoding="utf-8")
+    except OSError:
+        # No roster to check against -- fail open rather than block every
+        # create on a missing file.
+        return
+    if not listed:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "'%s' is not listed in %s, so nothing would be able to route to "
+                "it. Add its one-line entry under '## Current Categories' first, "
+                "then create the category." % (category, ROSTER_CATEGORY)
+            ),
+        )
+
+
 def validate_doc(slug: str) -> Path:
     if not CATEGORY_RE.match(slug):
         raise HTTPException(status_code=400, detail="invalid doc slug")
@@ -271,6 +310,10 @@ def require_precondition(path: Path, request: Request) -> None:
                 status_code=428,
                 detail="category does not exist; send 'If-None-Match: *' to create it",
             )
+        # Creating. Only /memory categories are rostered; DOCS_DIR paths and
+        # anything else that reaches here keep their previous behaviour.
+        if path.parent == DATA_DIR and path.suffix == ".md":
+            require_rostered(path.stem)
 
 
 # --------------------------------------------------------------------------
