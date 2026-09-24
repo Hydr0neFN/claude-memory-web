@@ -19,6 +19,7 @@ import secrets
 import subprocess
 import sys
 import threading
+import time
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
@@ -93,6 +94,57 @@ SEARCH_SCOPES = ("memory", "docs", "all")
 SEARCH_MODES = ("and", "rank")
 
 DOCS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def clear_stale_index_lock() -> None:
+    """Remove data/.git/index.lock left by a git killed mid-commit (OOM, power
+    loss). Until it goes, every write succeeds but commits nothing -- see
+    git_commit.
+
+    "No git running" cannot mean no git process on the box: Home Assistant's
+    supervisor keeps `git cat-file --batch-check` workers alive for days. So a
+    git process blocks removal only if it is visibly working on this store
+    (DATA_DIR in its command line, or a cwd inside DATA_DIR), and the lock must
+    also be older than 60 s -- a live commit holds it for well under a second
+    and git() times out at 30 -- which covers a root git whose cwd this user
+    cannot read. Without /proc there is no evidence either way: left alone."""
+    lock = DATA_DIR / ".git" / "index.lock"
+    try:
+        age = time.time() - lock.stat().st_mtime
+    except OSError:
+        return
+    proc = Path("/proc")
+    if not proc.is_dir():
+        print("index.lock present; no /proc to prove it stale, left in place", file=sys.stderr)
+        return
+    if age < 60:
+        print("index.lock is %.0fs old; left in place" % age, file=sys.stderr)
+        return
+    root = str(DATA_DIR.resolve())
+    for comm in proc.glob("[0-9]*/comm"):
+        pid = comm.parent
+        try:
+            if comm.read_text().strip() != "git":
+                continue
+            if root in (pid / "cmdline").read_bytes().decode("utf-8", "replace"):
+                break
+            cwd = os.readlink(pid / "cwd")
+            if cwd == root or cwd.startswith(root + "/"):
+                break
+        except OSError:
+            continue  # exited while we looked, or another user's cwd
+    else:
+        try:
+            lock.unlink()
+            print("removed stale %s (%.0fs old)" % (lock, age), file=sys.stderr)
+        except OSError as e:
+            print("could not remove stale %s: %r" % (lock, e), file=sys.stderr)
+        return
+    print("index.lock present and git pid %s is using this store; left in place"
+          % pid.name, file=sys.stderr)
+
+
+clear_stale_index_lock()
 
 # No /docs, /redoc or /openapi.json: this app is on a public hostname and the
 # schema is the one thing here that needs no auth to be interesting.
