@@ -4,11 +4,14 @@
 #
 #   target protocol.md = PROTO_HEADER_DIR/<target>.header.md   (vault name, the
 #                        "wrong vault -> stop" rule, language; per instance)
-#                      + the owner's PROTO_SOURCE_CAT at HEAD, its H1 dropped
-#                        (generic rules only: the owner's own `protocol` names
-#                        owner categories and infrastructure, so it never goes)
+#                      + the `## ` sections of the owner's own `protocol` (at
+#                        HEAD) that carry a line <!-- shared -->, marker removed
 #
-# Until the source category exists, <target>.fallback.md stands in for it.
+# One source, so the relatives' rules cannot drift from the owner's. Sharing is
+# opt-in per section: the owner's protocol also maps the owner's categories and
+# infrastructure, and a new section stays private until someone marks it.
+#
+# Until a section is marked, <target>.fallback.md stands in for the body.
 #
 # Clients cannot write the result: the target instance runs with
 # MEMORY_READONLY_CATEGORIES=protocol, so every route refuses it (403). This
@@ -26,7 +29,8 @@ LOG_TAG=memprotocol-sync
 
 : "${PROTO_SOURCE:?PROTO_SOURCE unset}"          # the owner instance, e.g. yu-i
 : "${PROTO_TARGETS:=}"                           # e.g. "dad"
-: "${PROTO_SOURCE_CAT:=protocol-shared}"
+: "${PROTO_SOURCE_CAT:=protocol}"
+: "${PROTO_MARK:=shared}"                         # <!-- shared --> opts a section in
 : "${PROTO_TARGET_CAT:=protocol}"
 : "${PROTO_HEADER_DIR:=/etc/claude-memory/protocol}"
 
@@ -35,11 +39,22 @@ LOG_TAG=memprotocol-sync
 
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 src_commit=$(git_i "$PROTO_SOURCE" rev-parse -q --verify "HEAD^{commit}") || src_commit=""
+rm -f "$tmp/source"
 if [ -n "$src_commit" ] &&
-   git_i "$PROTO_SOURCE" show "$src_commit:$PROTO_SOURCE_CAT.md" > "$tmp/source" 2>/dev/null; then
-    source_label="$PROTO_SOURCE $PROTO_SOURCE_CAT@${src_commit:0:12}"
-else
-    rm -f "$tmp/source"
+   git_i "$PROTO_SOURCE" show "$src_commit:$PROTO_SOURCE_CAT.md" > "$tmp/whole" 2>/dev/null; then
+    # Keep only marked sections; everything before the first `## ` (the title)
+    # goes, and so do the marker lines themselves.
+    tr -d '\r' < "$tmp/whole" | awk -v mark="$PROTO_MARK" '
+        function flush() { if (keep) printf "%s", buf; buf = ""; keep = 0 }
+        /^## / { flush(); insec = 1; buf = $0 "\n"; next }
+        !insec { next }
+        $0 ~ "^[ \t]*<!--[ \t]*" mark "[ \t]*-->[ \t]*$" { keep = 1; next }
+        { buf = buf $0 "\n" }
+        END { flush() }' > "$tmp/shared"
+    if grep -q . "$tmp/shared"; then
+        mv "$tmp/shared" "$tmp/source"
+        source_label="$PROTO_SOURCE $PROTO_SOURCE_CAT@${src_commit:0:12}"
+    fi
 fi
 
 rc=0
@@ -48,7 +63,7 @@ for t in $PROTO_TARGETS; do
     header="$PROTO_HEADER_DIR/$t.header.md"
     if [ -f "$tmp/source" ]; then body="$tmp/source"; label=$source_label
     elif [ -f "$PROTO_HEADER_DIR/$t.fallback.md" ]; then body="$PROTO_HEADER_DIR/$t.fallback.md"
-        label="$t.fallback.md (no $PROTO_SOURCE_CAT yet)"
+        label="$t.fallback.md (no shared section in $PROTO_SOURCE_CAT yet)"
     else log "$t: no $PROTO_SOURCE_CAT and no fallback, left as is"; continue; fi
     [ -f "$header" ] || { notify "protocol sync: $header missing, $t not updated"; rc=1; continue; }
 

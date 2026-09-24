@@ -1,5 +1,5 @@
 [Unit]
-Description=Render the relatives' read-only protocol from the owner's protocol-shared
+Description=Render the relatives' read-only protocol from the owner's shared protocol sections
 
 [Service]
 Type=oneshot

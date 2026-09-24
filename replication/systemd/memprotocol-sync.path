@@ -1,7 +1,7 @@
 # The owner vault's post-commit hook touches this file when a commit changes
-# protocol-shared.md.
+# protocol.md.
 [Unit]
-Description=Sync the relatives' protocol after the owner changes protocol-shared
+Description=Sync the relatives' protocol after the owner changes protocol
 
 [Path]
 PathChanged=/var/lib/claude-memory/repl/protocol-sync

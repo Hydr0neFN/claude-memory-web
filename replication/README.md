@@ -70,16 +70,18 @@ survive, then re-run.
 
 ## A relative's protocol (read-only, owner-managed)
 
-A relative's `protocol` is not theirs to edit. The owner keeps the generic
-rules in `protocol-shared` (never the owner's own `protocol`, which maps the
-owner's categories and infrastructure), and `memprotocol-sync` renders each
-target's `protocol` from it:
+A relative's `protocol` is not theirs to edit, and it is not a second copy
+the owner has to keep in step: `memprotocol-sync` renders it from the owner's
+own `protocol`, taking only the `## ` sections the owner marked for sharing
+with a line `<!-- shared -->`. Sharing is opt-in because the rest of that file
+maps the owner's categories and infrastructure; a new section stays private
+until it is marked.
 
 ```
- owner commit touching protocol-shared.md
+ owner commit touching protocol.md
    └─ post-commit hook touches repl/protocol-sync ─► memprotocol-sync.path
         └─ memprotocol-sync:  /etc/claude-memory/protocol/<t>.header.md
-                              + owner HEAD:protocol-shared.md (its H1 dropped)
+                              + owner HEAD:protocol.md, marked sections only
              └─ file write + git commit as the target's user ─► normal replication
 ```
 
@@ -87,11 +89,12 @@ target's `protocol` from it:
   (`systemd/relative-readonly.conf`): every PUT/DELETE on it is 403 for every
   credential, over REST and MCP alike. `protocol-roster` stays writable.
 - The header is per instance: vault name, the wrong-vault stop rule, language.
-  Until `protocol-shared` exists, `<t>.fallback.md` stands in for the body.
+  Until a section is marked, `<t>.fallback.md` stands in for the body.
 - It runs on the lease holder only, is a no-op when nothing changed, and
   repairs a hand-edited file. `memprotocol-sync.timer` is the hourly backstop.
 - Configured in `replication.conf`: `PROTO_SOURCE=yu-i PROTO_TARGETS=dad`.
-  Header and fallback live on both nodes, outside the vault.
+  Header and fallback live on both nodes, outside the vault. The hook gets
+  `@PROTO@=protocol.md` in the owner vault only.
 - Nothing ever flows back into the owner vault.
 
 ## Where things are
