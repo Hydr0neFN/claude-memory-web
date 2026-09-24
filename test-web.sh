@@ -7,10 +7,14 @@
 # which is what makes the run repeatable.
 #
 # Another instance on the same box (README "Running several instances"):
-#   MEMORY_SERVICE=claude-memory@dad MEMORY_ENV_FILE=/var/lib/claude-memory/dad/.env #   MEMORY_AUTH_FILE=/var/lib/claude-memory/dad/auth.json #   MEMORY_KEYS_FILE=/var/lib/claude-memory/dad/apikeys.json #   ./test-web.sh http://127.0.0.1:8788
+#   D=/var/lib/claude-memory/dad
+#   MEMORY_SERVICE=claude-memory@dad MEMORY_ENV_FILE=$D/.env \
+#   MEMORY_AUTH_FILE=$D/auth.json MEMORY_KEYS_FILE=$D/apikeys.json \
+#   MEMORY_DATA_DIR=$D/data ./test-web.sh http://127.0.0.1:8788
 set -u
 BASE="${1:-http://127.0.0.1:8787}"
 SERVICE="${MEMORY_SERVICE:-claude-memory}"
+DATADIR="${MEMORY_DATA_DIR:-data}"
 TOKEN="$(grep CLAUDE_MEMORY_TOKEN "${MEMORY_ENV_FILE:-.env}" | cut -d= -f2-)"
 JAR=$(mktemp); HDR=$(mktemp); BODY=$(mktemp)
 CAT="webui-test"
@@ -97,7 +101,7 @@ check "cookie write without X-Memory-Actor refused" 403 "$code"
 code=$(curl -s -o /dev/null -w "%{http_code}" -b "$JAR" -X PUT -H "If-Match: $ETAG" \
   -H "X-Memory-Actor: memory-web" --data-binary $'## Scratch\n\n- three\n' "$BASE/memory/$CAT")
 check "cookie write with X-Memory-Actor" 200 "$code"
-msg=$(git -c safe.directory='*' -C data log -1 --format=%s)
+msg=$(git -c safe.directory='*' -C "$DATADIR" log -1 --format=%s)
 contains "commit names the web actor" "via memory-web" "$msg"
 
 echo "=== 4. logout ==="
@@ -164,7 +168,7 @@ code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $
   --data-binary $'# webui test doc\n\n## Where things stand\n\n- two\n' "$BASE/docs/$DOC")
 check "doc write with current etag" 200 "$code"
 
-msg=$(git -c safe.directory='*' -C data log -1 --format=%s)
+msg=$(git -c safe.directory='*' -C "$DATADIR" log -1 --format=%s)
 contains "X-Memory-Note in git log" "PUT doc $DOC via" "$msg"
 contains "X-Memory-Note text in git log" "second write" "$msg"
 
@@ -222,9 +226,14 @@ d = json.load(sys.stdin)
 e = [c for c in d if c["category"] == "projects-trading-audit"]
 print(",".join(e[0]["docs"]) if e else "MISSING")
 ')
+# A check against the owner's real corpus; another instance has no such category.
+if [ "$audit" = MISSING ] && [ "$DATADIR" != data ]; then
+  echo "SKIP: projects-trading-audit doc order (not in this instance's store)"
+else
 check "projects-trading-audit lists its 6 doc slugs in order" \
   "trading-audit-trader-perf,trading-audit-dowtrade-perf,trading-audit-slot-analysis,trading-audit-confidence-calibration,trading-audit-d7-sweep,trading-audit-risk-budget" \
   "$audit"
+fi
 
 empty=$(echo "$idx" | python3 -c '
 import json, sys
@@ -315,7 +324,7 @@ code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $
   -H "If-Match: $etag" --data-binary @"$DSEC" "$BASE/docs/$DOC?section=Next%20step")
 check "a heading that does not match the section is a 400, not a silent rename" 400 "$code"
 
-msg=$(git -c safe.directory='*' -C data log -1 --format=%s)
+msg=$(git -c safe.directory='*' -C "$DATADIR" log -1 --format=%s)
 contains "a doc section write names the section in the commit subject" "doc $DOC#Next step" "$msg"
 
 etag=$(curl -s -D - -o /dev/null -H "Authorization: Bearer $TOKEN" "$BASE/docs/$DOC" \
@@ -428,7 +437,7 @@ after_whole=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT")
 expected_whole=$(echo "$before_whole" | sed 's/^- three$/- three EDITED/')
 check "editing Beta changes only Beta in the whole-file body" "$expected_whole" "$after_whole"
 
-msg=$(git -c safe.directory='*' -C data log -1 --format=%s)
+msg=$(git -c safe.directory='*' -C "$DATADIR" log -1 --format=%s)
 contains "commit subject carries #<section>" "$CAT#Beta" "$msg"
 
 code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN" \
@@ -455,7 +464,7 @@ contains "rejected rename did not touch Gamma's content" "- four" "$gamma_body"
 code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN" \
   -H "If-Match: $ETAG" --data-binary @"$SECBODY" "$BASE/memory/$CAT?section=Gamma&rename_to=Delta")
 check "explicit rename_to=Delta (expect 200)" 200 "$code"
-msg=$(git -c safe.directory='*' -C data log -1 --format=%s)
+msg=$(git -c safe.directory='*' -C "$DATADIR" log -1 --format=%s)
 contains "commit subject uses the new (post-rename) name" "$CAT#Delta" "$msg"
 code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT?section=Gamma")
 check "old section name is gone after rename" 404 "$code"
@@ -506,7 +515,7 @@ j = t.find('## ', i + 2)
 print(t[:i] + (t[j:] if j != -1 else ''), end='')
 ")
 check "DELETE ?section= leaves the rest of the whole file byte-identical" "$expected_whole" "$after_whole"
-msg=$(git -c safe.directory='*' -C data log -1 --format=%s)
+msg=$(git -c safe.directory='*' -C "$DATADIR" log -1 --format=%s)
 contains "DELETE commit subject carries #<section>" "$CAT#Epsilon" "$msg"
 
 curl -s -D "$HDR" -o /dev/null -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT" >/dev/null
