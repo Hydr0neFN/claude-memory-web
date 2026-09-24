@@ -27,6 +27,8 @@ Two ways in, deliberately asymmetric:
 Both end at the same HMAC-signed, HttpOnly cookie: JavaScript can never read
 it, and the signing key is derived from the API token, so there is no second
 secret to store or back up, and rotating the API token logs every browser out.
+An instance that wants the two decoupled sets MEMORY_SESSION_KEY; main.py then
+hands that to Session in place of the token.
 
 Both paths read the identity over a direct back-channel call, so no token
 signature has to be verified here: nothing between us and the provider's token

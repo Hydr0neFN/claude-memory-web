@@ -99,7 +99,10 @@ DOCS_DIR.mkdir(parents=True, exist_ok=True)
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(versiongate.VersionGate)  # refuse too-old memapi clients; see versiongate.py
 
-session = webauth.Session(TOKEN)
+# MEMORY_SESSION_KEY, when set, signs cookies instead of the API token, so the
+# token can be rotated without signing every browser out (and vice versa).
+# Unset, the key is derived from the token exactly as before.
+session = webauth.Session(os.environ.get("MEMORY_SESSION_KEY") or TOKEN)
 creds = webauth.Credentials()
 keystore = apikeys.KeyStore()
 oauth = mcpoauth.Store()

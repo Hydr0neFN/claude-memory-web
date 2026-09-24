@@ -57,6 +57,12 @@ check("empty cookie rejected", s.read("", 1), None)
 check("cookie from another token rejected",
       webauth.Session(OTHER_TOKEN).read(cookie, 1), None)
 
+# Pinned bytes: every browser signed in today holds a cookie under this exact
+# key. main.py only swaps the input (MEMORY_SESSION_KEY or the token), never
+# the derivation, so an instance without that variable must land here.
+check("keyver-1 key is sha256(token + context), unchanged",
+      s.key(1), hashlib.sha256(TOKEN.encode() + b"memory-webui-v1").digest())
+
 # The legacy format is what every browser signed in before 2026-08-30 is
 # holding; breaking it would sign the user out of the box they are reading this
 # on, for no security gain.
