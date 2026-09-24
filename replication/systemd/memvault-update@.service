@@ -1,0 +1,7 @@
+[Unit]
+Description=Fast-forward the standby working tree of memory vault %i
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/memvault-update %i
+TimeoutStartSec=60

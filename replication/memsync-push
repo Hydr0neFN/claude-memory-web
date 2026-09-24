@@ -19,7 +19,10 @@ fi
 head=$(git_i "$inst" rev-parse -q --verify "HEAD^{commit}") || { log "$inst: empty repo"; exit 0; }
 
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+# The retry timer runs this every few minutes; a remote already holding this
+# head is not contacted again (GitHub and NL both see one push per change).
 for r in $REMOTES; do
+    [ "$(cat "$STATE_DIR/pushed.$inst.$r" 2>/dev/null)" = "$head" ] && continue
     ( git_i "$inst" push --porcelain "$r" "HEAD:refs/heads/$(branch "$inst")" \
           > "$tmp/$r.out" 2>&1; echo $? > "$tmp/$r.rc" ) &
 done
@@ -27,6 +30,7 @@ wait
 
 rc=0
 for r in $REMOTES; do
+    [ -e "$tmp/$r.rc" ] || continue   # skipped: already there
     if grep -q '^!' "$tmp/$r.out"; then
         why=$(grep '^!' "$tmp/$r.out" | head -n1 | cut -f3)
         flag_set "$inst" READONLY "push to $r rejected $why at $(stamp); local ${head:0:12}"
@@ -37,6 +41,7 @@ for r in $REMOTES; do
         [ $rc = 0 ] && rc=1
     else
         log "$inst: $r at ${head:0:12}"
+        echo "$head" > "$STATE_DIR/pushed.$inst.$r"
     fi
 done
 exit $rc

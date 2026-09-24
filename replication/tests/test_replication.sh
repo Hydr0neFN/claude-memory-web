@@ -77,12 +77,6 @@ where) cat "$T/dns.$3" ;;
 point) [ -e "$T/cf_fail_$3" ] && exit 1; echo "$4" > "$T/dns.$3"; echo "dns $3 -> $4" >> "$T/trace" ;;
 esac
 EOF
-cat > "$T/bin/fstate" <<'EOF'
-#!/bin/bash
-# fstate <src> <dst> <inst> -- copy an instance's state files
-{ [ -e "$T/net_down_$1" ] || [ -e "$T/net_down_$2" ] || [ -e "$T/ts_down" ]; } && exit 1
-cp "$T/$1/state/$3.json" "$T/$2/state/$3.json"
-EOF
 cat > "$T/bin/fnotify" <<'EOF'
 #!/bin/bash
 echo "$1" >> "$T/notify.log"
@@ -105,16 +99,17 @@ for n in tw nl; do
         echo "REMOTES=\"$remotes\" UPDATE_REMOTE=vault PUBLIC_HOSTS=\"memory.test dad-memory.test\""
         echo "SYSTEMCTL=\"$T/bin/fsystemctl $n\" NOTIFY=$T/bin/fnotify"
         echo "PEER_CTL=\"$T/bin/fctl $n $p\" PROBE_PUBLIC=\"$T/bin/fpublic $n\" PROBE_APP=\"$T/bin/fapp $n\""
-        echo "CF=\"$T/bin/fcf $n\" STATE_PUSH=\"$T/bin/fstate $n $p\" STATE_PULL=\"$T/bin/fstate $p $n\""
+        echo "CF=\"$T/bin/fcf $n\" STATE_PUSH=\"$HERE/memstate-xfer push\" STATE_PULL=\"$HERE/memstate-xfer pull\""
         echo "FAKE_NOW_FILE=$T/now"
         for i in $INSTS; do
             v=${i//-/_}
-            echo "DATA_$v=$T/$n/data/$i FLAGDIR_$v=$T/$n/flags/$i UNIT_$v=claude-memory@$i BRANCH_$v=main"
+            echo "DATA_$v=$T/$n/data/$i FLAGDIR_$v=$T/$n/flags/$i STATEDIR_$v=$T/$n/state/$i UNIT_$v=claude-memory@$i BRANCH_$v=main"
         done
     } > "$T/$n/conf"
     for i in $INSTS; do
-        mkdir -p "$T/$n/flags/$i"
-        echo "{\"grants\":[\"$n-initial\"]}" > "$T/$n/state/$i.json"
+        mkdir -p "$T/$n/flags/$i" "$T/$n/state/$i"
+        echo "{\"grants\":[\"$n-initial\"]}" > "$T/$n/state/$i/mcpoauth.json"
+        echo "CLAUDE_MEMORY_TOKEN=$n-$i" > "$T/$n/state/$i/.env"
     done
 done
 # TW holds the history; NL's trees are clones of its bare repos.
@@ -182,6 +177,8 @@ rm -f "$T/tw/flags/dad/READONLY"; rm -rf "$T/rogue"
 on tw memsync-push dad; check "push ok after repair" 0 $?
 
 echo "=== 4. heartbeat: silence is flagged and notified once, never acted on ==="
+on nl memheartbeat-check
+check "unarmed before the first heartbeat: no alert" no "$(has "$T/nl/repl/PEER_SILENT")"
 for n in 1 2 3; do minute; done
 check "healthy: no PEER_SILENT" no "$(has "$T/nl/repl/PEER_SILENT")"
 touch "$T/net_down_tw"
@@ -219,14 +216,14 @@ rm -f "$T/tw/app_crashed"
 echo "=== 7. handback: NL wrote, minted a grant; TW takes it all back ==="
 write nl yu-i "nl-w1"; check "NL write accepted" 0 $?
 on nl memsync-push yu-i; check "NL pushes to its vault + GitHub" 0 $?
-echo '{"grants":["nl-minted-during-failover"]}' > "$T/nl/state/yu-i.json"
+echo '{"grants":["nl-minted-during-failover"]}' > "$T/nl/state/yu-i/mcpoauth.json"
 nl_head=$(head_of nl yu-i)
 : > "$T/trace"
 on tw mem-handback-tw; check "handback exit 0" 0 $?
 check "TW primary" primary "$(role_of tw)"
 check "NL standby" standby "$(role_of nl)"
 check "TW has NL's write" "$nl_head" "$(head_of tw yu-i)"
-check "grant minted on NL copied back" '{"grants":["nl-minted-during-failover"]}' "$(cat "$T/tw/state/yu-i.json")"
+check "grant minted on NL copied back" '{"grants":["nl-minted-during-failover"]}' "$(cat "$T/tw/state/yu-i/mcpoauth.json")"
 check "both hostnames at TW" tw,tw "$(dns)"
 check "no two writers" 0 "$(violations)"
 check "NL units stopped" no "$(running nl yu-i)"
@@ -234,9 +231,22 @@ check "NL ALERT cleared" no "$(has "$T/nl/flags/yu-i/ALERT")"
 check "DNS moved before TW started" yes "$(before "-> tw" "tw start")"
 grep -q "enable memvault-update@yu-i.path" "$T/trace"; check "NL updater re-enabled" 0 $?
 on tw mem-handback-tw; check "re-run is a no-op" 0 $?
-echo '{"grants":["stale"]}' > "$T/nl/state/dad.json"; before_dad=$(cat "$T/tw/state/dad.json")
-on nl memstate-sync; check "standby does not push its state" "$before_dad" "$(cat "$T/tw/state/dad.json")"
-on tw memstate-sync; check "primary pushes its state" "$before_dad" "$(cat "$T/nl/state/dad.json")"
+echo '{"grants":["stale"]}' > "$T/nl/state/dad/mcpoauth.json"; before_dad=$(cat "$T/tw/state/dad/mcpoauth.json")
+on nl memstate-sync; check "standby does not push its state" "$before_dad" "$(cat "$T/tw/state/dad/mcpoauth.json")"
+on tw memstate-sync; check "primary pushes its state" "$before_dad" "$(cat "$T/nl/state/dad/mcpoauth.json")"
+
+echo "=== 7b. state transfer hardening ==="
+check "state sync carries .env too" "$(cat "$T/tw/state/dad/.env")" "$(cat "$T/nl/state/dad/.env")"
+echo junk > "$T/tw/state/dad/node.env"; on tw memstate-sync
+check "node.env is never copied" no "$(has "$T/nl/state/dad/node.env")"
+py=python3; command -v python3 >/dev/null || py=python
+$py -c 'import sys,tarfile; t=tarfile.open(sys.argv[1],"w"); i=tarfile.TarInfo("auth.json"); i.type=tarfile.SYMTYPE; i.linkname="/etc/passwd"; t.addfile(i); t.close()' "$(cygpath -w "$T/evil.tar" 2>/dev/null || echo "$T/evil.tar")"
+SSH_ORIGINAL_COMMAND="state-recv dad" REPL_CONF=$T/nl/conf bash "$HERE/memctl" < "$T/evil.tar" 2>/dev/null
+check "symlink in a state tar refused" 1 $?
+check "no auth.json planted" no "$(has "$T/nl/state/dad/auth.json")"
+SSH_ORIGINAL_COMMAND="state-recv ../../etc" REPL_CONF=$T/nl/conf bash "$HERE/memctl" < /dev/null 2>/dev/null
+check "unknown instance refused" 64 $?
+on nl memstate-xfer push dad; check "a standby cannot push state into the primary" 1 $?
 
 echo "=== 8. TW only unreachable over Tailscale, still serving: promotion refused ==="
 touch "$T/ts_down"

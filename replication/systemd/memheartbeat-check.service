@@ -1,0 +1,6 @@
+[Unit]
+Description=Check the primary's memory heartbeat (alert only, never acts)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/memheartbeat-check

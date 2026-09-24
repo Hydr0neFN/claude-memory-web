@@ -1,0 +1,11 @@
+# The vault's post-commit hook touches this file; the push runs out of band,
+# so a write never waits on the network.
+[Unit]
+Description=Push memory vault %i after each commit
+
+[Path]
+PathChanged=/var/lib/claude-memory/repl/push.%i
+Unit=memsync-push@%i.service
+
+[Install]
+WantedBy=paths.target

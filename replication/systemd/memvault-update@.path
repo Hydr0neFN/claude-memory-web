@@ -1,0 +1,10 @@
+# The bare repo's post-receive touches this file.
+[Unit]
+Description=Update standby tree of memory vault %i on push
+
+[Path]
+PathChanged=/srv/memvault/%i.git/pushed
+Unit=memvault-update@%i.service
+
+[Install]
+WantedBy=paths.target

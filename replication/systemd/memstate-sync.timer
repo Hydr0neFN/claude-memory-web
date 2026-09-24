@@ -1,0 +1,11 @@
+# Belt and braces for the .path units (memstate-sync-<inst>.path, generated
+# per node because the watched paths differ per instance).
+[Unit]
+Description=Copy memory state files to the standby (periodic)
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=15min
+
+[Install]
+WantedBy=timers.target

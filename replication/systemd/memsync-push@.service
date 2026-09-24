@@ -1,0 +1,10 @@
+[Unit]
+Description=Push memory vault %i to its replicas
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/memsync-push %i
+TimeoutStartSec=120
+Nice=5

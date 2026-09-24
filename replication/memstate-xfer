@@ -1,0 +1,13 @@
+#!/bin/bash
+# memstate-xfer push|pull <inst> -- move an instance's state files over the
+# peer's control key: push = ours -> peer (memctl state-recv), pull = peer's
+# -> ours (memctl state-send). Used as STATE_PUSH / STATE_PULL.
+. "$(dirname "$(readlink -f "$0")")/lib.sh"
+LOG_TAG=state-xfer
+dir=${1:?push|pull}; inst=${2:?inst}
+valid_inst "$inst" || { log "unknown instance $inst"; exit 64; }
+case $dir in
+    push) state_tar "$inst" | $PEER_CTL state-recv "$inst" ;;
+    pull) $PEER_CTL state-send "$inst" | state_install "$inst" ;;
+    *) exit 64 ;;
+esac

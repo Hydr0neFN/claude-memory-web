@@ -3,6 +3,12 @@
 # writer lease. A non-zero exit makes systemd SKIP the start without failing
 # the unit, so Restart=on-failure cannot revive a node whose lease is gone.
 # It only reads; it never starts, stops or syncs anything.
+# memgate <inst>: an instance with its own lease (a drill sandbox) has
+# /etc/claude-memory/replication-<inst>.conf; everything else shares the
+# node's main one.
+if [ -n "${1:-}" ] && [ -z "${REPL_CONF:-}" ] && [ -e "/etc/claude-memory/replication-$1.conf" ]; then
+    REPL_CONF=/etc/claude-memory/replication-$1.conf
+fi
 . "$(dirname "$(readlink -f "$0")")/lib.sh"
 r=$(role)
 if [ "$r" = primary ]; then exit 0; fi

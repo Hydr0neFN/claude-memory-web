@@ -1,0 +1,27 @@
+#!/bin/bash
+# memcf where <host>        -> the node (tw|nl) whose tunnel <host>'s CNAME points at
+# memcf point <host> <node> -> re-point <host>'s proxied CNAME at <node>'s tunnel
+# Used as CF. Token: CF_TOKEN_FILE (Zone.DNS:Edit on one zone, mode 600).
+# The tunnel ingress for every lease hostname is pre-provisioned on BOTH
+# tunnels; a hostname binds to whichever tunnel its CNAME names, so moving the
+# CNAME is the whole switch.
+. "$(dirname "$(readlink -f "$0")")/lib.sh"
+: "${CF_TOKEN_FILE:=/etc/claude-memory/cf-dns.token}" "${CF_ZONE:?}" "${TUNNEL_tw:?}" "${TUNNEL_nl:?}"
+tok=$(cat "$CF_TOKEN_FILE" 2>/dev/null) || { log "no CF token"; exit 1; }
+api() { curl -sS -m 20 -H "Authorization: Bearer $tok" -H "Content-Type: application/json" "$@"; }
+record() {  # "<id> <content>" for the CNAME of $1
+    api "https://api.cloudflare.com/client/v4/zones/$CF_ZONE/dns_records?type=CNAME&name=$1" \
+        | python3 -c 'import json,sys; r=json.load(sys.stdin); x=r["result"]; assert r["success"] and len(x)==1; print(x[0]["id"], x[0]["content"])'
+}
+node_of() { case $1 in "$TUNNEL_tw.cfargotunnel.com") echo tw ;; "$TUNNEL_nl.cfargotunnel.com") echo nl ;; *) echo "?" ;; esac; }
+case ${1:-} in
+where) r=$(record "$2") || exit 1; node_of "${r#* }" ;;
+point)
+    host=$2 to=$3; tun=$(iv TUNNEL "$to"); [ -n "$tun" ] || exit 64
+    r=$(record "$host") || exit 1
+    api -X PATCH "https://api.cloudflare.com/client/v4/zones/$CF_ZONE/dns_records/${r%% *}" \
+        -d "{\"content\":\"$tun.cfargotunnel.com\",\"proxied\":true}" \
+        | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("success") else 1)' \
+        && log "DNS $host -> $to" ;;
+*) exit 64 ;;
+esac

@@ -1,0 +1,8 @@
+[Unit]
+Description=Copy memory instances' state files to the standby
+After=network-online.target tailscaled.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/memstate-sync
+TimeoutStartSec=120

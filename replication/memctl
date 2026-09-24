@@ -14,6 +14,8 @@
 #   prepare-handback  READONLY, drain, final push; prints heads
 #   abort-handback    clear the handback READONLY, stay primary
 #   release           stop, become standby, clear flags, updater back on
+#   state-send <inst> tar of the instance's state files on stdout
+#   state-recv <inst> install such a tar from stdin (refused while primary)
 . "$(dirname "$(readlink -f "$0")")/lib.sh"
 LOG_TAG=memctl
 HERE=$(dirname "$(readlink -f "$0")")
@@ -109,6 +111,15 @@ release)
     updaters enable
     notify "released: $PEER is primary again, this node is standby"
     echo "role=standby"
+    ;;
+state-send|state-recv)
+    inst=${cmd#* }; [ "$inst" != "$cmd" ] && valid_inst "$inst" || { echo "memctl: bad instance" >&2; exit 64; }
+    if [ "$verb" = state-send ]; then state_tar "$inst"
+    else
+        # Only a standby/fenced node accepts state: never overwrite the writer's.
+        [ "$(role)" = primary ] && { echo "memctl: refusing state from $PEER, this node is primary" >&2; exit 1; }
+        state_install "$inst"
+    fi
     ;;
 *)
     echo "memctl: refused verb '${cmd:0:60}'" >&2

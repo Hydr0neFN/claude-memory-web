@@ -6,7 +6,9 @@
 . "$(dirname "$(readlink -f "$0")")/lib.sh"
 LOG_TAG=hb-check
 [ "$(role)" = standby ] || exit 0
-hb=$(cat "$STATE_DIR/peer_heartbeat" 2>/dev/null) || hb="0"
+# Unarmed until the first heartbeat ever arrives: a freshly installed standby
+# must not page the owner about a peer that has simply not started sending.
+hb=$(cat "$STATE_DIR/peer_heartbeat" 2>/dev/null) || { log "no heartbeat from $PEER received yet; not armed"; exit 0; }
 last=${hb%% *}; age=$(( $(now) - ${last:-0} ))
 silent=$STATE_DIR/PEER_SILENT degraded=$STATE_DIR/PEER_DEGRADED
 

@@ -1,0 +1,11 @@
+# Retry: a remote that was down gets the head once it is back.
+[Unit]
+Description=Retry pushing memory vault %i
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5min
+Unit=memsync-push@%i.service
+
+[Install]
+WantedBy=timers.target

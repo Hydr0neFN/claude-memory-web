@@ -29,8 +29,19 @@ else
     log "heartbeat to $PEER failed"
 fi
 
+# The Worker's KV has a daily write budget, so it hears about CHANGES only:
+# "fail" once after JOB_ALERT_AFTER consecutive bad minutes, "ok" once on
+# recovery. (A dead TW is the dead-man switch's job, not this one.)
 if [ -n "${JOB_ALERT:-}" ] && [ "$r" = primary ]; then
-    if [ "$pub" = "$NODE" ] && [ $apps_ok = 1 ]; then $JOB_ALERT memory-api ok "serving" >/dev/null 2>&1 || true
-    else $JOB_ALERT memory-api soft-fail "memory on $NODE: $report" >/dev/null 2>&1 || true; fi
+    bad=$STATE_DIR/jobalert.bad sent=$STATE_DIR/jobalert.sent
+    if [ "$pub" = "$NODE" ] && [ $apps_ok = 1 ]; then
+        rm -f "$bad"
+        if [ -e "$sent" ]; then $JOB_ALERT memory-api ok >/dev/null 2>&1 && rm -f "$sent"; fi
+    else
+        n=$(( $(cat "$bad" 2>/dev/null || echo 0) + 1 )); echo $n > "$bad"
+        if [ $n -ge "${JOB_ALERT_AFTER:-3}" ] && [ ! -e "$sent" ]; then
+            $JOB_ALERT memory-api fail "memory API on $NODE not serving for ${n} min: $report" >/dev/null 2>&1 && : > "$sent"
+        fi
+    fi
 fi
 exit 0

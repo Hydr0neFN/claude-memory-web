@@ -1,0 +1,8 @@
+[Unit]
+Description=Memory replication heartbeat to the peer
+After=network-online.target tailscaled.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/memheartbeat
+TimeoutStartSec=50

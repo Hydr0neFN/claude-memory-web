@@ -1,0 +1,9 @@
+#!/bin/bash
+# notify-ntfy "message" -- NOTIFY for a node without Home Assistant access:
+# post to the owner's ntfy topic (/etc/claude-memory/ntfy.topic, mode 600;
+# the topic name is the credential). Always logs locally too.
+msg=${1:-}; [ -n "$msg" ] || exit 0
+echo "$(date -u +%FT%TZ) $msg" >> /var/log/memrepl-notify.log
+topic=$(cat /etc/claude-memory/ntfy.topic 2>/dev/null) || exit 0
+curl -fsS -m 15 -H "Title: memory replication ($(hostname))" -H "Tags: warning" \
+    -d "$msg" "https://ntfy.sh/$topic" >/dev/null

@@ -48,11 +48,15 @@ notify() { log "NOTIFY: $*"; $NOTIFY "memory replication ($NODE): $*" >/dev/null
 # Per-instance settings are NAME_<inst> with '-' -> '_' (DATA_yu_i, UNIT_dad ...).
 iv() { local v="${1}_${2//-/_}"; printf '%s' "${!v:-${3:-}}"; }
 branch() { iv BRANCH "$1" main; }
-git_i() { local inst=$1; shift; git -c safe.directory='*' -C "$(iv DATA "$inst")" "$@"; }
-as_inst() {  # run a command as the instance's service user (writes to its tree)
+# Every git call runs as the instance's service user: a fetch as root would
+# leave root-owned object directories in the app's .git, and the app's next
+# commit (as that user) could no longer write there. Its ssh identity comes
+# from the repo's core.sshCommand, so no key is shared between instances.
+as_inst() {
     local u; u=$(iv USER "$1"); shift
     if [ -n "$u" ] && [ "$(id -un)" != "$u" ]; then runuser -u "$u" -- "$@"; else "$@"; fi
 }
+git_i() { local inst=$1; shift; as_inst "$inst" git -c safe.directory='*' -C "$(iv DATA "$inst")" "$@"; }
 
 role() { local r; r=$(cat "$ROLE_FILE" 2>/dev/null) || r=""; case "$r" in
     primary|standby|fenced) echo "$r" ;; *) echo fenced ;; esac; }   # unknown = fenced
@@ -111,10 +115,7 @@ fence_self() {
 }
 
 # Fast-forward an instance's working tree to REF, as the instance's user.
-ff_to() {
-    local inst=$1 ref=$2
-    as_inst "$inst" git -c safe.directory="*" -C "$(iv DATA "$inst")" merge --ff-only -q "$ref"
-}
+ff_to() { git_i "$1" merge --ff-only -q "$2"; }
 
 # Notify once per KEY until notify_reset KEY -- watchdogs tick every 30 s.
 notify_once() {
@@ -140,4 +141,29 @@ dns_point_all() {
             return 1
         fi
     done
+}
+
+# Per-instance credential/state files that follow the lease (never to GitHub).
+# Node-local settings (port, node name, public URL) live in node.env, which is
+# never copied, so a copied .env cannot re-point the peer's instance.
+: "${STATE_FILES:=.env auth.json apikeys.json mcpoauth.json}"
+valid_inst() { local i; for i in $INSTANCES; do [ "$i" = "$1" ] && return 0; done; return 1; }
+state_tar() {  # write a tar of this instance's state files to stdout
+    local d f files=""; d=$(iv STATEDIR "$1")
+    for f in $STATE_FILES; do [ -f "$d/$f" ] && files="$files $f"; done
+    [ -n "$files" ] || { log "$1: no state files in $d"; return 1; }
+    # shellcheck disable=SC2086
+    tar -C "$d" -cf - $files
+}
+state_install() {  # read a tar from stdin; install only the known names, as the instance user
+    local inst=$1 d tmp f u n=0; d=$(iv STATEDIR "$inst"); u=$(iv USER "$inst")
+    tmp=$(mktemp -d); trap 'rm -rf "$tmp"' RETURN
+    tar -C "$tmp" -xf - --no-same-owner --no-same-permissions 2>/dev/null || { log "$inst: bad state tar"; return 1; }
+    for f in $STATE_FILES; do
+        [ -e "$tmp/$f" ] || continue
+        if [ -L "$tmp/$f" ] || [ ! -f "$tmp/$f" ]; then log "$inst: $f is not a regular file, refused"; return 1; fi
+        install -m 600 ${u:+-o "$u" -g "$u"} "$tmp/$f" "$d/$f.new" && mv -f "$d/$f.new" "$d/$f" && n=$((n+1))
+    done
+    log "$inst: installed $n state file(s)"
+    [ $n -gt 0 ]
 }

@@ -1,0 +1,14 @@
+#!/bin/bash
+# memprobe public <host>  -> print X-Memory-Node of whoever serves https://<host>
+# memprobe app <inst>     -> exit 0 if this node's instance answers /auth/me
+# Used as PROBE_PUBLIC / PROBE_APP.
+. "$(dirname "$(readlink -f "$0")")/lib.sh"
+case ${1:-} in
+public)
+    curl -sS -m 10 -o /dev/null -D - "https://$2/auth/me" 2>/dev/null \
+        | tr -d '\r' | sed -n 's/^[Xx]-[Mm]emory-[Nn]ode: *\([a-z0-9-]*\)$/\1/p' | head -n1 ;;
+app)
+    port=$(iv PORT "$2"); [ -n "$port" ] || exit 2
+    curl -sf -m 5 -o /dev/null "http://127.0.0.1:$port/auth/me" ;;
+*) exit 64 ;;
+esac
