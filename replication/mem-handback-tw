@@ -82,6 +82,23 @@ for n in $(seq 0 "${VERIFY_SECS:-60}"); do
 done
 [ $ok = 1 ] || notify "handback: public hostnames not (all) served by $NODE yet: $(public_node)"
 
+# Cloudflare's edge keeps sending some requests to the old tunnel for a
+# minute or more after a CNAME change (measured 46-80 s on 2026-09-25). NL is
+# still up read-only, so those requests get reads and a clear 503 on writes
+# instead of a 502. Release it only once the public hostnames have answered
+# from this node continuously for SETTLE_SECS (give up after SETTLE_MAX).
+if [ "$pr" = primary ] && [ "${SETTLE_SECS:-120}" -gt 0 ]; then
+    s0=$(date +%s); good_since=""
+    while :; do
+        t=$(date +%s)
+        if [ "$(public_node)" = "$NODE" ]; then good_since=${good_since:-$t}; else good_since=""; fi
+        [ -n "$good_since" ] && [ $((t - good_since)) -ge "${SETTLE_SECS:-120}" ] && break
+        [ $((t - s0)) -ge "${SETTLE_MAX:-600}" ] && { notify "handback: edge still splitting traffic after ${SETTLE_MAX:-600}s; releasing $PEER anyway"; break; }
+        sleep 3
+    done
+    log "edge settled on $NODE after $(( $(date +%s) - s0 ))s"
+fi
+
 if [ "$pr" = primary ]; then
     $PEER_CTL release >/dev/null || notify "handback done but release of $PEER failed: it is still up read-only; re-run mem-handback-tw"
 fi

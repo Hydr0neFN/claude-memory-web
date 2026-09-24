@@ -58,7 +58,9 @@ The steps run in this order:
 3. NL's state files (grants, keys) are copied to TW.
 4. DNS for both hostnames moves back to TW.
 5. TW starts and is verified.
-6. NL is released to standby.
+6. NL is released to standby, but only after the public hostnames have answered from TW for 2 minutes straight. Cloudflare's edge keeps routing some requests to the old tunnel for 45–80 s after a CNAME change; until the release, NL answers those read-only.
+
+A promotion has the same edge window in the other direction. Requests that still reach a stopped TW get a 502 for up to about a minute.
 
 The script is resumable: re-run it after a crash at any step.
 

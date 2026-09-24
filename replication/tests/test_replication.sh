@@ -95,7 +95,7 @@ for n in tw nl; do
     {
         echo "NODE=$n PEER=$p HOME_NODE=tw INSTANCES=\"$INSTS\""
         echo "ROLE_FILE=$T/$n/ROLE STATE_DIR=$T/$n/repl"
-        echo "HEARTBEAT_STALE_SECS=300 DRAIN_SECS=0 VERIFY_SECS=0"
+        echo "HEARTBEAT_STALE_SECS=300 DRAIN_SECS=0 VERIFY_SECS=0 SETTLE_SECS=0"
         echo "REMOTES=\"$remotes\" UPDATE_REMOTE=vault PUBLIC_HOSTS=\"memory.test dad-memory.test\""
         echo "SYSTEMCTL=\"$T/bin/fsystemctl $n\" NOTIFY=$T/bin/fnotify"
         echo "PEER_CTL=\"$T/bin/fctl $n $p\" PROBE_PUBLIC=\"$T/bin/fpublic $n\" PROBE_APP=\"$T/bin/fapp $n\""

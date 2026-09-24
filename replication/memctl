@@ -16,10 +16,18 @@
 #   release           stop, become standby, clear flags, updater back on
 #   state-send <inst> tar of the instance's state files on stdout
 #   state-recv <inst> install such a tar from stdin (refused while primary)
+cmd=${SSH_ORIGINAL_COMMAND:-$*}
+# "@<name> <verb>" addresses a separately leased instance (a drill sandbox)
+# with its own /etc/claude-memory/replication-<name>.conf; nothing else can
+# be selected, so the key still reaches only configured leases.
+if [[ $cmd =~ ^@([a-z0-9-]{1,32})\ (.*)$ ]]; then
+    REPL_CONF=/etc/claude-memory/replication-${BASH_REMATCH[1]}.conf
+    cmd=${BASH_REMATCH[2]}
+    [ -e "$REPL_CONF" ] || { echo "memctl: no such lease" >&2; exit 64; }
+fi
 . "$(dirname "$(readlink -f "$0")")/lib.sh"
 LOG_TAG=memctl
 HERE=$(dirname "$(readlink -f "$0")")
-cmd=${SSH_ORIGINAL_COMMAND:-$*}
 verb=${cmd%% *}
 
 heads() {
