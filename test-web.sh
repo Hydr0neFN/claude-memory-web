@@ -767,7 +767,10 @@ cat > "$AUTHFILE" <<'JSON'
 }
 JSON
 chmod 600 "$AUTHFILE"
-id claudemem >/dev/null 2>&1 && chown claudemem:claudemem "$AUTHFILE"
+# The file is 600, so it must belong to whoever the unit runs as.
+SVC_USER=$(systemctl show -p User --value "$SERVICE" 2>/dev/null)
+SVC_USER=${SVC_USER:-claudemem}
+id "$SVC_USER" >/dev/null 2>&1 && chown "$SVC_USER:$SVC_USER" "$AUTHFILE"
 
 me=$(curl -s "$BASE/auth/me")
 contains "config change is seen without a restart" '"providers":["github"]' "$me"
