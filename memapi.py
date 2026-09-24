@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""CLI for the memory API (see README).
+"""CLI for the custom memory API at memory.hydr0negnetwork.de.
 
 Usage:
   memapi.py list                      -> JSON array of category names
@@ -65,7 +65,50 @@ Usage:
                                           move and prints a "no change" note
                                           to stderr so a no-op write doesn't
                                           read as "I wrote something"
-  memapi.py delete <cat> [--note "..."] [--force] [--section "<name>"]
+  memapi.py delete <cat> [--note "..."] [--force] [--section "<name>"] [--diff]
+                                       -> --diff is a dry run: says what would
+                                          be deleted and deletes nothing
+  memapi.py rename <old> <new> [--dry-run] [--subtree] [--rewrite-mentions]
+                               [--note "..."]
+                                       -> rename a category. The server has no
+                                          rename, so this is client-side
+                                          orchestration: NOT atomic, and git
+                                          history stays under the old name
+                                          (the new commit's note records the
+                                          origin). Order: roster line -> create
+                                          <new> -> rewrite every [[old]] link in
+                                          all categories AND docs, plus `old` in
+                                          the roster and in '## Sub-categories'
+                                          sections -> delete <old> last. Each
+                                          write is ETag-locked; a 409/422 stops
+                                          the run and lists what was done, and
+                                          re-running resumes while <new> is
+                                          still an identical copy.
+                                          Refuses: bad name, <new> exists,
+                                          protocol-*, or a hierarchy change --
+                                          the sidebar parent is the longest
+                                          existing name prefix, so renaming
+                                          `infra-pc` would orphan
+                                          `infra-pc-tuning`, and a <new> that
+                                          prefixes an existing name would
+                                          capture it. --subtree renames every
+                                          `<old>-*` along with it.
+                                          --dry-run (or --diff) prints the move,
+                                          every edit, and every backticked
+                                          mention it will NOT touch (prose,
+                                          fenced blocks), and writes nothing.
+                                          --rewrite-mentions also rewrites
+                                          backticked `old` in prose.
+
+  memapi.py update [--check]           -> replace this file with the client in the
+                                          store's `memapi-client` doc (sha256 +
+                                          compile checked, old file kept as
+                                          .bak, never downgrades). --check only
+                                          reports (exit 10 = update available)
+                                          Versioning: the server refuses (426) a
+                                          client older than its min-client and
+                                          prints how to update; the update fetch
+                                          itself is always allowed.
 
   memapi.py doc list                  -> JSON array of doc slugs
   memapi.py doc sections <slug>       -> that doc's '## ' section names, one
@@ -79,7 +122,7 @@ Usage:
                                           the file has no '## ' heading --
                                           such a doc gets sections: [] in
                                           `doc index` with no outline
-  memapi.py doc delete <slug> [--force]
+  memapi.py doc delete <slug> [--force] [--section "<name>"] [--diff]
   memapi.py doc history <slug>
 
   memapi.py --help / -h               -> this text, on any command or
@@ -130,11 +173,14 @@ if hasattr(sys.stdin, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace", newline="\n")
 
-# Where the service lives. Set MEMORY_API_BASE to your own host; the default
-# is the loopback bind the systemd unit uses, which is what you want when
-# running this on the box itself.
-BASE = os.environ.get("MEMORY_API_BASE", "http://127.0.0.1:8787").rstrip("/")
-UA = "claude-code-memapi/2.0"
+BASE = "https://memory.hydr0negnetwork.de"
+# Bump on every client change worth forcing. The server refuses any
+# claude-code-memapi/<version> older than its min-client file (HTTP 426), and
+# that refusal is the only thing that reaches a client too old to check for
+# itself -- so this string is what the server keys on. Keep the number in step
+# with the `memapi-client` doc entry.
+CLIENT_VERSION = "2.1.1"
+UA = "claude-code-memapi/" + CLIENT_VERSION
 TOKEN_FILE = os.path.join(os.path.expanduser("~"), ".claude", ".memory-token")
 # ETag of the revision each category was last read at, so a write can prove it
 # was based on current content rather than silently clobbering a newer one.
@@ -187,9 +233,45 @@ def call(method, path, data=None, extra_headers=None):
     req = urllib.request.Request(BASE + path, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
-            return r.status, r.read().decode("utf-8", "replace"), dict(r.headers)
+            out = r.status, r.read().decode("utf-8", "replace"), dict(r.headers)
     except urllib.error.HTTPError as e:
-        return e.code, e.read().decode("utf-8", "replace"), dict(e.headers)
+        out = e.code, e.read().decode("utf-8", "replace"), dict(e.headers)
+    check_server_min(out[0], out[2])
+    return out
+
+
+def _ver(text):
+    """'2.1' -> (2, 1); None when it is not a dotted integer version."""
+    try:
+        return tuple(int(x) for x in str(text).strip().split("."))
+    except ValueError:
+        return None
+
+
+_min_warned = []
+
+
+def check_server_min(status, headers):
+    """The server states the oldest client it accepts in X-Memapi-Min-Client.
+    426 means this client is below it: say how to update and stop, instead of
+    letting every caller print a raw error. On any other status a stale client
+    is only warned once (that is the update fetch itself, which the server
+    exempts so an old client can still get the new one)."""
+    need_s = next((v for k, v in headers.items() if k.lower() == "x-memapi-min-client"), None)
+    need, mine = _ver(need_s), _ver(CLIENT_VERSION)
+    behind = bool(need and mine and mine < need)
+    if status == 426 or (behind and not _min_warned):
+        _min_warned.append(1)
+        sys.stderr.write(
+            "%s: this memapi client (%s) is older than the server accepts (>= %s).\n"
+            "  update:  python3 %s update\n"
+            "  (fetches doc 'memapi-client' from the store, verifies its sha256,\n"
+            "   keeps the old file as .bak)\n"
+            % ("error" if status == 426 else "warning", CLIENT_VERSION,
+               need_s or "newer", os.path.abspath(__file__))
+        )
+        if status == 426:
+            raise SystemExit(5)
 
 
 def category_size(cat):
@@ -483,6 +565,82 @@ def do_diff(cat, new_body, section, upsert, rename_to=None, is_doc=False):
     return 0
 
 
+def do_delete_preview(cat, section, is_doc=False):
+    """`delete --diff`: dry run, never deletes. Before this existed --diff was
+    parsed and then ignored on delete, so `delete <cat> --diff` really deleted."""
+    path = api_path(cat, is_doc)
+    if section:
+        path += "?section=" + urllib.parse.quote(section)
+    status, body, _headers = call("GET", path)
+    if status != 200:
+        sys.stderr.write("error: GET %s -> %s %s\n" % (path, status, body))
+        return 1
+    what = "section '%s' of %s" % (section, cat) if section else cat
+    sys.stdout.write(
+        "would delete %s%s (%d bytes, %d lines); nothing deleted\n"
+        % ("doc " if is_doc else "", what, len(body.encode("utf-8")), len(body.splitlines()))
+    )
+    return 0
+
+
+def do_update(check_only):
+    """Replace this file with the client published in the `memapi-client` doc.
+    Verifies the doc's sha256 and that the code compiles before touching
+    anything, refuses a downgrade, and keeps the old file as <file>.bak."""
+    import hashlib
+
+    # Running `update` is the answer to the "please update" warning, so do not
+    # print that warning again from inside it.
+    _min_warned.append(1)
+    status, body, _headers = call("GET", "/docs/memapi-client")
+    if status != 200:
+        sys.stderr.write("error: GET /docs/memapi-client -> %s %s\n" % (status, body))
+        return 1
+    want = re.search(r"sha256: `([0-9a-f]{64})`", body)
+    parts = body.split("````python\n", 1)
+    if not want or len(parts) != 2 or "\n````" not in parts[1]:
+        sys.stderr.write("error: the doc has no recognisable client block; not updating\n")
+        return 1
+    code = parts[1].rsplit("\n````", 1)[0] + "\n"
+    if hashlib.sha256(code.encode("utf-8")).hexdigest() != want.group(1):
+        sys.stderr.write("error: checksum mismatch in the doc; not updating\n")
+        return 1
+    try:
+        compile(code, "memapi.py (new)", "exec")
+    except SyntaxError as e:
+        sys.stderr.write("error: the published client does not compile (%s); not updating\n" % e)
+        return 1
+    found = re.search(r'^CLIENT_VERSION = "([^"]+)"', code, re.MULTILINE)
+    # A doc with no CLIENT_VERSION predates versioning, so it is older than
+    # every numbered client -- treat "unknown" as oldest, never as "skip check".
+    new_v = found.group(1) if found else "pre-2.1"
+    if (_ver(new_v) or (0,)) < (_ver(CLIENT_VERSION) or (0,)):
+        sys.stderr.write(
+            "error: the doc holds %s but this client is %s; publish the newer one "
+            "first (refusing to downgrade)\n" % (new_v, CLIENT_VERSION))
+        return 1
+    # realpath, not abspath: replacing a symlinked memapi.py must update the
+    # file it points to, not swap the link for a regular file.
+    path = os.path.realpath(__file__)
+    with io.open(path, encoding="utf-8", newline="") as f:
+        current = f.read()
+    if current == code:
+        print("up to date (%s)" % CLIENT_VERSION)
+        return 0
+    if check_only:
+        print("update available: %s -> %s  (run: python3 %s update)" % (CLIENT_VERSION, new_v, path))
+        return 10
+    mode = os.stat(path).st_mode & 0o777
+    with io.open(path + ".bak", "w", encoding="utf-8", newline="") as f:
+        f.write(current)
+    with io.open(path + ".new", "w", encoding="utf-8", newline="") as f:
+        f.write(code)
+    os.chmod(path + ".new", mode)
+    os.replace(path + ".new", path)
+    print("updated %s -> %s; previous kept as %s.bak" % (CLIENT_VERSION, new_v, path))
+    return 0
+
+
 def print_stale_report(index_data, days):
     """Client-side only, over the /memory/index payload already returned by
     the server -- no server change, and a write is never treated as a
@@ -523,6 +681,396 @@ def print_stale_report(index_data, days):
             "(%d section%s marked verified: never, skipped as stable)"
             % (stable_count, "" if stable_count == 1 else "s")
         )
+
+
+# --- rename ----------------------------------------------------------------
+# The server has no category rename, so this is client-side orchestration over
+# plain PUT/DELETE: not atomic, and the git history stays under the old name.
+# plan_rename() is pure (no I/O) so it can be tested offline; do_rename() does
+# the fetching and the writes.
+
+NAME_RE = re.compile(r"^[a-z0-9-]+$")
+# Mirrors main.py's TEST_FIXTURE_RE: fixtures are exempt from the roster gate.
+FIXTURE_RE = re.compile(r"^(zz-|webui-)|-scratch$")
+LINK_RE = re.compile(r"\[\[([a-z0-9-]+)\]\]")
+TICK_RE = re.compile(r"`([a-z0-9-]+)`")
+ROSTER = "protocol-roster"
+ROSTER_SECTION = "Current Categories"
+
+
+class RenameError(Exception):
+    pass
+
+
+def parent_of(name, names):
+    """Longest existing category that is a '-'-bounded prefix of name -- the
+    same inference the web UI's sidebar tree uses."""
+    best = None
+    for n in names:
+        if n != name and name.startswith(n + "-") and (best is None or len(n) > len(best)):
+            best = n
+    return best
+
+
+def hierarchy_changes(names, mapping):
+    """(cat, parent_before, parent_after) for every category NOT being renamed
+    whose inferred parent would change: orphaned (its parent goes away) or
+    captured (a new name becomes its longest prefix)."""
+    after = (set(names) - set(mapping)) | set(mapping.values())
+    out = []
+    for c in sorted(names):
+        if c in mapping:
+            continue
+        b, a = parent_of(c, names), parent_of(c, after)
+        if b != a:
+            out.append((c, b, a))
+    return out
+
+
+def section_spans(lines):
+    hs = section_headers(lines)
+    return [
+        (name, i, hs[k + 1][0] if k + 1 < len(hs) else len(lines))
+        for k, (i, name) in enumerate(hs)
+    ]
+
+
+def _first_hit(line, mapping, ticks_only=False):
+    """Start offset of the first `name` (or [[name]]) that is a renamed name."""
+    pats = (TICK_RE,) if ticks_only else (LINK_RE, TICK_RE)
+    hits = [m.start() for pat in pats for m in pat.finditer(line) if m.group(1) in mapping]
+    return min(hits) if hits else None
+
+
+def _around(line, at, width=90):
+    lo = max(0, at - width // 3)
+    seg = line[lo:lo + width].strip()
+    return ("..." if lo else "") + seg + ("..." if lo + width < len(line) else "")
+
+
+def rewrite_text(cat, text, mapping, rewrite_mentions):
+    """Rewrite references to renamed categories in one body. Returns
+    (new_text, report). [[old]] links are rewritten everywhere outside fenced
+    blocks. A backticked `old` is rewritten only where it is a structural
+    reference -- the roster's Current Categories, or any '## Sub-categories'
+    section -- or everywhere with rewrite_mentions. Every other line holding
+    one is reported in report['mentions'] (one entry per line, snippet at the
+    first hit), never dropped silently."""
+    lines = text.split("\n")
+    mask = fence_mask(lines)
+    scoped = set()
+    for name, i, end in section_spans(lines):
+        if name == "Sub-categories" or (cat == ROSTER and name == ROSTER_SECTION):
+            scoped.update(range(i, end))
+    links, ticks, mentions = [], [], []
+    for i, line in enumerate(lines):
+        if not any(k in line for k in mapping):
+            continue
+        if mask[i]:
+            hit = _first_hit(line, mapping)
+            if hit is not None:
+                mentions.append((i + 1, _around(line, hit), "fenced"))
+            continue
+        new_line, n = LINK_RE.subn(
+            lambda m: "[[%s]]" % mapping.get(m.group(1), m.group(1)), line
+        )
+        if n and new_line != line:
+            links.append(i + 1)
+        if rewrite_mentions or i in scoped:
+            new_line2 = TICK_RE.sub(
+                lambda m: "`%s`" % mapping.get(m.group(1), m.group(1)), new_line
+            )
+            if new_line2 != new_line:
+                ticks.append(i + 1)
+            new_line = new_line2
+        else:
+            hit = _first_hit(line, mapping, ticks_only=True)
+            if hit is not None:
+                mentions.append((i + 1, _around(line, hit), "prose"))
+        lines[i] = new_line
+    return "\n".join(lines), {"links": links, "ticks": ticks, "mentions": mentions}
+
+
+def in_group(name, head):
+    return name == head or name.startswith(head + "-")
+
+
+def ensure_rostered(text, new_names_from):
+    """Make sure each new name has a leading-token line in the roster's
+    Current Categories. new_names_from: [(new, old)]. Returns (text, added,
+    ungrouped) -- ungrouped: added names that matched no '### group' and went
+    to the end of the section."""
+    added, ungrouped = [], []
+    for new, old in new_names_from:
+        if FIXTURE_RE.search(new):
+            continue  # the server's roster gate exempts fixtures
+        lines = text.split("\n")
+        span = next(
+            ((i, e) for n, i, e in section_spans(lines) if n == ROSTER_SECTION), None
+        )
+        if span is None:
+            raise RenameError("%s has no '## %s' section" % (ROSTER, ROSTER_SECTION))
+        start, end = span
+        if any(lines[k].startswith("- `%s`" % new) for k in range(start, end)):
+            continue
+        # No entry to carry over (old was never listed): add one under the
+        # longest matching '### group', else after the section's last bullet.
+        groups = [(lines[k][4:].strip(), k) for k in range(start, end) if lines[k].startswith("### ")]
+        match = [g for g in groups if in_group(new, g[0])]
+        if match:
+            gk = max(match, key=lambda g: len(g[0]))[1]
+            gend = min([k for _, k in groups if k > gk] + [end])
+        else:
+            gk, gend = start, end
+            ungrouped.append(new)
+        bullets = [k for k in range(gk, gend) if lines[k].startswith("- `")]
+        at = (bullets[-1] if bullets else gk) + 1
+        lines.insert(at, "- `%s` — renamed from `%s`; add a one-line description" % (new, old))
+        text = "\n".join(lines)
+        added.append(new)
+    return text, added, ungrouped
+
+
+def plan_rename(mem, docs, old, new, subtree=False, rewrite_mentions=False):
+    """mem/docs: {name: text}. Pure. Returns a plan dict, or raises
+    RenameError carrying every problem found (not just the first)."""
+    problems = []
+    if not NAME_RE.match(new):
+        problems.append("new name %r must match ^[a-z0-9-]+$" % new)
+    if old not in mem:
+        problems.append("no such category: %s" % old)
+    if old == new:
+        problems.append("old and new are the same name")
+    for n in (old, new):
+        if n.startswith("protocol-"):
+            problems.append("%s: protocol-* categories are referenced by name from "
+                            "hooks and CLAUDE.md; rename them by hand" % n)
+    if problems:
+        raise RenameError("\n".join(problems))
+
+    mapping = {old: new}
+    if subtree:
+        for c in sorted(mem):
+            if c.startswith(old + "-"):
+                mapping[c] = new + c[len(old):]
+    for o, n in mapping.items():
+        if n in mapping:
+            problems.append("%s -> %s: target is itself being renamed" % (o, n))
+
+    bodies, resume, body_mentions = {}, [], []
+    for o, n in mapping.items():
+        bodies[n], rep = rewrite_text(o, mem[o], mapping, rewrite_mentions)
+        # a moved body's own prose (e.g. its "Sub-category of `old`" line) is
+        # reported like any other reference, under its new name
+        body_mentions += [("memory", n) + m for m in rep["mentions"]]
+        if n in mem:
+            if mem[n] == bodies[n]:
+                resume.append(n)
+            else:
+                problems.append("%s -> %s: target already exists" % (o, n))
+
+    groups = {}
+    for c, b, a in hierarchy_changes(set(mem), mapping):
+        groups.setdefault((b, a), []).append(c)
+    for (b, a), cs in sorted(groups.items(), key=lambda kv: str(kv[0])):
+        shown = ", ".join(cs[:6]) + (", +%d more" % (len(cs) - 6) if len(cs) > 6 else "")
+        problems.append(
+            "hierarchy: %d categor%s would move from under %s to under %s (%s) -- %s"
+            % (len(cs), "y" if len(cs) == 1 else "ies", b or "(top level)",
+               a or "(top level)", shown,
+               "pass --subtree to rename them along with it" if b in mapping
+               else "the new name would capture them"))
+    if problems:
+        raise RenameError("\n".join(problems))
+
+    after = (set(mem) - set(mapping)) | set(mapping.values())
+    warnings, reparent = [], []
+    for o, n in mapping.items():
+        pb, pa = parent_of(o, set(mem)), parent_of(n, after)
+        if mapping.get(pb, pb) != pa:
+            reparent.append((n, pb, pa))
+            warnings.append(
+                "%s moves from under %s to under %s: the breadcrumb in %s is rewritten "
+                "in place but now sits in the wrong parent, and %s has no entry for it"
+                % (n, pb or "(top level)", pa or "(top level)", pb or "(none)", pa or "(top level)")
+            )
+
+    edits, mentions = [], list(body_mentions)
+    for kind, store in (("memory", mem), ("docs", docs)):
+        for name, text in sorted(store.items()):
+            if kind == "memory" and name in mapping:
+                continue
+            new_text, rep = rewrite_text(name if kind == "memory" else None,
+                                         text, mapping, rewrite_mentions)
+            if kind == "memory" and name == ROSTER:
+                new_text, added, ungrouped = ensure_rostered(
+                    new_text, [(n, o) for o, n in mapping.items()])
+                rep["added"] = added
+                for n in ungrouped:
+                    warnings.append("%s matches no roster '### group'; its placeholder line "
+                                    "went to the end of the section -- move it" % n)
+                heads = [l[4:].strip() for l in new_text.split("\n") if l.startswith("### ")]
+                for o, n in mapping.items():
+                    if n in added:
+                        warnings.append("%s was not in the roster; added a placeholder line "
+                                        "for %s -- give it a real description" % (o, n))
+                    elif heads and not FIXTURE_RE.search(n) and not any(in_group(n, h) for h in heads):
+                        warnings.append("%s matches no roster '### group'; its line stays in "
+                                        "the old group" % n)
+            for m in rep["mentions"]:
+                mentions.append((kind, name) + m)
+            if new_text != text:
+                edits.append({"kind": kind, "name": name, "text": new_text, "report": rep})
+    if ROSTER not in mem and not all(FIXTURE_RE.search(n) for n in mapping.values()):
+        raise RenameError("%s not found: the server refuses to create an unlisted "
+                          "category, so this rename cannot land" % ROSTER)
+    # roster first: creating a category the roster does not list is a 422
+    edits.sort(key=lambda e: (e["name"] != ROSTER, e["kind"], e["name"]))
+    return {
+        "mapping": mapping, "bodies": bodies, "resume": resume, "edits": edits,
+        "mentions": mentions, "warnings": warnings, "reparent": reparent,
+    }
+
+
+def fetch_store():
+    """({name: (text, etag)}, {slug: (text, etag)}) -- every read carries the
+    ETag its later write is conditioned on."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def names(path):
+        status, body, _h = call("GET", path)
+        if status != 200:
+            raise RenameError("GET %s -> %s %s" % (path, status, body))
+        return json.loads(body)
+
+    def one(job):
+        kind, name = job
+        status, body, headers = call("GET", "/%s/%s" % (kind, name))
+        if status != 200:
+            raise RenameError("GET /%s/%s -> %s %s" % (kind, name, status, body))
+        etag = next((v for k, v in headers.items() if k.lower() == "etag"), None)
+        if not etag:
+            raise RenameError("GET /%s/%s returned no ETag; cannot lock the write" % (kind, name))
+        return kind, name, body, etag
+
+    jobs = [("memory", n) for n in names("/memory")] + [("docs", n) for n in names("/docs")]
+    mem, docs = {}, {}
+    with ThreadPoolExecutor(8) as ex:
+        for kind, name, body, etag in ex.map(one, jobs):
+            (mem if kind == "memory" else docs)[name] = (body, etag)
+    return mem, docs
+
+
+def _lines_label(nums, limit=6):
+    s = ",".join("L%d" % n for n in nums[:limit])
+    return s + (",+%d" % (len(nums) - limit) if len(nums) > limit else "")
+
+
+def print_plan(plan, old, new, mem):
+    out = sys.stdout.write
+    mapping = plan["mapping"]
+    out("rename %s -> %s\n" % (old, new))
+    for o, n in mapping.items():
+        out("  MOVE      %s -> %s  (%d bytes%s)\n" % (
+            o, n, len(mem[o][0].encode("utf-8")),
+            ", identical copy already exists: resuming" if n in plan["resume"] else ""))
+    out("            git history stays under the old name; the new commit's note says "
+        "where it came from\n")
+    for e in plan["edits"]:
+        r = e["report"]
+        bits = []
+        if r["links"]:
+            bits.append("%d [[link]] line(s) %s" % (len(r["links"]), _lines_label(r["links"])))
+        if r["ticks"]:
+            bits.append("%d `name` line(s) %s" % (len(r["ticks"]), _lines_label(r["ticks"])))
+        if r.get("added"):
+            bits.append("roster line ADDED for %s" % ", ".join(r["added"]))
+        tag = "ROSTER   " if e["name"] == ROSTER and e["kind"] == "memory" else \
+              ("DOC      " if e["kind"] == "docs" else "EDIT     ")
+        out("  %s %s: %s\n" % (tag, e["name"], "; ".join(bits) or "text changed"))
+    if not plan["edits"]:
+        out("  (no other category or doc references it)\n")
+    if plan["mentions"]:
+        out("  NOT REWRITTEN -- backticked names in prose or fenced blocks "
+            "(pass --rewrite-mentions for prose):\n")
+        for kind, name, ln, snip, why in plan["mentions"]:
+            out("            %s%s L%d [%s] %s\n" % ("doc " if kind == "docs" else "", name, ln, why, snip))
+    for w in plan["warnings"]:
+        out("  WARN      %s\n" % w)
+    out("  DELETE    %s   (last, after every reference has been rewritten)\n" % ", ".join(mapping))
+
+
+def do_rename(old, new, dry_run, subtree, rewrite_mentions, note):
+    try:
+        mem_e, docs_e = fetch_store()
+        plan = plan_rename(
+            {k: v[0] for k, v in mem_e.items()}, {k: v[0] for k, v in docs_e.items()},
+            old, new, subtree, rewrite_mentions,
+        )
+    except RenameError as e:
+        sys.stderr.write("refused:\n%s\n" % "\n".join("  " + l for l in str(e).split("\n")))
+        return 1
+    print_plan(plan, old, new, mem_e)
+    if dry_run:
+        sys.stdout.write("dry run: nothing written\n")
+        return 0
+
+    done = []
+
+    def stamp(o, n):
+        base = "rename %s->%s" % (o, n)
+        return (base + ": " + note if note else base)[:60]
+
+    def put(kind, name, text, etag, o, n):
+        headers = {"If-Match": etag} if etag else {"If-None-Match": "*"}
+        headers["X-Memory-Note"] = urllib.parse.quote(stamp(o, n))
+        status, body, _h = call("PUT", api_path(name, kind == "docs"), text.encode("utf-8"), headers)
+        if status // 100 != 2:
+            raise RenameError("PUT %s -> %s %s" % (name, status, body.strip()[:200]))
+        try:
+            os.remove(cache_path(cache_key(name, kind == "docs")))
+        except OSError:
+            pass
+        done.append("wrote %s%s" % ("doc " if kind == "docs" else "", name))
+
+    def etag_of(e):
+        return (mem_e if e["kind"] == "memory" else docs_e)[e["name"]][1]
+
+    is_roster = lambda e: e["kind"] == "memory" and e["name"] == ROSTER
+    try:
+        # roster first (the server 422s a create it does not list), then the
+        # new bodies, then every other reference, and only then the deletes
+        for e in filter(is_roster, plan["edits"]):
+            put(e["kind"], e["name"], e["text"], etag_of(e), old, new)
+        for o, n in plan["mapping"].items():
+            if n not in plan["resume"]:
+                put("memory", n, plan["bodies"][n], None, o, n)
+        for e in plan["edits"]:
+            if not is_roster(e):
+                put(e["kind"], e["name"], e["text"], etag_of(e), old, new)
+        for o, n in plan["mapping"].items():
+            headers = {"If-Match": mem_e[o][1], "X-Memory-Note": urllib.parse.quote(stamp(o, n))}
+            status, body, _h = call("DELETE", api_path(o), None, headers)
+            if status // 100 != 2:
+                raise RenameError(
+                    "DELETE %s -> %s %s. If it was edited after it was copied, %s holds "
+                    "the OLD text and every reference already points at it: diff `get %s` "
+                    "against `get %s`, merge the newer edits into %s, and only then delete "
+                    "%s. Do not delete it blindly."
+                    % (o, status, body.strip()[:200], n, o, n, n, o))
+            try:
+                os.remove(cache_path(cache_key(o)))
+            except OSError:
+                pass
+            done.append("deleted %s" % o)
+    except RenameError as e:
+        sys.stderr.write("STOPPED: %s\n  completed: %s\n" % (e, "; ".join(done) or "nothing"))
+        sys.stderr.write("  every step is idempotent: re-run the same command to finish. It "
+                         "refuses (rather than guesses) if <new> was edited since it was "
+                         "copied or the flags differ from the first run\n")
+        return 1
+    sys.stdout.write("done: %s\n" % "; ".join(done))
+    return 0
 
 
 def take_flag_value(args, name):
@@ -602,8 +1150,27 @@ def main(argv):
     upsert = "--upsert" in args
     diff_flag = "--diff" in args
     rank = "--rank" in args
-    args = [a for a in args if a not in ("--force", "--full", "--upsert", "--diff", "--rank")]
+    dry_run = "--dry-run" in args
+    subtree = "--subtree" in args
+    rewrite_mentions = "--rewrite-mentions" in args
+    check_flag = "--check" in args
+    args = [a for a in args if a not in (
+        "--force", "--full", "--upsert", "--diff", "--rank",
+        "--dry-run", "--subtree", "--rewrite-mentions", "--check")]
     args = args + literal_tail
+
+    # These are dropped from args like every boolean above, so on any other
+    # command they would be silently ignored -- and `put ... --dry-run` would
+    # then really write. Refuse instead of guessing.
+    if cmd != "update" and check_flag:
+        sys.stderr.write("error: --check belongs to `update` only\n")
+        return 2
+    if cmd != "rename" and (dry_run or subtree or rewrite_mentions):
+        sys.stderr.write(
+            "error: --dry-run/--subtree/--rewrite-mentions belong to `rename` only "
+            "(`put` and `delete` have --diff for a dry run)\n"
+        )
+        return 2
 
     if cmd == "list":
         return read_or_die("GET", "/memory")
@@ -676,8 +1243,8 @@ def main(argv):
     elif cmd == "history":
         return read_or_die("GET", "/memory/%s/history" % args[0])
     elif cmd == "put":
-        # newline="" keeps the file byte-exact; normalise CRLF here so a file authored
-        # on Windows cannot put CRLF into the store, which the service hashes on disk.
+        # newline="" keeps the file exactly as written; normalise CRLF here so a
+        # Windows-authored file cannot put CRLF into the store (2026-08-28).
         body = io.open(args[1], encoding="utf-8", newline="").read().replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
         if diff_flag:
             return do_diff(args[0], body, section, upsert, rename_to)
@@ -694,6 +1261,8 @@ def main(argv):
             return write("PUT", args[0], body, force, note=note, path=target, label=label)
         return write("PUT", args[0], body, force, note=note)
     elif cmd == "delete":
+        if diff_flag:
+            return do_delete_preview(args[0], section)
         if section:
             target = "/memory/%s?section=%s" % (
                 urllib.parse.quote(args[0]),
@@ -701,6 +1270,15 @@ def main(argv):
             )
             return write("DELETE", args[0], None, force, note=note, path=target)
         return write("DELETE", args[0], None, force, note=note)
+    elif cmd == "update":
+        return do_update(check_flag)
+    elif cmd == "rename":
+        if len(args) != 2:
+            sys.stderr.write("usage: memapi.py rename <old> <new> [--subtree] "
+                             "[--dry-run] [--rewrite-mentions] [--note \"...\"]\n")
+            return 2
+        return do_rename(args[0], args[1], dry_run or diff_flag, subtree,
+                         rewrite_mentions, note)
     else:
         print("unknown command: " + cmd)
         return 2
@@ -783,6 +1361,8 @@ def doc_main(cmd, args):
             )
         return write("PUT", args[0], raw, force, is_doc=True, note=note)
     elif cmd == "delete":
+        if diff_flag:
+            return do_delete_preview(args[0], section, is_doc=True)
         if section:
             target = "/docs/%s?section=%s" % (
                 urllib.parse.quote(args[0]),
