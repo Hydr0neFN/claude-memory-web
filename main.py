@@ -32,6 +32,7 @@ from fastapi.staticfiles import StaticFiles
 import apikeys
 import mcpoauth
 import mcpserver
+import replflag
 import searchrank
 import versiongate
 import webauth
@@ -150,6 +151,10 @@ clear_stale_index_lock()
 # schema is the one thing here that needs no auth to be interesting.
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(versiongate.VersionGate)  # refuse too-old memapi clients; see versiongate.py
+# READONLY / ALERT flag files set by the replication scripts; see replflag.py.
+app.add_middleware(replflag.ReplicationFlags,
+                   flag_dir=os.environ.get("MEMORY_FLAG_DIR") or str(DATA_DIR.parent),
+                   node=os.environ.get("MEMORY_NODE", ""))
 
 # MEMORY_SESSION_KEY, when set, signs cookies instead of the API token, so the
 # token can be rotated without signing every browser out (and vice versa).

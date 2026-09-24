@@ -313,14 +313,21 @@ class Server:
             raise ToolError("invalid name %r: lowercase letters, digits and '-' only" % name)
         return "%s/%s" % (self._base(args), name)
 
+    def _head(self, hdrs: dict) -> str:
+        """The orientation lines list/index start with: whose vault, and any
+        replication alert (standby promoted, read-only fence) the app is
+        raising -- see replflag.py."""
+        alert = (hdrs or {}).get("x-memory-alert")
+        return "vault: %s\n" % self.vault + ("ALERT: %s\n" % alert if alert else "")
+
     async def call(self, name: str, args: dict, actor: str) -> str:
         if name == "memory_list":
-            _, _, out = await self.rest("GET", self._base(args), actor=actor)
-            return "vault: %s\n%s" % (self.vault, out.decode("utf-8"))
+            _, hdrs, out = await self.rest("GET", self._base(args), actor=actor)
+            return self._head(hdrs) + out.decode("utf-8")
 
         if name == "memory_index":
-            _, _, out = await self.rest("GET", self._base(args) + "/index", actor=actor)
-            return "vault: %s\n%s" % (self.vault, out.decode("utf-8"))
+            _, hdrs, out = await self.rest("GET", self._base(args) + "/index", actor=actor)
+            return self._head(hdrs) + out.decode("utf-8")
 
         if name == "memory_search":
             query = {"q": args.get("query", ""), "scope": args.get("scope") or "memory",
