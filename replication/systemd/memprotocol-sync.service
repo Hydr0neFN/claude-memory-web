@@ -1,0 +1,8 @@
+[Unit]
+Description=Render the relatives' read-only protocol from the owner's protocol-shared
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/memprotocol-sync
+TimeoutStartSec=60
+Nice=5

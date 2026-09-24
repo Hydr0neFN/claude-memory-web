@@ -324,6 +324,51 @@ hostile='heartbeat role=primary x=$(id) y=`id` * public=tw;rm'
 SSH_ORIGINAL_COMMAND=$hostile REPL_CONF=$T/nl/conf bash "$HERE/memctl" >/dev/null 2>&1
 check "heartbeat keeps only clean key=value tokens" "role=primary" "$(cut -d' ' -f2- "$T/nl/repl/peer_heartbeat")"
 
+echo "=== 14. protocol sync: owner protocol-shared -> dad protocol, one way ==="
+P=$T/proto; mkdir -p "$P"; echo primary > "$P/ROLE"
+{ cat "$T/tw/conf"; echo "ROLE_FILE=$P/ROLE PROTO_SOURCE=yu-i PROTO_TARGETS=dad PROTO_HEADER_DIR=$P"; } > "$P/conf"
+ps() { REPL_CONF=$P/conf bash "$HERE/memprotocol-sync" 2>>"$P/log"; }
+O=$T/tw/data/yu-i; D=$T/tw/data/dad
+dadproto() { git -C "$D" show HEAD:protocol.md 2>/dev/null; }
+subject() { git -C "$D" log -1 --format=%s; }
+printf '# Claude Memory — Protocol\n\n## Vault\nThis is **dad**.\n\n' > "$P/dad.header.md"
+d0=$(head_of tw dad)
+ps; check "no source, no fallback: exit 0" 0 $?
+check "  ... and nothing committed" "$d0" "$(head_of tw dad)"
+printf '## Writing\nold rules\n' > "$P/dad.fallback.md"
+ps; check "fallback render: exit 0" 0 $?
+check "  dad protocol = header + fallback" "$(printf '# Claude Memory — Protocol\n\n## Vault\nThis is **dad**.\n\n## Writing\nold rules')" "$(dadproto)"
+check "  commit names the fallback" "SYNC protocol from dad.fallback.md (no protocol-shared yet)" "$(subject)"
+d1=$(head_of tw dad)
+ps; check "re-run is a no-op" "$d1" "$(head_of tw dad)"
+printf '# Shared rules\r\n\r\n## Writing\r\nask first — 先問\r\n' > "$O/protocol-shared.md"
+git -C "$O" add protocol-shared.md; git -C "$O" commit -q -m "PUT protocol-shared"
+o1=$(head_of tw yu-i)
+echo "## Uncommitted" >> "$O/protocol-shared.md"   # a working-tree change is not a commit
+echo "dad's own note" > "$D/people.md"             # an unrelated dirty file in dad's tree
+ps; check "source render: exit 0" 0 $?
+check "  body replaces fallback, H1 dropped, CRLF gone, UTF-8 kept" \
+    "$(printf '# Claude Memory — Protocol\n\n## Vault\nThis is **dad**.\n\n## Writing\nask first — 先問')" "$(dadproto)"
+check "  commit names the source commit" "SYNC protocol from yu-i protocol-shared@${o1:0:12}" "$(subject)"
+check "  only protocol.md committed" "protocol.md" "$(git -C "$D" show --name-only --format= HEAD)"
+check "  dad's unrelated change left alone" "?? people.md" "$(git -C "$D" status --porcelain)"
+check "  working file matches the commit" "" "$(git -C "$D" diff HEAD -- protocol.md)"
+check "  owner vault untouched" "$o1" "$(head_of tw yu-i)"
+git -C "$O" checkout -q -- protocol-shared.md; rm -f "$D/people.md"
+printf '# changed by hand\n' > "$D/protocol.md"      # drift on disk is repaired
+ps; check "hand-edited file restored" "" "$(git -C "$D" status --porcelain)"
+d2=$(head_of tw dad)
+echo standby > "$P/ROLE"
+printf '# Shared rules\n\n## Writing\nv2\n' > "$O/protocol-shared.md"; git -C "$O" commit -qam "PUT v2"
+ps; check "standby: exit 0" 0 $?
+check "  standby never writes" "$d2" "$(head_of tw dad)"
+echo primary > "$P/ROLE"; mv "$P/dad.header.md" "$P/h.bak"
+ps; check "missing header: exit 1" 1 $?
+check "  ... nothing committed" "$d2" "$(head_of tw dad)"
+grep -q "dad.header.md missing" "$T/notify.log"; check "  ... and notified" 0 $?
+mv "$P/h.bak" "$P/dad.header.md"
+ps; check "v2 lands once the header is back" "v2" "$(dadproto | tail -1)"
+
 echo "----"
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" = 0 ]

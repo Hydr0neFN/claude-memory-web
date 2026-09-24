@@ -1,0 +1,11 @@
+#!/bin/sh
+# Vault post-commit hook, installed as <data>/.git/hooks/post-commit on both
+# nodes with INST set to the vault's instance. Never blocks or fails a commit.
+INST=@INST@
+# Replication: poke memsync-push@<inst>.path.
+touch "/var/lib/claude-memory/repl/push.$INST" 2>/dev/null
+# The owner's shared rules changed: poke memprotocol-sync.path.
+if git diff-tree --root --no-commit-id --name-only -r HEAD 2>/dev/null | grep -qx protocol-shared.md; then
+    touch /var/lib/claude-memory/repl/protocol-sync 2>/dev/null
+fi
+exit 0

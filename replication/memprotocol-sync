@@ -1,0 +1,95 @@
+#!/bin/bash
+# memprotocol-sync -- render each relative's `protocol` from the owner's rules
+# and commit it into that relative's vault. One direction only: owner -> them.
+#
+#   target protocol.md = PROTO_HEADER_DIR/<target>.header.md   (vault name, the
+#                        "wrong vault -> stop" rule, language; per instance)
+#                      + the owner's PROTO_SOURCE_CAT at HEAD, its H1 dropped
+#                        (generic rules only: the owner's own `protocol` names
+#                        owner categories and infrastructure, so it never goes)
+#
+# Until the source category exists, <target>.fallback.md stands in for it.
+#
+# Clients cannot write the result: the target instance runs with
+# MEMORY_READONLY_CATEGORIES=protocol, so every route refuses it (403). This
+# script is the one writer, and it writes the way the app does -- file, then a
+# git commit as the instance user -- so the vault's own post-commit hook
+# replicates it like any other commit, and ETags and the search index (both
+# derived from the bytes on disk) pick it up with nothing to invalidate.
+#
+# Idempotent: renders, compares with the committed file, commits only on a
+# change. Runs from memprotocol-sync.path (the owner vault's post-commit hook
+# touches it when a commit changes the source) and hourly as a backstop, on
+# the lease holder only.
+. "$(dirname "$(readlink -f "$0")")/lib.sh"
+LOG_TAG=memprotocol-sync
+
+: "${PROTO_SOURCE:?PROTO_SOURCE unset}"          # the owner instance, e.g. yu-i
+: "${PROTO_TARGETS:=}"                           # e.g. "dad"
+: "${PROTO_SOURCE_CAT:=protocol-shared}"
+: "${PROTO_TARGET_CAT:=protocol}"
+: "${PROTO_HEADER_DIR:=/etc/claude-memory/protocol}"
+
+[ "$(role)" = primary ] || { log "role=$(role): not the writer, nothing to do"; exit 0; }
+[ -n "$PROTO_TARGETS" ] || exit 0
+
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+src_commit=$(git_i "$PROTO_SOURCE" rev-parse -q --verify "HEAD^{commit}") || src_commit=""
+if [ -n "$src_commit" ] &&
+   git_i "$PROTO_SOURCE" show "$src_commit:$PROTO_SOURCE_CAT.md" > "$tmp/source" 2>/dev/null; then
+    source_label="$PROTO_SOURCE $PROTO_SOURCE_CAT@${src_commit:0:12}"
+else
+    rm -f "$tmp/source"
+fi
+
+rc=0
+for t in $PROTO_TARGETS; do
+    valid_inst "$t" && [ "$t" != "$PROTO_SOURCE" ] || { log "$t: not a target instance"; rc=1; continue; }
+    header="$PROTO_HEADER_DIR/$t.header.md"
+    if [ -f "$tmp/source" ]; then body="$tmp/source"; label=$source_label
+    elif [ -f "$PROTO_HEADER_DIR/$t.fallback.md" ]; then body="$PROTO_HEADER_DIR/$t.fallback.md"
+        label="$t.fallback.md (no $PROTO_SOURCE_CAT yet)"
+    else log "$t: no $PROTO_SOURCE_CAT and no fallback, left as is"; continue; fi
+    [ -f "$header" ] || { notify "protocol sync: $header missing, $t not updated"; rc=1; continue; }
+
+    # LF only (the app's own rule: the ETag is the blob sha of the disk bytes),
+    # one blank line between header and body, the body's title dropped, and
+    # exactly one trailing newline.
+    {
+        tr -d '\r' < "$header" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}'
+        echo
+        tr -d '\r' < "$body" | sed '1{/^# /d}' | sed '/./,$!d' | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}'
+    } > "$tmp/$t.md"
+    iconv -f UTF-8 -t UTF-8 "$tmp/$t.md" > /dev/null 2>&1 ||
+        { notify "protocol sync: rendered $t protocol is not valid UTF-8, not written"; rc=1; continue; }
+
+    data=$(iv DATA "$t"); file="$data/$PROTO_TARGET_CAT.md"
+    committed=$(git_i "$t" rev-parse -q --verify "HEAD:$PROTO_TARGET_CAT.md" || echo none)
+    want=$(git hash-object "$tmp/$t.md")
+    if [ "$committed" = "$want" ] && cmp -s "$tmp/$t.md" "$file"; then
+        log "$t: up to date ($label)"; continue
+    fi
+
+    # Write as the instance user, atomically: never a half-written file for a
+    # concurrent GET to hash.
+    as_inst "$t" tee "$file.sync.tmp" < "$tmp/$t.md" > /dev/null &&
+        as_inst "$t" mv -f "$file.sync.tmp" "$file" ||
+        { notify "protocol sync: could not write $file"; rc=1; continue; }
+    # The commit was right, only the disk had drifted: restored, nothing to commit.
+    [ "$committed" = "$want" ] && { log "$t: $file restored to HEAD"; continue; }
+    # Commit that one path only; a concurrent app commit may hold index.lock
+    # for a moment, so retry briefly rather than touch the lock.
+    ok=0
+    for n in $(seq 1 15); do
+        if git_i "$t" add -- "$PROTO_TARGET_CAT.md" &&
+           git_i "$t" commit -q -m "SYNC $PROTO_TARGET_CAT from $label" -- "$PROTO_TARGET_CAT.md"; then
+            ok=1; break
+        fi
+        # An app commit's `add -A` can take the new file first: then it is in.
+        [ "$(git_i "$t" rev-parse -q --verify "HEAD:$PROTO_TARGET_CAT.md")" = "$want" ] && { ok=1; break; }
+        sleep 1
+    done
+    if [ $ok = 1 ]; then log "$t: $PROTO_TARGET_CAT updated from $label"
+    else notify "protocol sync: commit into $t failed, file written but uncommitted"; rc=1; fi
+done
+exit $rc

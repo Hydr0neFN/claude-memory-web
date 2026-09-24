@@ -68,6 +68,32 @@ The script is resumable: re-run it after a crash at any step.
 Compare `git log tw..nl` and `git log nl..tw` in the vault, keep what should
 survive, then re-run.
 
+## A relative's protocol (read-only, owner-managed)
+
+A relative's `protocol` is not theirs to edit. The owner keeps the generic
+rules in `protocol-shared` (never the owner's own `protocol`, which maps the
+owner's categories and infrastructure), and `memprotocol-sync` renders each
+target's `protocol` from it:
+
+```
+ owner commit touching protocol-shared.md
+   └─ post-commit hook touches repl/protocol-sync ─► memprotocol-sync.path
+        └─ memprotocol-sync:  /etc/claude-memory/protocol/<t>.header.md
+                              + owner HEAD:protocol-shared.md (its H1 dropped)
+             └─ file write + git commit as the target's user ─► normal replication
+```
+
+- The target instance runs with `MEMORY_READONLY_CATEGORIES=protocol`
+  (`systemd/relative-readonly.conf`): every PUT/DELETE on it is 403 for every
+  credential, over REST and MCP alike. `protocol-roster` stays writable.
+- The header is per instance: vault name, the wrong-vault stop rule, language.
+  Until `protocol-shared` exists, `<t>.fallback.md` stands in for the body.
+- It runs on the lease holder only, is a no-op when nothing changed, and
+  repairs a hand-edited file. `memprotocol-sync.timer` is the hourly backstop.
+- Configured in `replication.conf`: `PROTO_SOURCE=yu-i PROTO_TARGETS=dad`.
+  Header and fallback live on both nodes, outside the vault.
+- Nothing ever flows back into the owner vault.
+
 ## Where things are
 
 | | TW | NL |

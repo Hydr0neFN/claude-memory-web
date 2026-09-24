@@ -1,0 +1,11 @@
+# Backstop for a missed poke (the hook never blocks a commit, so it can fail
+# silently); the script is a no-op when nothing changed.
+[Unit]
+Description=Hourly protocol sync backstop
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=1h
+
+[Install]
+WantedBy=timers.target
