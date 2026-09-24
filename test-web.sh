@@ -5,9 +5,13 @@
 #
 # Restarts the service first so the in-memory login throttle starts empty,
 # which is what makes the run repeatable.
+#
+# Another instance on the same box (README "Running several instances"):
+#   MEMORY_SERVICE=claude-memory@dad MEMORY_ENV_FILE=/var/lib/claude-memory/dad/.env #   MEMORY_AUTH_FILE=/var/lib/claude-memory/dad/auth.json #   MEMORY_KEYS_FILE=/var/lib/claude-memory/dad/apikeys.json #   ./test-web.sh http://127.0.0.1:8788
 set -u
 BASE="${1:-http://127.0.0.1:8787}"
-TOKEN="$(grep CLAUDE_MEMORY_TOKEN .env | cut -d= -f2-)"
+SERVICE="${MEMORY_SERVICE:-claude-memory}"
+TOKEN="$(grep CLAUDE_MEMORY_TOKEN "${MEMORY_ENV_FILE:-.env}" | cut -d= -f2-)"
 JAR=$(mktemp); HDR=$(mktemp); BODY=$(mktemp)
 CAT="webui-test"
 DOC="webui-test-doc"
@@ -24,7 +28,7 @@ contains() {
 etag_of() { grep -i '^etag:' "$1" | tr -d '\r' | sed 's/^[Ee][Tt][Aa][Gg]: *//; s/"//g'; }
 
 if command -v systemctl >/dev/null && [ "$(id -u)" = "0" ]; then
-  systemctl restart claude-memory
+  systemctl restart "$SERVICE"
   for _ in $(seq 30); do curl -sf -o /dev/null "$BASE/auth/me" && break; sleep 0.3; done
 fi
 
@@ -731,7 +735,7 @@ echo "=== 8. oauth sign-in routes ==="
 # the redirect is built correctly, that the state is bound to the browser and
 # the provider that started the handshake, and that an unconfigured server says
 # so instead of 500ing.
-AUTHFILE=./auth.json
+AUTHFILE="${MEMORY_AUTH_FILE:-./auth.json}"
 AUTHBAK=$(mktemp)
 HADAUTH=no
 [ -f "$AUTHFILE" ] && { cp -p "$AUTHFILE" "$AUTHBAK"; HADAUTH=yes; }
@@ -834,7 +838,7 @@ echo "=== 9. minted API keys ==="
 # The point of a minted key is that it is a bearer credential which cannot mint
 # more of itself: a leaked key that could issue successors would survive its own
 # revocation, and revocation is the only reason these exist.
-KEYFILE=./apikeys.json
+KEYFILE="${MEMORY_KEYS_FILE:-./apikeys.json}"
 KEYBAK=$(mktemp)
 HADKEYS=no
 [ -f "$KEYFILE" ] && { cp -p "$KEYFILE" "$KEYBAK"; HADKEYS=yes; }
