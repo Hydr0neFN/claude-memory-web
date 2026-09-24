@@ -274,6 +274,7 @@ code, which is how a single install has always worked.
 | `MEMORY_INSTANCE_NAME` | `owner` | whose vault: named in `/mcp` serverInfo and instructions, list/index output, the consent page |
 | `MEMORY_FLAG_DIR` | the parent of `MEMORY_DATA_DIR` | `READONLY` / `ALERT` replication flags (see `replflag.py`) |
 | `MEMORY_NODE` | unset | `X-Memory-Node` on every response, so a watchdog can tell which node the public hostname reaches |
+| `MEMORY_READONLY_CATEGORIES` | unset | comma list of categories every client credential may read but never PUT/DELETE (403); a relative's `protocol`, rendered by `replication/memprotocol-sync` |
 
 Set `MEMORY_ENV_FILE` whenever the code directory also holds another
 instance's `.env`: python-dotenv never overrides a variable that is already

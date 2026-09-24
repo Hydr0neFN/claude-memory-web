@@ -270,7 +270,7 @@ def unquote_etag(value: str) -> str:
 
 class Server:
     def __init__(self, app, token: str, sections_of, vault: str = "owner",
-                 public_url: str = "") -> None:
+                 public_url: str = "", readonly=()) -> None:
         self.app = app
         self.token = token
         self.sections_of = sections_of
@@ -280,6 +280,17 @@ class Server:
         self.vault = vault
         where = (" at " + public_url) if public_url else ""
         self.instructions = "This is the %s's vault%s.\n\n%s" % (vault, where, INSTRUCTIONS)
+        # Categories the route refuses to change (MEMORY_READONLY_CATEGORIES),
+        # said where a model looks before writing, so it does not try.
+        self.tools = TOOLS
+        if readonly:
+            note = ("Read-only here, managed by the vault owner: %s. Follow them; "
+                    "memory_write and memory_delete on them are refused (403)."
+                    % ", ".join("`%s`" % c for c in readonly))
+            self.instructions += "\n" + note + "\n"
+            self.tools = [dict(t, description=t["description"] + " " + note)
+                          if t["name"] in ("memory_write", "memory_delete") else t
+                          for t in TOOLS]
 
     async def rest(self, method: str, path: str, query: dict = None, body: bytes = b"",
                    actor: str = "mcp", extra: dict = None):
@@ -432,7 +443,7 @@ class Server:
         if method == "ping":
             return rpc_result(mid, {})
         if method == "tools/list":
-            return rpc_result(mid, {"tools": TOOLS})
+            return rpc_result(mid, {"tools": self.tools})
         if method in ("resources/list", "prompts/list", "resources/templates/list"):
             key = {"resources/list": "resources", "prompts/list": "prompts",
                    "resources/templates/list": "resourceTemplates"}[method]

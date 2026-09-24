@@ -227,6 +227,21 @@ def check_write_auth(request: Request) -> None:
 RESERVED_CATEGORIES = {"index", "search", "pins"}
 RESERVED_DOCS = {"index"}
 
+# Categories this instance serves but never lets a client change: a relative's
+# `protocol` is rendered from the owner's rules by replication/memprotocol-sync,
+# which commits it as the instance user straight into the git tree. The route
+# is the only client path to the file, so refusing here covers every
+# credential -- master token, cookie, mem_ key, OAuth grant -- and MCP, whose
+# tools call these same routes.
+READONLY_CATEGORIES = frozenset(
+    c.strip() for c in os.environ.get("MEMORY_READONLY_CATEGORIES", "").split(",") if c.strip()
+)
+
+
+def refuse_readonly(category: str) -> None:
+    if category in READONLY_CATEGORIES:
+        raise HTTPException(status_code=403, detail="read-only: managed by the vault owner")
+
 
 def validate_category(category: str) -> Path:
     if not CATEGORY_RE.match(category):
@@ -1353,6 +1368,7 @@ async def put_category(
 ):
     check_write_auth(request)
     path = validate_category(category)
+    refuse_readonly(category)
     # Body first: await is a yield point, so checking the precondition before it lets
     # two slow-uploading writers both pass the check before either writes.
     raw_body = await request.body()
@@ -1388,6 +1404,7 @@ async def put_category(
 def delete_category(category: str, request: Request, section: str = ""):
     check_write_auth(request)
     path = validate_category(category)
+    refuse_readonly(category)
     if not path.exists():
         raise HTTPException(status_code=404, detail="not found")
     require_precondition(path, request)
@@ -1567,7 +1584,8 @@ def delete_doc(slug: str, request: Request, section: str = ""):
 # or a person can always tell which vault a connector points at.
 VAULT = os.environ.get("MEMORY_INSTANCE_NAME") or "owner"
 mcp = mcpserver.Server(app, TOKEN, sections_of, VAULT,
-                       os.environ.get("MEMORY_PUBLIC_URL", "").rstrip("/"))
+                       os.environ.get("MEMORY_PUBLIC_URL", "").rstrip("/"),
+                       sorted(READONLY_CATEGORIES))
 
 
 def public_base(request: Request) -> str:
