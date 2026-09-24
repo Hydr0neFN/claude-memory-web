@@ -271,6 +271,7 @@ code, which is how a single install has always worked.
 | `MEMORY_MIN_CLIENT_FILE` | `min-client` | memapi version gate |
 | `MEMORY_PUBLIC_URL` | the request's Host | issuer / resource URL for `/mcp` |
 | `MEMORY_SESSION_KEY` | derived from `CLAUDE_MEMORY_TOKEN` | cookie-signing secret |
+| `MEMORY_INSTANCE_NAME` | `owner` | whose vault: named in `/mcp` serverInfo and instructions, list/index output, the consent page |
 
 Set `MEMORY_ENV_FILE` whenever the code directory also holds another
 instance's `.env`: python-dotenv never overrides a variable that is already

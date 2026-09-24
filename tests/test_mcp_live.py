@@ -21,6 +21,7 @@ import urllib.request
 
 BASE = (sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8787").rstrip("/")
 TOKEN = os.environ["CLAUDE_MEMORY_TOKEN"]
+VAULT = os.environ.get("MEMORY_INSTANCE_NAME") or "owner"
 DOC = "zz-mcp-selftest"
 REDIRECT = "http://127.0.0.1:33418/callback"
 PASS = FAIL = 0
@@ -113,6 +114,10 @@ st, _, out = rpc(TOKEN, "initialize", {"protocolVersion": "2025-06-18", "capabil
 check("initialize 200", st, 200)
 check("version echoed", out["result"]["protocolVersion"], "2025-06-18")
 check("instructions present", "protocol" in out["result"]["instructions"])
+check("serverInfo title names the vault", out["result"]["serverInfo"]["title"],
+      "Claude Memory (%s)" % VAULT)
+check("instructions open with the vault",
+      out["result"]["instructions"].startswith("This is the %s's vault" % VAULT))
 st, _, out = rpc(TOKEN, "initialize", {"protocolVersion": "1999-01-01"})
 check("unknown version -> newest", out["result"]["protocolVersion"], "2025-11-25")
 st, _, _ = req("POST", "/mcp", {"jsonrpc": "2.0", "method": "notifications/initialized"},
@@ -132,7 +137,11 @@ check("outline lists sections", "sections:" in text and "- Endpoint" in text)
 err, text = tool(TOKEN, "memory_search", query="Bearer token")
 check("search ok", err, False)
 err, text = tool(TOKEN, "memory_list")
-check("list has protocol", "protocol" in json.loads(text))
+head, _, rest = text.partition("\n")
+check("list names the vault", head, "vault: " + VAULT)
+check("list has protocol", "protocol" in json.loads(rest))
+err, text = tool(TOKEN, "memory_index")
+check("index names the vault", text.partition("\n")[0], "vault: " + VAULT)
 err, text = tool(TOKEN, "memory_get", name="../etc/passwd")
 check("path traversal refused", err, True)
 err, text = tool(TOKEN, "memory_get", name="zz-definitely-not-here")

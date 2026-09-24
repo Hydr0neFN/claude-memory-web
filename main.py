@@ -1557,7 +1557,12 @@ def delete_doc(slug: str, request: Request, section: str = ""):
 # mcpoauth.py for the why; the routes only translate HTTP.
 # --------------------------------------------------------------------------
 
-mcp = mcpserver.Server(app, TOKEN, sections_of)
+# Whose store this is ("owner", "dad", ...). Named in /mcp's serverInfo and
+# instructions, the list/index tool output and the consent page, so a model
+# or a person can always tell which vault a connector points at.
+VAULT = os.environ.get("MEMORY_INSTANCE_NAME") or "owner"
+mcp = mcpserver.Server(app, TOKEN, sections_of, VAULT,
+                       os.environ.get("MEMORY_PUBLIC_URL", "").rstrip("/"))
 
 
 def public_base(request: Request) -> str:
@@ -1804,23 +1809,24 @@ def oauth_authorize(request: Request):
                esc(webauth.PROVIDERS[n]["label"]))
             for n in creds.enabled_providers)
         return authz_page("Sign in", (
-            "<h1 style='font-size:1.2rem'>Sign in to connect <b>%s</b></h1>%s"
+            "<h1 style='font-size:1.2rem'>Sign in to connect <b>%s</b> to the "
+            "<b>%s</b> vault</h1>%s"
             "<p style='color:#666'>Or sign in on the <a href='/' target=_blank>main "
             "page</a> with the token, then reload this tab.</p>")
-            % (name, buttons or "<p>No sign-in provider is configured.</p>"))
+            % (name, esc(VAULT), buttons or "<p>No sign-in provider is configured.</p>"))
 
     hidden = "".join("<input type=hidden name='%s' value='%s'>" % (k, esc(v))
                      for k, v in p.items())
     who = esc(info.email or "token session")
     return authz_page("Allow access?", (
-        "<h1 style='font-size:1.2rem'>Allow <b>%s</b> to use your memory store?</h1>"
+        "<h1 style='font-size:1.2rem'>Allow <b>%s</b> to use the <b>%s</b> vault?</h1>"
         "<p>It will be able to <b>read and write every category and doc</b>, exactly as "
         "an API key can. After you allow it, you are sent to <b>%s</b>.</p>"
         "<p style='color:#666'>Signed in as %s. Revoke it any time under API keys.</p>"
         "<form method=post action='/oauth/authorize'>%s"
         "<button name=decision value=allow style='font-size:1rem;padding:.5rem 1.2rem'>"
         "Allow</button> <button name=decision value=deny style='font-size:1rem;"
-        "padding:.5rem 1.2rem'>Deny</button></form>") % (name, dest, who, hidden))
+        "padding:.5rem 1.2rem'>Deny</button></form>") % (name, esc(VAULT), dest, who, hidden))
 
 
 @app.post("/oauth/authorize")

@@ -269,10 +269,17 @@ def unquote_etag(value: str) -> str:
 
 
 class Server:
-    def __init__(self, app, token: str, sections_of) -> None:
+    def __init__(self, app, token: str, sections_of, vault: str = "owner",
+                 public_url: str = "") -> None:
         self.app = app
         self.token = token
         self.sections_of = sections_of
+        # Which store this is, said up front: the Claude apps sync connectors
+        # per account, and one machine can switch between the owner's account
+        # and a relative's, so the same connector name can point at either.
+        self.vault = vault
+        where = (" at " + public_url) if public_url else ""
+        self.instructions = "This is the %s's vault%s.\n\n%s" % (vault, where, INSTRUCTIONS)
 
     async def rest(self, method: str, path: str, query: dict = None, body: bytes = b"",
                    actor: str = "mcp", extra: dict = None):
@@ -309,11 +316,11 @@ class Server:
     async def call(self, name: str, args: dict, actor: str) -> str:
         if name == "memory_list":
             _, _, out = await self.rest("GET", self._base(args), actor=actor)
-            return out.decode("utf-8")
+            return "vault: %s\n%s" % (self.vault, out.decode("utf-8"))
 
         if name == "memory_index":
             _, _, out = await self.rest("GET", self._base(args) + "/index", actor=actor)
-            return out.decode("utf-8")
+            return "vault: %s\n%s" % (self.vault, out.decode("utf-8"))
 
         if name == "memory_search":
             query = {"q": args.get("query", ""), "scope": args.get("scope") or "memory",
@@ -411,9 +418,9 @@ class Server:
             return rpc_result(mid, {
                 "protocolVersion": version,
                 "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": SERVER_NAME, "title": "Claude Memory",
+                "serverInfo": {"name": SERVER_NAME, "title": "Claude Memory (%s)" % self.vault,
                                "version": SERVER_VERSION},
-                "instructions": INSTRUCTIONS,
+                "instructions": self.instructions,
             })
         if method == "ping":
             return rpc_result(mid, {})
