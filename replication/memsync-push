@@ -1,0 +1,42 @@
+#!/bin/bash
+# memsync-push <inst> -- push the vault's history to every remote in REMOTES,
+# in parallel, never with force. Runs from a .path unit the post-commit hook
+# pokes, and from a timer as the retry. A write never waits on this.
+#
+#   pushed / already there  -> fine
+#   network or remote down  -> exit 1, the timer retries
+#   rejected (non-ff or any "!" in --porcelain) -> another writer exists:
+#       READONLY on this node + notify. Cleared only by a person.
+#
+# MEMSYNC_HANDBACK=1 (set by memctl prepare-handback) pushes although this
+# node is fenced read-only for the handback itself.
+. "$(dirname "$(readlink -f "$0")")/lib.sh"
+inst=${1:?usage: memsync-push <inst>}
+[ "$(role)" = primary ] || { log "$inst: not primary, nothing to push"; exit 0; }
+if [ -e "$(flag_file "$inst" READONLY)" ] && [ -z "${MEMSYNC_HANDBACK:-}" ]; then
+    log "$inst: READONLY set, not pushing"; exit 0
+fi
+head=$(git_i "$inst" rev-parse -q --verify "HEAD^{commit}") || { log "$inst: empty repo"; exit 0; }
+
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+for r in $REMOTES; do
+    ( git_i "$inst" push --porcelain "$r" "HEAD:refs/heads/$(branch "$inst")" \
+          > "$tmp/$r.out" 2>&1; echo $? > "$tmp/$r.rc" ) &
+done
+wait
+
+rc=0
+for r in $REMOTES; do
+    if grep -q '^!' "$tmp/$r.out"; then
+        why=$(grep '^!' "$tmp/$r.out" | head -n1 | cut -f3)
+        flag_set "$inst" READONLY "push to $r rejected $why at $(stamp); local ${head:0:12}"
+        notify "$inst: push to $r REJECTED $why -- another writer? vault is now READ-ONLY here"
+        rc=3
+    elif [ "$(cat "$tmp/$r.rc")" != 0 ]; then
+        log "$inst: push to $r failed (will retry): $(tail -n1 "$tmp/$r.out")"
+        [ $rc = 0 ] && rc=1
+    else
+        log "$inst: $r at ${head:0:12}"
+    fi
+done
+exit $rc

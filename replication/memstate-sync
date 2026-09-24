@@ -1,0 +1,11 @@
+#!/bin/bash
+# memstate-sync -- copy each instance's state files (.env, auth.json,
+# apikeys.json, mcpoauth.json) from the lease holder to the peer. Timer on
+# both nodes; only the primary acts, so a stale copy never overwrites the
+# writer's grants (handback copies the other way, before the home node starts).
+. "$(dirname "$(readlink -f "$0")")/lib.sh"
+LOG_TAG=state-sync
+[ "$(role)" = primary ] || exit 0
+rc=0
+for i in $INSTANCES; do $STATE_PUSH "$i" || { log "$i: state push failed"; rc=1; }; done
+exit $rc

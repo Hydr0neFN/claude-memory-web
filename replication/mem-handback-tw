@@ -1,0 +1,89 @@
+#!/bin/bash
+# mem-handback-tw -- OPERATOR ONLY, run on TW: take the lease back from NL.
+# Resumable: each step checks whether it already happened, so re-running
+# after a crash mid-way finishes the job. At every step at most one node
+# accepts writes:
+#
+#   1 NL: READONLY, drain, final push, report heads   (ctl prepare-handback)
+#   2 TW: fetch; behind/equal -> ff; ahead -> keep; DIVERGED -> abort, no merge
+#   3 TW: copy NL's state files (grants, keys, .env) -- NL was the writer
+#   4 DNS for every hostname -> TW, or none
+#   5 TW: ROLE=primary, start, verify X-Memory-Node=tw on every host
+#   6 NL: stop, standby, flags cleared, updater on      (ctl release)
+#
+# An abort leaves NL primary and writable, DNS at NL, and an ALERT here.
+. "$(dirname "$(readlink -f "$0")")/lib.sh"
+LOG_TAG=handback
+crash() { [ "${HANDBACK_CRASH_AT:-}" = "$1" ] && { log "test: crash at $1"; exit 99; }; return 0; }
+
+st=$(peer_status) || { notify "handback: $PEER unreachable, nothing done"; exit 1; }
+pr=$(field "$st" role)
+
+if [ "$(role)" = primary ]; then
+    # Finishing an interrupted run (crash after step 5), or nothing to do.
+    dns_point_all "$NODE" "$PEER" || notify "handback: DNS re-check failed"
+    [ "$pr" = primary ] && { $PEER_CTL release >/dev/null || notify "handback: release of $PEER failed"; }
+    log "$NODE is primary, $PEER is $( [ "$pr" = primary ] && echo released || echo "$pr")"
+    exit 0
+fi
+
+abort() {
+    local h
+    [ "$pr" = primary ] && { $PEER_CTL abort-handback >/dev/null 2>&1 || log "abort-handback on $PEER failed"; }
+    for h in $PUBLIC_HOSTS; do
+        [ "$($CF where "$h" 2>/dev/null)" = "$NODE" ] && { dns_point_all "$PEER" "$NODE" || log "DNS move-back failed"; break; }
+    done
+    for i in $INSTANCES; do [ -e "$(flag_file "$i" ALERT)" ] || flag_set "$i" ALERT "handback FAILED $(stamp): $1"; done
+    notify "handback ABORTED, $PEER stays primary: $1"
+    exit 1
+}
+
+if [ "$pr" = primary ]; then
+    out=$($PEER_CTL prepare-handback 2>/dev/null) || abort "$PEER could not prepare ($(field "$out" error))"
+else
+    out=$st   # NL standby/fenced: nobody writes; just catch up and take over
+fi
+crash prepared
+
+for i in $INSTANCES; do
+    want=$(field "$out" "head.$i")
+    git_i "$i" fetch -q peer || abort "$i: fetch from $PEER failed"
+    got=$(git_i "$i" rev-parse -q --verify "peer/$(branch "$i")^{commit}" || echo none)
+    [ "$want" = "$got" ] || abort "$i: $PEER reported ${want:0:12} but its vault has ${got:0:12}"
+    if git_i "$i" fetch -q gh 2>/dev/null && [ "$(classify "$i" "gh/$(branch "$i")")" = diverged ]; then
+        flag_set "$i" ALERT "DIVERGED from GitHub since $(stamp): resolve by hand, no automatic merge"
+        abort "$i DIVERGED from the GitHub copy"
+    fi
+    case $(classify "$i" "peer/$(branch "$i")") in
+        behind) ff_to "$i" "peer/$(branch "$i")" || abort "$i: ff failed" ;;
+        equal|ahead|missing) ;;
+        diverged)
+            flag_set "$i" ALERT "DIVERGED from $PEER since $(stamp): resolve by hand, no automatic merge"
+            abort "$i DIVERGED from $PEER" ;;
+    esac
+done
+
+if [ "$pr" = primary ]; then
+    for i in $INSTANCES; do $STATE_PULL "$i" || abort "$i: copying state files from $PEER failed"; done
+fi
+crash state
+
+dns_point_all "$NODE" "$PEER" || abort "Cloudflare DNS switch failed (rolled back)"
+crash dns
+set_role primary "handback from $PEER"
+for i in $INSTANCES; do flag_clear "$i" READONLY; flag_clear "$i" ALERT; done
+units_start || notify "handback: a unit failed to start"
+crash started
+
+ok=0
+for n in $(seq 0 "${VERIFY_SECS:-60}"); do
+    [ "$(public_node)" = "$NODE" ] && { ok=1; break; }
+    [ "$n" -lt "${VERIFY_SECS:-60}" ] && sleep 1
+done
+[ $ok = 1 ] || notify "handback: public hostnames not (all) served by $NODE yet: $(public_node)"
+
+if [ "$pr" = primary ]; then
+    $PEER_CTL release >/dev/null || notify "handback done but release of $PEER failed: it is still up read-only; re-run mem-handback-tw"
+fi
+notify "handback complete: $NODE is primary"
+for i in $INSTANCES; do "$(dirname "$(readlink -f "$0")")/memsync-push" "$i" || true; done

@@ -1,0 +1,117 @@
+#!/bin/bash
+# memctl <verb> -- the only things the peer node may ask of this one. On the
+# box it is the forced command of the peer's control key:
+#   command="/usr/local/sbin/memctl",restrict ssh-ed25519 ...
+# so the verb arrives in SSH_ORIGINAL_COMMAND and is checked against a fixed
+# list; anything else is refused.
+#
+#   status            role, per-instance head / app health / flags, tunnel
+#   heartbeat k=v...  (NL, from TW's memheartbeat) record TW's report;
+#                     answers with this node's role
+#   fence             stop, push what we have, give up the lease; prints heads
+#                     (mem-promote-nl, when TW is reachable)
+#   unfence           undo that fence when the promotion then aborted
+#   prepare-handback  READONLY, drain, final push; prints heads
+#   abort-handback    clear the handback READONLY, stay primary
+#   release           stop, become standby, clear flags, updater back on
+. "$(dirname "$(readlink -f "$0")")/lib.sh"
+LOG_TAG=memctl
+HERE=$(dirname "$(readlink -f "$0")")
+cmd=${SSH_ORIGINAL_COMMAND:-$*}
+verb=${cmd%% *}
+
+heads() {
+    local i
+    for i in $INSTANCES; do
+        echo "head.$i=$(git_i "$i" rev-parse -q --verify "HEAD^{commit}" || echo none)"
+    done
+}
+
+drain() {
+    # READONLY is already set, so no new write can start. A write already past
+    # the fence holds data/.git/index.lock while it commits (git() times out
+    # at 30 s); wait for every store's lock to clear, then DRAIN_SECS more.
+    # Not "no git process": HA's supervisor keeps git workers alive for days.
+    local i n busy
+    for n in $(seq 1 35); do
+        busy=0
+        for i in $INSTANCES; do [ -e "$(iv DATA "$i")/.git/index.lock" ] && busy=1; done
+        [ $busy = 0 ] && break
+        sleep 1
+    done
+    sleep "$DRAIN_SECS"
+}
+
+case "$verb" in
+status)
+    echo "node=$NODE"
+    echo "role=$(role)"
+    if $PROBE_TUNNEL; then echo "tunnel=up"; else echo "tunnel=down"; fi
+    for i in $INSTANCES; do
+        if $PROBE_APP "$i"; then echo "app.$i=up"; else echo "app.$i=down"; fi
+        [ -e "$(flag_file "$i" READONLY)" ] && echo "readonly.$i=1" || echo "readonly.$i=0"
+    done
+    heads
+    ;;
+heartbeat)
+    # The report is data from the peer: keep only key=value tokens of a tight
+    # alphabet, so nothing in it can reach a shell or a notification unfiltered.
+    report=""
+    set -f   # no globbing of peer-supplied text
+    for tok in ${cmd#heartbeat}; do
+        [[ $tok =~ ^[a-z0-9._-]{1,40}=[a-z0-9._:-]{1,80}$ ]] && report="$report $tok"
+    done
+    printf '%s%s\n' "$(now)" "$report" > "$STATE_DIR/peer_heartbeat.tmp"
+    mv -f "$STATE_DIR/peer_heartbeat.tmp" "$STATE_DIR/peer_heartbeat"
+    echo "role=$(role)"
+    ;;
+fence)
+    [ "$(role)" = primary ] || { echo "role=$(role)"; heads; exit 0; }   # idempotent
+    units_stop
+    for i in $INSTANCES; do
+        MEMSYNC_HANDBACK=1 "$HERE/memsync-push" "$i" && echo "pushed.$i=1" || echo "pushed.$i=0"
+    done
+    set_role fenced "fenced by $PEER (operator promotion)"
+    for i in $INSTANCES; do flag_set "$i" READONLY "fenced $(stamp): $PEER is being promoted"; done
+    notify "fenced: an operator is promoting $PEER"
+    echo "role=fenced"
+    heads
+    ;;
+unfence)
+    [ "$(role)" = fenced ] || { echo "role=$(role)"; exit 0; }
+    set_role primary "promotion of $PEER aborted"
+    for i in $INSTANCES; do flag_clear "$i" READONLY; done
+    units_start || true
+    notify "unfenced: the promotion of $PEER was aborted, this node is primary again"
+    echo "role=primary"
+    ;;
+prepare-handback)
+    [ "$(role)" = primary ] || { echo "error=not primary ($(role))"; exit 1; }
+    for i in $INSTANCES; do flag_set "$i" READONLY "handback to $PEER in progress since $(stamp)"; done
+    drain
+    for i in $INSTANCES; do
+        MEMSYNC_HANDBACK=1 "$HERE/memsync-push" "$i" || { echo "error=final push failed for $i"; exit 1; }
+    done
+    heads
+    ;;
+abort-handback)
+    for i in $INSTANCES; do
+        case "$(flag_text "$i" READONLY)" in "handback to"*) flag_clear "$i" READONLY ;; esac
+    done
+    notify "handback aborted; still primary"
+    echo "role=$(role)"
+    ;;
+release)
+    [ "$(role)" = primary ] || { echo "role=$(role)"; exit 0; }   # idempotent
+    units_stop
+    set_role standby "handed back to $PEER"
+    for i in $INSTANCES; do flag_clear "$i" READONLY; flag_clear "$i" ALERT; done
+    updaters enable
+    notify "released: $PEER is primary again, this node is standby"
+    echo "role=standby"
+    ;;
+*)
+    echo "memctl: refused verb '${cmd:0:60}'" >&2
+    exit 64
+    ;;
+esac

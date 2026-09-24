@@ -1,0 +1,28 @@
+#!/bin/bash
+# memheartbeat-check -- every minute on NL (memheartbeat-check.timer).
+# No automatic action: it tells the owner, and leaves a flag file their agent
+# can read (STATE_DIR/PEER_SILENT, STATE_DIR/PEER_DEGRADED). Deciding to run
+# mem-promote-nl is the owner's call.
+. "$(dirname "$(readlink -f "$0")")/lib.sh"
+LOG_TAG=hb-check
+[ "$(role)" = standby ] || exit 0
+hb=$(cat "$STATE_DIR/peer_heartbeat" 2>/dev/null) || hb="0"
+last=${hb%% *}; age=$(( $(now) - ${last:-0} ))
+silent=$STATE_DIR/PEER_SILENT degraded=$STATE_DIR/PEER_DEGRADED
+
+if [ "$age" -gt "$HEARTBEAT_STALE_SECS" ]; then
+    echo "$PEER silent for ${age}s (last heartbeat $(date -u -d "@${last:-0}" +%FT%TZ 2>/dev/null)). If it stays down: mem-promote-nl on $NODE." > "$silent"
+    notify_once peer-silent "$(cat "$silent")"
+    exit 0
+fi
+bad=""
+case " $hb " in *" role=primary "*) ;; *) bad="$bad role" ;; esac
+case " $hb " in *" public=$PEER "*) ;; *) bad="$bad public" ;; esac
+case " $hb " in *"=down "*) bad="$bad down" ;; esac
+if [ -n "$bad" ]; then
+    echo "$PEER alive but degraded:${hb#* }" > "$degraded"
+    notify_once peer-degraded "$(cat "$degraded")"
+else
+    [ -e "$silent" ] || [ -e "$degraded" ] && notify "$PEER is healthy again"
+    rm -f "$silent" "$degraded"; notify_reset peer-silent; notify_reset peer-degraded
+fi

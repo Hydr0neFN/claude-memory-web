@@ -1,0 +1,80 @@
+#!/bin/bash
+# mem-promote-nl [reason] -- OPERATOR ONLY, run on NL: make NL the primary.
+# Idempotent: re-running after a crash picks up where it stopped, and a
+# finished promotion re-run only re-verifies.
+#
+#   1 TW reachable (Tailscale ctl)  -> fence it: it stops, pushes, gives up the
+#                                      lease; its heads must then be in our vault
+#     TW unreachable                -> refuse if the public URL is still served
+#                                      by TW; otherwise go on (TW fences itself on
+#                                      its first heartbeat after it reconnects)
+#   2 standby updater off; ff each tree from the vault (diverged -> abort)
+#   3 DNS for EVERY hostname -> NL tunnel, or none (rollback)
+#   4 ROLE=primary, ALERT, start units, verify X-Memory-Node=nl on every host
+# Any abort before 4 un-fences TW if we fenced it.
+. "$(dirname "$(readlink -f "$0")")/lib.sh"
+LOG_TAG=promote
+reason=${1:-operator promotion}
+fenced_peer=0
+
+abort() {
+    updaters enable
+    [ $fenced_peer = 1 ] && { $PEER_CTL unfence >/dev/null 2>&1 || log "unfence of $PEER failed"; }
+    notify "promotion ABORTED: $1"
+    exit 1
+}
+verify() {
+    local n
+    for n in $(seq 0 "${VERIFY_SECS:-60}"); do
+        [ "$(public_node)" = "$NODE" ] && { log "verified: every hostname served by $NODE"; return 0; }
+        [ "$n" -lt "${VERIFY_SECS:-60}" ] && sleep 1
+    done
+    notify "promoted, but the public hostnames are not (all) served by $NODE yet: $(public_node)"
+    return 2
+}
+
+if [ "$(role)" = primary ]; then
+    log "already primary: re-checking DNS, units, public URL"
+    dns_point_all "$NODE" "$PEER" || notify "DNS re-check failed"
+    units_start || true
+    verify; exit $?
+fi
+
+if st=$(peer_status); then
+    case $(field "$st" role) in
+    primary)
+        out=$($PEER_CTL fence 2>/dev/null) || abort "fencing $PEER failed"
+        fenced_peer=1
+        for i in $INSTANCES; do
+            want=$(field "$out" "head.$i")
+            git_i "$i" fetch -q "${UPDATE_REMOTE:-vault}" || abort "$i: fetch from the vault failed"
+            have=$(git_i "$i" rev-parse -q --verify "${UPDATE_REMOTE:-vault}/$(branch "$i")^{commit}" || echo none)
+            [ "$want" = "$have" ] || abort "$i: $PEER is at ${want:0:12} but our vault has ${have:0:12} (its last push failed?)"
+        done ;;
+    fenced|standby) log "$PEER is already $(field "$st" role)" ;;
+    esac
+else
+    [ "$(public_node)" = "$PEER" ] && abort "$PEER is unreachable over Tailscale but still serves the public hostnames: not promoting"
+    log "$PEER unreachable and not serving; promoting without fencing it (it fences itself on reconnect)"
+fi
+
+updaters disable
+for i in $INSTANCES; do
+    git_i "$i" fetch -q "${UPDATE_REMOTE:-vault}" || abort "$i: fetch from the vault failed"
+    c=$(classify "$i" "${UPDATE_REMOTE:-vault}/$(branch "$i")")
+    case $c in
+        behind) ff_to "$i" "${UPDATE_REMOTE:-vault}/$(branch "$i")" || abort "$i: ff failed" ;;
+        equal|ahead|missing) ;;
+        *) abort "$i: working tree $c against the vault" ;;
+    esac
+done
+
+dns_point_all "$NODE" "$PEER" || abort "Cloudflare DNS switch failed (rolled back)"
+set_role primary "$reason"
+for i in $INSTANCES; do
+    flag_clear "$i" READONLY
+    flag_set "$i" ALERT "running on the $NODE standby since $(stamp): $reason"
+done
+units_start || notify "promoted but a unit failed to start"
+notify "PROMOTED $NODE to primary: $reason"
+verify

@@ -1,0 +1,16 @@
+#!/bin/bash
+# memvault-update <inst> -- keep a standby's working tree at the vault's head
+# (fast-forward only). Poked by the bare repo's post-receive via a .path unit.
+# Does nothing unless this node is standby: a promoted node's tree belongs
+# to its running app (and index.lock).
+. "$(dirname "$(readlink -f "$0")")/lib.sh"
+LOG_TAG=vault-update
+inst=${1:?usage: memvault-update <inst>}
+[ "$(role)" = standby ] || exit 0
+ref="${UPDATE_REMOTE:-vault}/$(branch "$inst")"
+git_i "$inst" fetch -q "${UPDATE_REMOTE:-vault}" || { log "$inst: fetch failed"; exit 1; }
+case $(classify "$inst" "$ref") in
+    behind) ff_to "$inst" "$ref" && log "$inst: at $(git_i "$inst" rev-parse --short HEAD)" ;;
+    equal|missing) ;;
+    ahead|diverged) notify_once "update-$inst" "$inst: standby tree is not an ancestor of the vault -- someone wrote on the standby" ;;
+esac

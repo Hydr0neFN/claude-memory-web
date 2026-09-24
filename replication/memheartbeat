@@ -1,0 +1,36 @@
+#!/bin/bash
+# memheartbeat -- every minute on TW (memheartbeat.timer). Outbound only:
+#   1 report to NL over Tailscale (memctl heartbeat); NL alerts when these stop
+#   2 report the memory service to the existing dead-man Worker (/alert,
+#     source memory-api) when JOB_ALERT is set -- the channel that still works
+#     when NL is the one that is down
+#   3 the one automatic lease move: if the public hostname is served by the
+#     peer, or the peer answers that it is primary, fence this node. It only
+#     ever reduces the number of writers.
+. "$(dirname "$(readlink -f "$0")")/lib.sh"
+LOG_TAG=heartbeat
+r=$(role)
+pub=$(public_node)
+if [ "$r" = primary ] && [ "$pub" = "$PEER" ]; then
+    fence_self "the public hostname is served by $PEER"; r=$(role)
+fi
+
+report="role=$r public=${pub:-none}"
+if $PROBE_TUNNEL; then report="$report tunnel=up"; else report="$report tunnel=down"; fi
+apps_ok=1
+for i in $INSTANCES; do
+    if $PROBE_APP "$i"; then report="$report app.$i=up"; else report="$report app.$i=down"; apps_ok=0; fi
+done
+
+if reply=$($PEER_CTL heartbeat $report 2>/dev/null); then
+    pr=$(field "$reply" role)
+    if [ "$r" = primary ] && [ "$pr" = primary ]; then fence_self "$PEER reports that it is primary"; r=$(role); fi
+else
+    log "heartbeat to $PEER failed"
+fi
+
+if [ -n "${JOB_ALERT:-}" ] && [ "$r" = primary ]; then
+    if [ "$pub" = "$NODE" ] && [ $apps_ok = 1 ]; then $JOB_ALERT memory-api ok "serving" >/dev/null 2>&1 || true
+    else $JOB_ALERT memory-api soft-fail "memory on $NODE: $report" >/dev/null 2>&1 || true; fi
+fi
+exit 0

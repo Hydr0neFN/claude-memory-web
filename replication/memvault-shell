@@ -1,0 +1,17 @@
+#!/bin/bash
+# memvault-shell <repo>... -- forced command for a node's git key on the peer:
+#   command="/usr/local/sbin/memvault-shell yu-i dad",restrict ssh-ed25519 ...
+# Allows exactly git-receive-pack / git-upload-pack on the named bare repos
+# under VAULT_ROOT, nothing else. Fast-forward-only is enforced by the repos'
+# own config (receive.denyNonFastForwards, receive.denyDeletes).
+VAULT_ROOT=${VAULT_ROOT:-/srv/memvault}
+cmd=${SSH_ORIGINAL_COMMAND:-}
+re="^(git-receive-pack|git-upload-pack) '?/?([a-z0-9-]+)\.git'?$"
+if [[ $cmd =~ $re ]]; then
+    verb=${BASH_REMATCH[1]} repo=${BASH_REMATCH[2]}
+    for allowed in "$@"; do
+        [ "$repo" = "$allowed" ] && exec "$verb" "$VAULT_ROOT/$repo.git"
+    done
+fi
+echo "memvault-shell: refused '${cmd:0:80}'" >&2
+exit 64
