@@ -483,3 +483,4 @@ input:focus, textarea:focus { outline: 2px solid var(--accent-line); outline-off
   font-family: var(--mono); font-size: 13px;
   word-break: break-all; user-select: all;
 }
+.keyh2 { font-size: 15px; margin: 32px 0 6px; }

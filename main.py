@@ -11,6 +11,8 @@ that has grown past the ~20KB split threshold still needs a whole-file PUT to
 restructure. This is an accepted gap, not an oversight.
 """
 import hashlib
+import html
+import json
 import os
 import re
 import secrets
@@ -23,10 +25,12 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 import apikeys
+import mcpoauth
+import mcpserver
 import searchrank
 import versiongate
 import webauth
@@ -94,11 +98,16 @@ app.add_middleware(versiongate.VersionGate)  # refuse too-old memapi clients; se
 session = webauth.Session(TOKEN)
 creds = webauth.Credentials()
 keystore = apikeys.KeyStore()
+oauth = mcpoauth.Store()
 login_throttle = webauth.Throttle(max_attempts=5, window_sec=300)
 # The Google path is slower and involves a third party, so it gets its own
 # budget: exhausting one must not lock the other out, and the token path is the
 # way back in when Google is the thing that is broken.
 oauth_throttle = webauth.Throttle(max_attempts=10, window_sec=300)
+# MCP OAuth: registration is anonymous by design, so every call counts
+# against its budget; the token endpoint counts failures only.
+register_throttle = webauth.Throttle(max_attempts=10, window_sec=3600)
+token_throttle = webauth.Throttle(max_attempts=20, window_sec=300)
 
 
 # --------------------------------------------------------------------------
@@ -821,6 +830,27 @@ def html_escape(text: str) -> str:
             .replace(">", "&gt;").replace('"', "&quot;"))
 
 
+NEXT_COOKIE = "mem_next"
+
+
+def safe_next(value: str) -> str:
+    """Where to land after sign-in, if it is somewhere we are willing to go.
+    Only the MCP consent page ever asks, and only a relative path to it is
+    accepted: anything else would make sign-in an open redirect."""
+    value = value or ""
+    if (value.startswith("/oauth/authorize?") and len(value) <= 3000
+            and not any(c in value for c in "\\\r\n\t<>\"'")):
+        return value
+    return ""
+
+
+def read_next_cookie(request: Request) -> str:
+    try:
+        return webauth.b64u_decode(request.cookies.get(NEXT_COOKIE, "")).decode("utf-8")
+    except Exception:
+        return ""
+
+
 def oauth_start(name: str, request: Request):
     """Begin a handshake. GET, because it is a top-level navigation."""
     if not creds.enabled(name):
@@ -848,6 +878,14 @@ def oauth_start(name: str, request: Request):
         samesite="lax",
         path="/auth",
     )
+    nxt = safe_next(request.query_params.get("next", ""))
+    if nxt:
+        # Same lifetime and SameSite as the state cookie, for the same reason.
+        response.set_cookie(NEXT_COOKIE, webauth.b64u(nxt.encode("utf-8")), max_age=webauth.OAUTH_SECONDS, httponly=True,
+                            secure=webauth.cookie_secure(request), samesite="lax",
+                            path="/auth")
+    else:
+        response.delete_cookie(NEXT_COOKIE, path="/auth")
     return response
 
 
@@ -887,14 +925,17 @@ def oauth_callback(name: str, request: Request, code: str, state: str, error: st
     # a redirect issued while still inside the provider's cross-site navigation
     # would not carry it to the page it lands on. A same-site navigation
     # started by this page does.
+    dest = safe_next(read_next_cookie(request)) or "/"
     response = HTMLResponse(
         "<!doctype html><meta charset=utf-8><title>Signed in</title>"
-        "<script>location.replace('/')</script>"
+        "<script>location.replace(%s)</script>"
         "<body style='font:14px system-ui;margin:3rem auto;max-width:32rem'>"
-        "<p>Signed in as %s. <a href='/'>Continue</a>.</p>" % html_escape(email)
+        "<p>Signed in as %s. <a href='%s'>Continue</a>.</p>"
+        % (js_string(dest), html_escape(email), esc(dest))
     )
     set_session_cookie(response, request, webauth.PROVIDERS[name]["subject"], email)
     response.delete_cookie(webauth.OAUTH_COOKIE, path="/auth")
+    response.delete_cookie(NEXT_COOKIE, path="/auth")
     return response
 
 
@@ -949,7 +990,7 @@ def require_browser(request: Request) -> None:
 @app.get("/auth/keys")
 def list_keys(request: Request):
     require_browser(request)
-    return JSONResponse({"keys": keystore.listing()})
+    return JSONResponse({"keys": keystore.listing(), "grants": oauth.listing()})
 
 
 @app.post("/auth/keys")
@@ -1449,6 +1490,344 @@ def delete_doc(slug: str, request: Request, section: str = ""):
     path.unlink()
     committed = git_commit(commit_subject("DELETE", "doc %s" % slug, request))
     return PlainTextResponse("OK", headers=commit_headers({}, committed))
+
+
+# --------------------------------------------------------------------------
+# MCP: /mcp for claude.ai connectors and Claude Code, plus the OAuth 2.1
+# authorization server claude.ai needs to reach it. See mcpserver.py and
+# mcpoauth.py for the why; the routes only translate HTTP.
+# --------------------------------------------------------------------------
+
+mcp = mcpserver.Server(app, TOKEN, sections_of)
+
+
+def public_base(request: Request) -> str:
+    """Our own origin as clients see it. MEMORY_PUBLIC_URL pins it; otherwise
+    the Host header, which through the tunnel is always the public name."""
+    pinned = os.environ.get("MEMORY_PUBLIC_URL", "").rstrip("/")
+    if pinned:
+        return pinned
+    host = (request.headers.get("host") or "localhost").strip()
+    return ("https://" if webauth.cookie_secure(request) else "http://") + host
+
+
+def mcp_resource(request: Request) -> str:
+    return public_base(request) + "/mcp"
+
+
+def esc(text: str) -> str:
+    """html_escape plus the single quote. Everything on the MCP pages lands in
+    single-quoted attributes, and `state` / `client_name` come from whoever
+    built the link -- html_escape alone would let a crafted state close the
+    attribute and run script on this origin."""
+    return html.escape(str(text), quote=True)
+
+
+def js_string(text: str) -> str:
+    """A JS string literal safe inside an inline <script>."""
+    return json.dumps(text).replace("<", "\\u003c").replace(">", "\\u003e")
+
+
+def mcp_unauthorized(request: Request, error: str = ""):
+    challenge = 'Bearer resource_metadata="%s/.well-known/oauth-protected-resource/mcp"' \
+        % public_base(request)
+    if error:
+        challenge += ', error="%s"' % error
+    return JSONResponse({"error": error or "unauthorized",
+                         "error_description": "sign in: this server uses OAuth"},
+                        status_code=401, headers={"WWW-Authenticate": challenge})
+
+
+def actor_suffix(name: str) -> str:
+    return ("mcp " + re.sub(r"[^\w.-]", "", name or "", flags=re.ASCII))[:40].strip()
+
+
+def mcp_actor(request: Request):
+    """Authorize an /mcp call. Returns the commit actor name, or None.
+
+    Accepts the master token, a minted mem_ key, or an OAuth access token.
+    OAuth tokens are audience-bound to /mcp: check_auth never accepts them, so
+    a connector's token cannot be replayed against the REST API. No cookie
+    path: /mcp answers non-browser clients only, and a cookie would make it
+    reachable by cross-site POSTs.
+    """
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        return None
+    presented = auth[7:].strip()
+    if secrets.compare_digest(presented, TOKEN):
+        return "mcp"
+    rec = keystore.verify(presented)
+    if rec:
+        keystore.touch(rec)
+        return actor_suffix(rec.get("name"))
+    grant = oauth.verify_access(presented)
+    if grant and grant.get("resource") == mcp_resource(request):
+        return actor_suffix(grant.get("client_name"))
+    return None
+
+
+@app.post("/mcp")
+async def mcp_post(request: Request):
+    # DNS-rebinding guard from the transport spec: a browser page on another
+    # origin must not be able to drive this endpoint. Server-side clients send
+    # no Origin at all.
+    origin = request.headers.get("origin")
+    if origin and origin.rstrip("/") != public_base(request):
+        return JSONResponse({"error": "origin not allowed"}, status_code=403)
+    actor = mcp_actor(request)
+    if actor is None:
+        auth = request.headers.get("authorization", "")
+        return mcp_unauthorized(request, "invalid_token" if auth else "")
+    try:
+        msg = json.loads(await request.body())
+    except Exception:
+        return JSONResponse(mcpserver.rpc_error(None, -32700, "parse error"), status_code=400)
+
+    if isinstance(msg, list):
+        if not msg:
+            return JSONResponse(mcpserver.rpc_error(None, -32600, "empty batch"),
+                                status_code=400)
+        out = [r for r in [await mcp.handle(m, actor) for m in msg] if r is not None]
+        return JSONResponse(out) if out else Response(status_code=202)
+    reply = await mcp.handle(msg, actor)
+    if reply is None:
+        return Response(status_code=202)
+    return JSONResponse(reply)
+
+
+@app.get("/mcp")
+@app.delete("/mcp")
+def mcp_other(request: Request):
+    # 405 on GET is how Streamable HTTP says "no server-initiated SSE stream";
+    # DELETE is session teardown, and this server keeps no sessions.
+    return Response(status_code=405, headers={"Allow": "POST"})
+
+
+@app.get("/.well-known/oauth-protected-resource")
+@app.get("/.well-known/oauth-protected-resource/mcp")
+def protected_resource_metadata(request: Request):
+    base = public_base(request)
+    return JSONResponse({
+        "resource": base + "/mcp",
+        "authorization_servers": [base],
+        "bearer_methods_supported": ["header"],
+        "scopes_supported": [mcpoauth.SCOPE],
+        "resource_name": "Claude Memory",
+    })
+
+
+@app.get("/.well-known/oauth-authorization-server")
+@app.get("/.well-known/oauth-authorization-server/mcp")
+@app.get("/.well-known/openid-configuration")
+def authorization_server_metadata(request: Request):
+    base = public_base(request)
+    return JSONResponse({
+        "issuer": base,
+        "authorization_endpoint": base + "/oauth/authorize",
+        "token_endpoint": base + "/oauth/token",
+        "registration_endpoint": base + "/oauth/register",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none"],
+        "scopes_supported": [mcpoauth.SCOPE],
+        "authorization_response_iss_parameter_supported": True,
+    })
+
+
+def oauth_json_error(exc):
+    return JSONResponse(exc.body(), status_code=exc.status,
+                        headers={"Cache-Control": "no-store"})
+
+
+@app.post("/oauth/register")
+async def oauth_register(request: Request):
+    key = webauth.client_key(request)
+    if not register_throttle.allow(key):
+        return JSONResponse({"error": "slow_down"}, status_code=429)
+    register_throttle.record(key)   # every registration counts, not just failures
+    try:
+        meta = json.loads(await request.body())
+    except Exception:
+        return oauth_json_error(mcpoauth.OAuthError("invalid_client_metadata",
+                                                    "body must be JSON"))
+    try:
+        rec = oauth.register(meta)
+    except mcpoauth.OAuthError as exc:
+        return oauth_json_error(exc)
+    sys.stderr.write("memory: registered oauth client %s (%s)\n"
+                     % (rec["client_id"], rec["client_name"]))
+    return JSONResponse(rec, status_code=201, headers={"Cache-Control": "no-store"})
+
+
+AUTHZ_FIELDS = ("response_type", "client_id", "redirect_uri", "code_challenge",
+                "code_challenge_method", "state", "scope", "resource")
+
+
+def authz_page(title: str, body: str, status: int = 200):
+    return HTMLResponse(
+        "<!doctype html><meta charset=utf-8>"
+        "<meta name=viewport content='width=device-width,initial-scale=1'>"
+        "<title>%s</title><body style='font:15px system-ui;margin:3rem auto;"
+        "max-width:32rem;padding:0 1rem;line-height:1.5'>%s" % (esc(title), body),
+        status_code=status,
+        # The consent button must never be clickable inside someone else's frame.
+        headers={"X-Frame-Options": "DENY",
+                 "Content-Security-Policy": "frame-ancestors 'none'",
+                 "Cache-Control": "no-store",
+                 # same-origin, NOT no-referrer: under no-referrer the browser
+                 # sends "Origin: null" on the consent form's POST, and the
+                 # Origin check there refuses every Allow (found live
+                 # 2026-09-25). same-origin still keeps state/code_challenge
+                 # out of any cross-site Referer.
+                 "Referrer-Policy": "same-origin"},
+    )
+
+
+def authz_validate(request: Request, p: dict):
+    """Check an authorization request. Returns (client, error_response).
+
+    Errors before the redirect URI is trusted are shown here, never redirected
+    (RFC 6749 s4.1.2.1): redirecting on an unverified URI is an open redirect.
+    """
+    client = oauth.client(p.get("client_id", ""))
+    if not client:
+        return None, authz_page("Unknown client", "<h1>Unknown client</h1><p>This "
+                                "connector is not registered here. Remove it and add it "
+                                "again.</p>", 400)
+    if not mcpoauth.redirect_matches(client["redirect_uris"], p.get("redirect_uri", "")):
+        return None, authz_page("Bad redirect", "<h1>Redirect URI mismatch</h1>", 400)
+
+    def back(error: str, desc: str):
+        q = {"error": error, "error_description": desc}
+        if p.get("state"):
+            q["state"] = p["state"]
+        sep = "&" if "?" in p["redirect_uri"] else "?"
+        return RedirectResponse(p["redirect_uri"] + sep + urllib.parse.urlencode(q),
+                                status_code=303)
+
+    if p.get("response_type") != "code":
+        return None, back("unsupported_response_type", "only code is supported")
+    if p.get("code_challenge_method") != "S256" or len(p.get("code_challenge", "")) < 43:
+        return None, back("invalid_request", "PKCE with S256 is required")
+    resource = (p.get("resource") or mcp_resource(request)).rstrip("/")
+    if resource != mcp_resource(request):
+        return None, back("invalid_target", "unknown resource")
+    return client, None
+
+
+@app.get("/oauth/authorize")
+def oauth_authorize(request: Request):
+    p = {k: request.query_params.get(k, "") for k in AUTHZ_FIELDS}
+    client, err = authz_validate(request, p)
+    if err:
+        return err
+
+    here = "/oauth/authorize?" + urllib.parse.urlencode({**p, "hop": "1"})
+    # The session cookie is SameSite=Strict, and this request is the tail of a
+    # cross-site navigation from claude.ai, so it arrives without it. Hop once
+    # through a navigation this page starts itself: that one is same-site and
+    # carries the cookie. Same trick as oauth_callback.
+    if request.query_params.get("hop") != "1":
+        return authz_page("Continue", "<script>location.replace(%s)</script>"
+                          "<p><a href='%s'>Continue</a></p>"
+                          % (js_string(here), esc(here)))
+
+    info = session.read(request.cookies.get(webauth.COOKIE_NAME), creds.keyver)
+    name = esc(client["name"])
+    dest = esc(urllib.parse.urlsplit(p["redirect_uri"]).netloc)
+    if not info:
+        buttons = "".join(
+            "<p><a href='/auth/%s?next=%s'>Sign in with %s</a></p>"
+            % (n, esc(urllib.parse.quote(here, safe="")),
+               esc(webauth.PROVIDERS[n]["label"]))
+            for n in creds.enabled_providers)
+        return authz_page("Sign in", (
+            "<h1 style='font-size:1.2rem'>Sign in to connect <b>%s</b></h1>%s"
+            "<p style='color:#666'>Or sign in on the <a href='/' target=_blank>main "
+            "page</a> with the token, then reload this tab.</p>")
+            % (name, buttons or "<p>No sign-in provider is configured.</p>"))
+
+    hidden = "".join("<input type=hidden name='%s' value='%s'>" % (k, esc(v))
+                     for k, v in p.items())
+    who = esc(info.email or "token session")
+    return authz_page("Allow access?", (
+        "<h1 style='font-size:1.2rem'>Allow <b>%s</b> to use your memory store?</h1>"
+        "<p>It will be able to <b>read and write every category and doc</b>, exactly as "
+        "an API key can. After you allow it, you are sent to <b>%s</b>.</p>"
+        "<p style='color:#666'>Signed in as %s. Revoke it any time under API keys.</p>"
+        "<form method=post action='/oauth/authorize'>%s"
+        "<button name=decision value=allow style='font-size:1rem;padding:.5rem 1.2rem'>"
+        "Allow</button> <button name=decision value=deny style='font-size:1rem;"
+        "padding:.5rem 1.2rem'>Deny</button></form>") % (name, dest, who, hidden))
+
+
+@app.post("/oauth/authorize")
+async def oauth_authorize_post(request: Request):
+    # A cross-site form cannot carry the Strict cookie, and a same-origin one
+    # carries a matching Origin. Both are checked; either alone would do.
+    origin = (request.headers.get("origin") or "").rstrip("/")
+    if origin != public_base(request):
+        return authz_page("Refused", "<h1>Refused</h1><p>Bad origin.</p>", 403)
+    info = session.read(request.cookies.get(webauth.COOKIE_NAME), creds.keyver)
+    if not info:
+        return authz_page("Signed out", "<h1>Your session expired</h1><p>Go back to "
+                          "Claude and connect again.</p>", 401)
+    form = urllib.parse.parse_qs((await request.body()).decode("utf-8", "replace"))
+    p = {k: (form.get(k) or [""])[0] for k in AUTHZ_FIELDS}
+    client, err = authz_validate(request, p)
+    if err:
+        return err
+    q = {}
+    if (form.get("decision") or [""])[0] == "allow":
+        q["code"] = oauth.issue_code(p["client_id"], p["redirect_uri"], p["code_challenge"],
+                                     mcp_resource(request), info.email or info.subject)
+        sys.stderr.write("memory: oauth consent for %s by %s\n"
+                         % (client["name"], info.email or info.subject))
+    else:
+        q["error"] = "access_denied"
+    if p.get("state"):
+        q["state"] = p["state"]
+    q["iss"] = public_base(request)
+    sep = "&" if "?" in p["redirect_uri"] else "?"
+    return RedirectResponse(p["redirect_uri"] + sep + urllib.parse.urlencode(q),
+                            status_code=303)
+
+
+@app.post("/oauth/token")
+async def oauth_token(request: Request):
+    key = webauth.client_key(request)
+    if not token_throttle.allow(key):
+        return JSONResponse({"error": "slow_down"}, status_code=429)
+    form = urllib.parse.parse_qs((await request.body()).decode("utf-8", "replace"))
+    f = {k: v[0] for k, v in form.items() if v}
+    resource = (f.get("resource") or "").rstrip("/")
+    if resource and resource != mcp_resource(request):
+        return oauth_json_error(mcpoauth.OAuthError("invalid_target", "unknown resource"))
+    try:
+        grant_type = f.get("grant_type")
+        if grant_type == "authorization_code":
+            out = oauth.redeem_code(f.get("code", ""), f.get("client_id", ""),
+                                    f.get("redirect_uri", ""), f.get("code_verifier", ""),
+                                    resource)
+        elif grant_type == "refresh_token":
+            out = oauth.refresh(f.get("refresh_token", ""), f.get("client_id", ""), resource)
+        else:
+            raise mcpoauth.OAuthError("unsupported_grant_type")
+    except mcpoauth.OAuthError as exc:
+        token_throttle.record(key)
+        return oauth_json_error(exc)
+    return JSONResponse(out, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+
+
+@app.delete("/auth/grants/{grant_id}")
+def delete_grant(request: Request, grant_id: str):
+    require_browser(request)
+    if not oauth.revoke(grant_id):
+        raise HTTPException(status_code=404, detail="no such connection")
+    sys.stderr.write("memory: revoked oauth grant %s\n" % grant_id)
+    return JSONResponse({"deleted": grant_id})
 
 
 # --------------------------------------------------------------------------

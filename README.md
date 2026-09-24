@@ -166,6 +166,33 @@ Login is throttled per client IP. FastAPI's own `/docs`, `/redoc` and
 thing readable without auth, and `/docs` is now the working-documents namespace
 described above.
 
+### MCP connector (`/mcp`)
+
+`POST /mcp` is a Model Context Protocol server (Streamable HTTP, stateless,
+plain JSON replies) exposing the store as eight tools: `memory_list`,
+`memory_index`, `memory_search`, `memory_get`, `memory_write`,
+`memory_delete`, `memory_history`, `memory_pins`. Each one calls the REST route
+above in-process, so ETag preconditions, the roster gate and git commits apply
+unchanged. A write takes the `etag` that `memory_get` returned; there is no
+client-side cache to lean on.
+
+- **claude.ai / the Claude apps**: Settings → Connectors → Add custom connector,
+  URL `https://<host>/mcp`. Claude registers itself (RFC 7591), sends you to
+  `/oauth/authorize`, you sign in with Google/GitHub and click Allow. The
+  connection is listed under *Connected apps* on `/#/keys` and disconnects there.
+- **Claude Code**: `claude mcp add --transport http memory https://<host>/mcp`
+  runs the same OAuth flow through a loopback redirect, or add
+  `--header "Authorization: Bearer <mem_ key>"` to skip it.
+
+`mcpoauth.py` is the authorization server. Registration is open, as the spec
+requires, but a code is only ever redirected to Claude's own callback or a
+loopback URI, only after a signed-in owner clicks Allow, and only to the holder
+of the PKCE verifier. Access tokens last an hour and are accepted by `/mcp`
+alone — never by the REST API. Refresh tokens last 90 days from last use and are
+not rotated (see the module docstring). Grants live in `mcpoauth.json` (mode
+600, hashes only). Set `MEMORY_PUBLIC_URL` if the Host header ever stops being
+the public name.
+
 ## Files
 
 | Path | Deployed to | What |
@@ -174,9 +201,12 @@ described above.
 | `webauth.py` | `$APP_DIR/webauth.py` | HMAC cookie sessions, the OAuth provider table, login throttle |
 | `manage_auth.py` | `$APP_DIR/manage_auth.py` | administers `auth.json`: provider clients, allowlists, `keyver` |
 | `apikeys.py` | `$APP_DIR/apikeys.py` | named revocable bearer keys, minted from the browser |
+| `mcpserver.py` | `$APP_DIR/mcpserver.py` | `/mcp`: JSON-RPC dispatch and the eight tools |
+| `mcpoauth.py` | `$APP_DIR/mcpoauth.py` | OAuth 2.1 server for `/mcp`: registration, codes, grants |
+| `versiongate.py` | `$APP_DIR/versiongate.py` | 426 for `memapi.py` clients below `min-client` |
 | `web/` | `$APP_DIR/web/` | `index.html`, `app.css`, `app.js`, `md.js`, `diff.js` |
 | `test-web.sh` | `$APP_DIR/test-web.sh` | server test suite, run on the box |
-| `tests/` | `$APP_DIR/tests/` | unit tests: `test_webauth.py` (offline), `test_etag_regression.py` |
+| `tests/` | `$APP_DIR/tests/` | unit tests: `test_webauth.py` (offline), `test_etag_regression.py`; `test_mcp_live.py` runs the whole connector flow against a live app |
 | `memapi.py` | anywhere on a client | command-line client for this API |
 | `devstub.py` | — | fake backend for local UI work, dev only |
 | `rendertest.js` | — | 28 checks over `md.js` / `diff.js`, dev only |

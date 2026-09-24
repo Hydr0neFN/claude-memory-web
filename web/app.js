@@ -1447,7 +1447,42 @@
       });
       html.push('</tbody></table>');
     }
+
+    var grants = data.grants || [];
+    html.push('<h2 class="keyh2">Connected apps</h2>',
+      '<p class="vsub">MCP connectors you allowed through the sign-in page ' +
+      '(claude.ai, the Claude apps, Claude Code). Each one reaches only ' +
+      '<code>/mcp</code>. Disconnecting takes effect at its next request.</p>');
+    if (!grants.length) {
+      html.push('<p class="vsub">None connected.</p>');
+    } else {
+      html.push('<table class="keytable"><thead><tr><th>App</th><th>Allowed by</th>' +
+                '<th>Created</th><th>Last refreshed</th><th></th></tr></thead><tbody>');
+      grants.forEach(function (g) {
+        html.push('<tr><td>' + e(g.client_name) + '</td><td class="muted small">' +
+          e(g.email || '') + '</td><td class="muted small">' +
+          e((g.created || '').slice(0, 10)) + '</td><td class="muted small">' +
+          e(g.last_used ? g.last_used.slice(0, 10) : 'never') +
+          '</td><td><button class="btn small danger" data-grant="' + e(g.id) +
+          '" data-name="' + e(g.client_name) + '">Disconnect</button></td></tr>');
+      });
+      html.push('</tbody></table>');
+    }
     main(html.join(''));
+
+    Array.prototype.forEach.call(document.querySelectorAll('[data-grant]'), function (b) {
+      b.onclick = function () {
+        if (!confirm('Disconnect "' + b.getAttribute('data-name') + '"?')) return;
+        api('/auth/grants/' + encodeURIComponent(b.getAttribute('data-grant')),
+            { method: 'DELETE' })
+          .then(function (res) {
+            if (!res.ok) return res.text().then(function (t) { throw new Error(detail(t, res.status)); });
+            toast('Disconnected');
+            viewKeys();
+          })
+          .catch(function (err2) { toast(err2.message, true); });
+      };
+    });
 
     $('key-new').addEventListener('submit', function (ev) {
       ev.preventDefault();
