@@ -11,7 +11,8 @@ SessionStart hook (`claude-code-sessionstart/*`), claude.ai and every other
 caller are untouched. `GET /docs/memapi-client` is always allowed, since it is
 how an old client fetches its replacement.
 
-The minimum lives in the file `min-client` next to this module ("2.1"), read
+The minimum lives in the file `min-client` next to this module ("2.1") --
+or wherever MEMORY_MIN_CLIENT_FILE points, for a per-instance gate -- read
 per request by mtime, so raising it needs neither a deploy nor a restart:
     echo 2.2 > /opt/claude-memory/min-client
 "0" or a missing/garbled file means "no minimum". Every failure path lets the
@@ -24,7 +25,8 @@ import json
 import os
 import re
 
-MIN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "min-client")
+MIN_FILE = (os.environ.get("MEMORY_MIN_CLIENT_FILE")
+            or os.path.join(os.path.dirname(os.path.abspath(__file__)), "min-client"))
 UA_RE = re.compile(rb"^claude-code-memapi/(\d+(?:\.\d+)*)")
 EXEMPT = {("GET", "/docs/memapi-client")}
 

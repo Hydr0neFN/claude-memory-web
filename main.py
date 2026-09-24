@@ -35,10 +35,14 @@ import searchrank
 import versiongate
 import webauth
 
-load_dotenv()
+# One code directory can serve several instances, each with its own state (see
+# README "Running several instances"). MEMORY_ENV_FILE names that instance's
+# .env; without it python-dotenv searches upward from this file and would hand
+# a second instance the first one's settings for any key its own env lacks.
+load_dotenv(os.environ.get("MEMORY_ENV_FILE") or None)
 
 TOKEN = os.environ["CLAUDE_MEMORY_TOKEN"]
-DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR = Path(os.environ.get("MEMORY_DATA_DIR") or (Path(__file__).parent / "data"))
 DOCS_DIR = DATA_DIR / "docs"
 WEB_DIR = Path(__file__).parent / "web"
 CATEGORY_RE = re.compile(r"^[a-z0-9-]+$")

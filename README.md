@@ -254,6 +254,30 @@ Category writes are git-committed in `data/`, so a bad edit is recoverable via
 Bump the `?v=` query on the `<script>`/`<link>` tags in `index.html` when
 shipping JS or CSS, or browsers will keep serving the old copy.
 
+## Running several instances
+
+One code directory can serve several fully separate stores -- one process per
+user, each on its own port and hostname. Everything an instance owns is named
+by an environment variable; unset, each falls back to the file next to the
+code, which is how a single install has always worked.
+
+| Variable | Default (next to the code) | What |
+|---|---|---|
+| `MEMORY_ENV_FILE` | python-dotenv's upward search | this instance's `.env` |
+| `MEMORY_DATA_DIR` | `data/` | categories, `docs/`, the git history |
+| `MEMORY_AUTH_FILE` | `auth.json` | sign-in providers, allowlists, `keyver` |
+| `MEMORY_KEYS_FILE` | `apikeys.json` | named `mem_` keys |
+| `MEMORY_OAUTH_FILE` | `mcpoauth.json` | MCP connector grants |
+| `MEMORY_MIN_CLIENT_FILE` | `min-client` | memapi version gate |
+| `MEMORY_PUBLIC_URL` | the request's Host | issuer / resource URL for `/mcp` |
+
+Set `MEMORY_ENV_FILE` whenever the code directory also holds another
+instance's `.env`: python-dotenv never overrides a variable that is already
+set, but it fills in every one that is missing, so a second instance would
+otherwise inherit the first one's `MEMORY_PUBLIC_URL` or provider settings.
+Each instance needs its own `CLAUDE_MEMORY_TOKEN`; tokens, cookies, `mem_`
+keys and `mcpa_` tokens from one are refused by every other.
+
 ## Notes
 
 - The static mount must stay the **last** statement in `main.py`. Starlette
