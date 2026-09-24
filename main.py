@@ -1700,7 +1700,8 @@ def authz_validate(request: Request, p: dict):
         return None, authz_page("Bad redirect", "<h1>Redirect URI mismatch</h1>", 400)
 
     def back(error: str, desc: str):
-        q = {"error": error, "error_description": desc}
+        # iss on errors too: the metadata advertises RFC 9207 support.
+        q = {"error": error, "error_description": desc, "iss": public_base(request)}
         if p.get("state"):
             q["state"] = p["state"]
         sep = "&" if "?" in p["redirect_uri"] else "?"

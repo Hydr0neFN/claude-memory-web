@@ -226,7 +226,14 @@ class Store:
                         if c not in used and now - int(rec.get("issued", 0)) > UNUSED_CLIENT_SECONDS]:
                 del clients[cid]
             if len(clients) >= MAX_CLIENTS:
-                raise OAuthError("invalid_client_metadata", "too many registered clients", 429)
+                # Evict the oldest never-used registration rather than refuse:
+                # registration is anonymous, so refusing would let anyone with
+                # enough IPs lock the real connector out for a day.
+                unused = sorted((c for c in clients if c not in used),
+                                key=lambda c: int(clients[c].get("issued", 0)))
+                if not unused:
+                    raise OAuthError("invalid_client_metadata", "too many registered clients", 429)
+                del clients[unused[0]]
             cid = "mcpc_" + secrets.token_urlsafe(16)
             clients[cid] = {"name": clean_name(meta.get("client_name")),
                             "redirect_uris": list(uris), "issued": now}

@@ -538,7 +538,12 @@ class Throttle:
     def allow(self, key: str) -> bool:
         now = time.time()
         lst = [t for t in self.hits.get(key, []) if now - t < self.window]
-        self.hits[key] = lst
+        # Drop an emptied key: the OAuth endpoints are public, and every
+        # scanner IP would otherwise leave an [] behind for the process life.
+        if lst:
+            self.hits[key] = lst
+        else:
+            self.hits.pop(key, None)
         return len(lst) < self.max
 
     def record(self, key: str) -> None:

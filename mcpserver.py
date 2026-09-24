@@ -210,7 +210,8 @@ async def asgi_call(app, method: str, path: str, query: dict, headers: dict,
 
     Returns (status, headers-dict with lowercase keys, body bytes).
     """
-    query = {k: v for k, v in query.items() if v not in (None, "", False)}
+    query = {k: v for k, v in query.items()
+             if v is not None and v is not False and v != ""}
     qs = urllib.parse.urlencode(query, quote_via=urllib.parse.quote)
     raw_headers = [(k.lower().encode("latin-1"), v.encode("latin-1"))
                    for k, v in headers.items()]
