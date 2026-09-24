@@ -28,6 +28,7 @@ from fastapi.staticfiles import StaticFiles
 
 import apikeys
 import searchrank
+import versiongate
 import webauth
 
 load_dotenv()
@@ -88,6 +89,7 @@ DOCS_DIR.mkdir(parents=True, exist_ok=True)
 # No /docs, /redoc or /openapi.json: this app is on a public hostname and the
 # schema is the one thing here that needs no auth to be interesting.
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+app.add_middleware(versiongate.VersionGate)  # refuse too-old memapi clients; see versiongate.py
 
 session = webauth.Session(TOKEN)
 creds = webauth.Credentials()
