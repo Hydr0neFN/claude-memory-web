@@ -206,7 +206,7 @@ the public name.
 | `versiongate.py` | `$APP_DIR/versiongate.py` | 426 for `memapi.py` clients below `min-client` |
 | `web/` | `$APP_DIR/web/` | `index.html`, `app.css`, `app.js`, `md.js`, `diff.js` |
 | `test-web.sh` | `$APP_DIR/test-web.sh` | server test suite, run on the box |
-| `tests/` | `$APP_DIR/tests/` | unit tests: `test_webauth.py` (offline), `test_etag_regression.py`; `test_mcp_live.py` runs the whole connector flow against a live app |
+| `tests/` | `$APP_DIR/tests/` | unit tests: `test_webauth.py` (offline), `test_etag_regression.py`; `test_mcp_live.py` runs the whole connector flow against a live app; `test_isolation_live.py` proves two instances refuse each other's credentials |
 | `memapi.py` | anywhere on a client | command-line client for this API |
 | `devstub.py` | — | fake backend for local UI work, dev only |
 | `rendertest.js` | — | 28 checks over `md.js` / `diff.js`, dev only |
