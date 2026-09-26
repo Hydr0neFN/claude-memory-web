@@ -1410,7 +1410,7 @@
     api('/auth/keys').then(function (res) {
       if (!res.ok) {
         return res.text().then(function (t) {
-          main('<div class="vhead"><h1>API keys</h1></div>' +
+          main('<div class="vhead"><h1>MCP access</h1></div>' +
                '<p class="vsub error">' + e(detail(t, res.status)) + '</p>');
         });
       }
@@ -1420,7 +1420,19 @@
 
   function renderKeys(data) {
     var rows = data.keys || [];
-    var html = ['<div class="vhead"><h1>API keys</h1></div>',
+    var mcpUrl = location.origin + '/mcp';
+    var html = ['<div class="vhead"><h1>MCP access</h1></div>',
+      '<p class="vsub">Claude reads and writes this store through its MCP server at ' +
+      '<code>' + e(mcpUrl) + '</code>. Two ways to connect:</p>',
+      '<ul class="vsub mcphow">',
+      '<li><strong>claude.ai / the Claude apps</strong> — Settings → Connectors ' +
+      '→ Add custom connector with that URL, then sign in here and click Allow. ' +
+      'It shows up under <em>Connected apps</em> below.</li>',
+      '<li><strong>Claude Code</strong> — create a key below and paste the command ' +
+      'it comes with. Without <code>--header</code> the same command goes through ' +
+      'the sign-in page instead.</li>',
+      '</ul>',
+      '<h2 class="keyh2">Keys</h2>',
       '<p class="vsub">A key is a bearer credential for one device or agent: it ' +
       'reads and writes the store exactly as the master token does, but deleting ' +
       'it disturbs nothing else. Keys cannot mint or delete other keys \u2014 that ' +
@@ -1507,8 +1519,10 @@
             '<div class="keyshow"><p><strong>' + e(k.name) + '</strong> created. ' +
             'Copy it now \u2014 it is never shown again.</p>' +
             '<code id="key-val">' + e(k.value) + '</code>' +
-            '<p class="muted small">Use it as <code>Authorization: Bearer &lt;key&gt;</code>, ' +
-            'for example as the bearer key of an MCP client.</p></div>';
+            '<p class="muted small">Add it to Claude Code (user scope, every project):</p>' +
+            '<code>' + e('claude mcp add --transport http --scope user memory ' +
+              location.origin + '/mcp --header "Authorization: Bearer ' + k.value + '"') +
+            '</code></div>';
           viewKeysRefresh();
         });
       }).catch(function (e2) {

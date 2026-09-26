@@ -2,19 +2,62 @@
 
 # claude-memory-web
 
-Browser UI for a personal [Claude Memory API](#what-the-api-is) — a small
-FastAPI service that stores categorised Markdown notes so Claude sessions share
-long-term memory across machines. This repo adds a front end served by that same
-app at `/`, so there is no CORS, no second host and no build step.
+A personal long-term memory store for Claude — a small FastAPI service that
+keeps categorised Markdown notes, git-commits every write, and serves them to
+Claude as an [MCP server](#connecting-claude-mcp) at `/mcp`, so every Claude
+session — Claude Code on any machine, claude.ai, the Claude apps — reads and
+writes the same memory. The same app serves a browser UI at `/` for people, so
+there is no CORS, no second host and no build step.
 
 Vanilla JS, no npm, no CDN, no dependencies. It runs off a Raspberry Pi 4.
 
 ![no build step](https://img.shields.io/badge/build-none-informational)
 
+## Connecting Claude (MCP)
+
+`POST /mcp` is a Model Context Protocol server (Streamable HTTP, stateless,
+plain JSON replies) exposing the store as eight tools: `memory_list`,
+`memory_index`, `memory_search`, `memory_get`, `memory_write`,
+`memory_delete`, `memory_history`, `memory_pins`. This is how Claude reaches the
+store; there is no client to install and nothing on the client side to keep
+up to date, since the tools and their instructions come from the server.
+
+- **claude.ai / the Claude apps**: Settings → Connectors → Add custom connector,
+  URL `https://<host>/mcp`. Claude registers itself (RFC 7591), sends you to
+  `/oauth/authorize`, you sign in with Google/GitHub and click Allow. The
+  connection is listed under *Connected apps* on the UI's MCP page (`/#/keys`)
+  and disconnects there.
+- **Claude Code**: mint a key on the MCP page, which hands back the finished
+  command:
+
+  ```bash
+  claude mcp add --transport http --scope user memory https://<host>/mcp \
+    --header "Authorization: Bearer <mem_ key>"
+  ```
+
+  Leave out `--header` to go through the same OAuth sign-in via a loopback
+  redirect instead.
+
+Each tool calls the [REST route](#what-the-api-is) underneath in-process, so
+ETag preconditions, the roster gate and git commits apply unchanged. A write
+takes the `etag` that `memory_get` returned; there is no client-side cache to
+lean on.
+
+`mcpoauth.py` is the authorization server. Registration is open, as the spec
+requires, but a code is only ever redirected to Claude's own callback or a
+loopback URI, only after a signed-in owner clicks Allow, and only to the holder
+of the PKCE verifier. Access tokens last an hour and are accepted by `/mcp`
+alone — never by the REST API. Refresh tokens last 90 days from last use and are
+not rotated (see the module docstring). Grants live in `mcpoauth.json` (mode
+600, hashes only). Set `MEMORY_PUBLIC_URL` if the Host header ever stops being
+the public name.
+
 ## What the API is
 
-The backend stores one Markdown file per category, guarded by a single bearer
-token, and git-commits every write so any edit is recoverable. Reads are
+Underneath the MCP tools and the browser UI is one REST API; both call it, and
+neither reimplements any of its rules. It stores one Markdown file per category,
+guarded by a single bearer token, and git-commits every write so any edit is
+recoverable. Reads are
 `GET /memory/{category}`; writes need `If-Match` with the ETag you read, which
 is the git blob SHA of the body. `main.py` and `webauth.py` here are the whole
 server.
@@ -75,14 +118,18 @@ name.
 - **History** — git revisions, per-revision view, diff against current, and
   restore-as-a-forward-commit (never a rewrite).
 - **Search** across the whole corpus, with jump-to-line.
+- **MCP page** — how to connect claude.ai and Claude Code, minting and deleting
+  keys (each new one comes with its `claude mcp add` command), and the list of
+  connected apps with a disconnect button.
 
 ## Auth
 
 Two ways in, deliberately asymmetric.
 
-**Agents** keep using the bearer token — unchanged, and never asked for a second
-factor. Whoever holds the token can already read and write the whole store
-through the API, so a second factor at the browser door would guard nothing.
+**Agents** — Claude over MCP — present a bearer credential: a `mem_` key or an
+OAuth grant from the connector flow, never asked for a second factor. Whoever
+holds one can already read and write the whole store, so a second factor at the
+browser door would guard nothing.
 
 **People** sign in with GitHub or Google, so a phone can read the store without
 holding the token. The second factor is the one already on that account; an
@@ -114,10 +161,10 @@ manage. `keyver` in `auth.json` is the same lever without touching the token:
 bump it and every browser session dies while every agent keeps working
 (`manage_auth.py sign-out-everyone`).
 
-### API keys
+### Keys
 
-A signed-in browser can mint named bearer keys at `/#/keys` — one per device or
-agent. A key reads and writes the store exactly as the master token does, but
+A signed-in browser can mint named bearer keys on the MCP page (`/#/keys`) —
+one per device or agent. A key reads and writes the store exactly as the master token does, but
 deleting it disturbs nothing else, which is what makes a lost phone answerable
 without rotating the token and signing every browser and agent out at once.
 
@@ -127,8 +174,8 @@ once and never stored — `apikeys.json` (mode 600, beside `main.py`, never insi
 `data/`) holds only its SHA-256. A 256-bit `secrets.token_urlsafe` needs no slow
 KDF; there is nothing to brute-force.
 
-Use one as `Authorization: Bearer <key>` — for example as the key an MCP client
-sends to `/mcp`.
+A key is what Claude Code sends to `/mcp` as `Authorization: Bearer <key>`; the
+page shows the ready `claude mcp add` command next to the new secret.
 
 ### Configuring a provider
 
@@ -165,33 +212,6 @@ Login is throttled per client IP. FastAPI's own `/docs`, `/redoc` and
 `/openapi.json` are disabled — on a public hostname the schema was the only
 thing readable without auth, and `/docs` is now the working-documents namespace
 described above.
-
-### MCP connector (`/mcp`)
-
-`POST /mcp` is a Model Context Protocol server (Streamable HTTP, stateless,
-plain JSON replies) exposing the store as eight tools: `memory_list`,
-`memory_index`, `memory_search`, `memory_get`, `memory_write`,
-`memory_delete`, `memory_history`, `memory_pins`. Each one calls the REST route
-above in-process, so ETag preconditions, the roster gate and git commits apply
-unchanged. A write takes the `etag` that `memory_get` returned; there is no
-client-side cache to lean on.
-
-- **claude.ai / the Claude apps**: Settings → Connectors → Add custom connector,
-  URL `https://<host>/mcp`. Claude registers itself (RFC 7591), sends you to
-  `/oauth/authorize`, you sign in with Google/GitHub and click Allow. The
-  connection is listed under *Connected apps* on `/#/keys` and disconnects there.
-- **Claude Code**: `claude mcp add --transport http memory https://<host>/mcp`
-  runs the same OAuth flow through a loopback redirect, or add
-  `--header "Authorization: Bearer <mem_ key>"` to skip it.
-
-`mcpoauth.py` is the authorization server. Registration is open, as the spec
-requires, but a code is only ever redirected to Claude's own callback or a
-loopback URI, only after a signed-in owner clicks Allow, and only to the holder
-of the PKCE verifier. Access tokens last an hour and are accepted by `/mcp`
-alone — never by the REST API. Refresh tokens last 90 days from last use and are
-not rotated (see the module docstring). Grants live in `mcpoauth.json` (mode
-600, hashes only). Set `MEMORY_PUBLIC_URL` if the Host header ever stops being
-the public name.
 
 ## Files
 
