@@ -1051,7 +1051,8 @@
     if (kind === 'd') {
       var noteEl = $('note');
       var noteVal = noteEl ? (noteEl.value || '').trim() : '';
-      if (noteVal) headers['X-Memory-Note'] = noteVal;
+      // Header values must be Latin-1 or fetch() throws; the server unquotes.
+      if (noteVal) headers['X-Memory-Note'] = encodeURIComponent(noteVal);
     }
 
     $('save').disabled = true;

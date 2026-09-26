@@ -135,17 +135,21 @@ notify_reset() { rm -f "$STATE_DIR/notified.$1"; }
 
 peer_status() { $PEER_CTL status 2>/dev/null; }
 
-# Point every public hostname at NODE_TO; on a failure, point the ones already
-# moved back at NODE_BACK so no hostname is left split between tunnels: both
-# move, or neither does.
+# Point every public hostname at NODE_TO; on a failure, point EVERY hostname
+# not already there at NODE_BACK, so none is left split between tunnels: all
+# move, or none does. Not just the ones this call moved: a host skipped as
+# already at NODE_TO (left there by an earlier interrupted run) must go back
+# too, or the split outlives the rollback (ultrareview 2026-09-26 #3).
 dns_point_all() {
-    local to=$1 back=$2 h moved=""
+    local to=$1 back=$2 h
     for h in $PUBLIC_HOSTS; do
         [ "$($CF where "$h" 2>/dev/null)" = "$to" ] && continue   # resumable
-        if $CF point "$h" "$to"; then moved="$moved $h"
-        else
+        if ! $CF point "$h" "$to"; then
             log "CF point $h -> $to failed"
-            for h in $moved; do $CF point "$h" "$back" || log "CF rollback of $h failed"; done
+            for h in $PUBLIC_HOSTS; do
+                [ "$($CF where "$h" 2>/dev/null)" = "$back" ] && continue
+                $CF point "$h" "$back" || log "CF rollback of $h failed"
+            done
             return 1
         fi
     done

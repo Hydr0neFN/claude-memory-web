@@ -324,6 +324,12 @@ check "TW un-fenced and serving" "primary yes" "$(role_of tw) $(running tw yu-i)
 check "NL standby" standby "$(role_of nl)"
 grep -q "enable memvault-update" "$T/trace"; check "updater re-enabled on abort" 0 $?
 check "no two writers" 0 "$(violations)"
+# An earlier interrupted run left memory.test at NL: the loop skips it as
+# already moved, dad fails, and the rollback must still bring memory.test back.
+echo nl > "$T/dns.memory.test"
+on nl mem-promote-nl "split drill"; check "promote from a split state aborts" 1 $?
+check "rollback un-splits a host this run did not move" tw,tw "$(dns)"
+check "no two writers after split rollback" 0 "$(violations)"
 rm -f "$T/cf_fail_dad-memory.test"
 
 echo "=== 13. input hardening ==="

@@ -18,6 +18,7 @@ import re
 import secrets
 import subprocess
 import sys
+import asyncio
 import threading
 import time
 import urllib.parse
@@ -28,6 +29,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 
 import apikeys
 import mcpoauth
@@ -441,7 +443,29 @@ def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     )
 
 
+# Every write -- precondition check, file write, git commit -- runs as one
+# unit: in the threadpool, so a slow commit (up to git()'s 30 s timeout) does
+# not stall the event loop, and under one asyncio lock, so a second write can
+# neither slip its file in between another's write and commit (bundling both
+# into one commit under the wrong subject) nor queue a commit behind the
+# READONLY drain. At most one worker thread is ever busy with git. The
+# threading lock in git_commit() is belt and braces for any other caller.
+# Ultrareview 2026-09-26 #2.
+_write_lock = asyncio.Lock()
+_git_lock = threading.Lock()
+
+
+async def locked_write(fn):
+    async with _write_lock:
+        return await run_in_threadpool(fn)
+
+
 def git_commit(message: str) -> bool:
+    with _git_lock:
+        return _git_commit(message)
+
+
+def _git_commit(message: str) -> bool:
     """Commit the whole data dir. Never raises into the request path -- a
     write must succeed even if git fails (a stale .git/index.lock, a fork
     failure under memory pressure on this shared Pi).
@@ -1409,62 +1433,70 @@ async def put_category(
     # Body first: await is a yield point, so checking the precondition before it lets
     # two slow-uploading writers both pass the check before either writes.
     raw_body = await request.body()
-    require_precondition(path, request)
 
-    if section:
-        new_text, heading_name = section_put_text(
-            path, section, raw_body, mode, rename_to,
-            "category '%s' does not exist; PUT it whole (without ?section) "
-            "first, then upsert into it" % category,
-        )
-        path.write_bytes(new_text.encode("utf-8"))   # not write_text: os.linesep would reintroduce CRLF
-        out_body = new_text.encode("utf-8")
-        committed = git_commit(commit_subject("PUT", "%s#%s" % (category, heading_name), request))
+    def write():
+        require_precondition(path, request)
+
+        if section:
+            new_text, heading_name = section_put_text(
+                path, section, raw_body, mode, rename_to,
+                "category '%s' does not exist; PUT it whole (without ?section) "
+                "first, then upsert into it" % category,
+            )
+            path.write_bytes(new_text.encode("utf-8"))   # not write_text: os.linesep would reintroduce CRLF
+            out_body = new_text.encode("utf-8")
+            committed = git_commit(commit_subject("PUT", "%s#%s" % (category, heading_name), request))
+            return PlainTextResponse(
+                "OK", headers=commit_headers({"ETag": '"%s"' % blob_sha(out_body)}, committed)
+            )
+
+        existed = path.exists()
+        # Hash what we WROTE, not what arrived. Returning blob_sha(raw_body) after writing
+        # the normalised bytes hands the caller an ETag the write guard will reject on its
+        # very next request -- the original bug, reintroduced from the other end.
+        stored = normalise_body(raw_body)
+        path.write_bytes(stored)
+        committed = git_commit(commit_subject("PUT" if existed else "CREATE", category, request))
+
         return PlainTextResponse(
-            "OK", headers=commit_headers({"ETag": '"%s"' % blob_sha(out_body)}, committed)
+            "OK", headers=commit_headers({"ETag": '"%s"' % blob_sha(stored)}, committed)
         )
 
-    existed = path.exists()
-    # Hash what we WROTE, not what arrived. Returning blob_sha(raw_body) after writing
-    # the normalised bytes hands the caller an ETag the write guard will reject on its
-    # very next request -- the original bug, reintroduced from the other end.
-    stored = normalise_body(raw_body)
-    path.write_bytes(stored)
-    committed = git_commit(commit_subject("PUT" if existed else "CREATE", category, request))
-
-    return PlainTextResponse(
-        "OK", headers=commit_headers({"ETag": '"%s"' % blob_sha(stored)}, committed)
-    )
+    return await locked_write(write)
 
 
 @app.delete("/memory/{category}")
-def delete_category(category: str, request: Request, section: str = ""):
+async def delete_category(category: str, request: Request, section: str = ""):
     check_write_auth(request)
     path = validate_category(category)
     refuse_readonly(category)
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="not found")
-    require_precondition(path, request)
 
-    if section:
-        new_text = section_delete_text(
-            path, section,
-            "deleting section '%s' would leave '%s' empty; delete the whole "
-            "category instead (DELETE /memory/%s with no ?section)"
-            % (section, category, category),
-        )
-        path.write_bytes(new_text.encode("utf-8"))   # not write_text: os.linesep would reintroduce CRLF
-        committed = git_commit(commit_subject("DELETE", "%s#%s" % (category, section), request))
-        return PlainTextResponse(
-            "OK",
-            headers=commit_headers(
-                {"ETag": '"%s"' % blob_sha(new_text.encode("utf-8"))}, committed
-            ),
-        )
+    def write():
+        if not path.exists():
+            raise HTTPException(status_code=404, detail="not found")
+        require_precondition(path, request)
 
-    path.unlink()
-    committed = git_commit(commit_subject("DELETE", category, request))
-    return PlainTextResponse("OK", headers=commit_headers({}, committed))
+        if section:
+            new_text = section_delete_text(
+                path, section,
+                "deleting section '%s' would leave '%s' empty; delete the whole "
+                "category instead (DELETE /memory/%s with no ?section)"
+                % (section, category, category),
+            )
+            path.write_bytes(new_text.encode("utf-8"))   # not write_text: os.linesep would reintroduce CRLF
+            committed = git_commit(commit_subject("DELETE", "%s#%s" % (category, section), request))
+            return PlainTextResponse(
+                "OK",
+                headers=commit_headers(
+                    {"ETag": '"%s"' % blob_sha(new_text.encode("utf-8"))}, committed
+                ),
+            )
+
+        path.unlink()
+        committed = git_commit(commit_subject("DELETE", category, request))
+        return PlainTextResponse("OK", headers=commit_headers({}, committed))
+
+    return await locked_write(write)
 
 
 # --------------------------------------------------------------------------
@@ -1552,62 +1584,70 @@ async def put_doc(
     check_write_auth(request)
     path = validate_doc(slug)
     body = await request.body()   # see put_category: body before precondition
-    require_precondition(path, request)
 
-    if section:
-        new_text, heading_name = section_put_text(
-            path, section, body, mode, rename_to,
-            "doc '%s' does not exist; PUT it whole (without ?section) first, "
-            "then upsert into it" % slug,
-        )
-        path.write_bytes(new_text.encode("utf-8"))   # not write_text: os.linesep would reintroduce CRLF
-        out_body = new_text.encode("utf-8")
-        committed = git_commit(
-            commit_subject("PUT", "doc %s#%s" % (slug, heading_name), request)
-        )
+    def write():
+        require_precondition(path, request)
+
+        if section:
+            new_text, heading_name = section_put_text(
+                path, section, body, mode, rename_to,
+                "doc '%s' does not exist; PUT it whole (without ?section) first, "
+                "then upsert into it" % slug,
+            )
+            path.write_bytes(new_text.encode("utf-8"))   # not write_text: os.linesep would reintroduce CRLF
+            out_body = new_text.encode("utf-8")
+            committed = git_commit(
+                commit_subject("PUT", "doc %s#%s" % (slug, heading_name), request)
+            )
+            return PlainTextResponse(
+                "OK", headers=commit_headers({"ETag": '"%s"' % blob_sha(out_body)}, committed)
+            )
+
+        existed = path.exists()
+        stored = normalise_body(body)      # see put_category: hash what we wrote
+        path.write_bytes(stored)
+        committed = git_commit(commit_subject("PUT" if existed else "CREATE", "doc %s" % slug, request))
+
         return PlainTextResponse(
-            "OK", headers=commit_headers({"ETag": '"%s"' % blob_sha(out_body)}, committed)
+            "OK", headers=commit_headers({"ETag": '"%s"' % blob_sha(stored)}, committed)
         )
 
-    existed = path.exists()
-    stored = normalise_body(body)      # see put_category: hash what we wrote
-    path.write_bytes(stored)
-    committed = git_commit(commit_subject("PUT" if existed else "CREATE", "doc %s" % slug, request))
-
-    return PlainTextResponse(
-        "OK", headers=commit_headers({"ETag": '"%s"' % blob_sha(stored)}, committed)
-    )
+    return await locked_write(write)
 
 
 @app.delete("/docs/{slug}")
-def delete_doc(slug: str, request: Request, section: str = ""):
+async def delete_doc(slug: str, request: Request, section: str = ""):
     check_write_auth(request)
     path = validate_doc(slug)
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="not found")
-    require_precondition(path, request)
 
-    if section:
-        new_text = section_delete_text(
-            path, section,
-            "deleting section '%s' would leave doc '%s' empty; delete the "
-            "whole doc instead (DELETE /docs/%s with no ?section)"
-            % (section, slug, slug),
-        )
-        path.write_bytes(new_text.encode("utf-8"))   # not write_text: os.linesep would reintroduce CRLF
-        committed = git_commit(
-            commit_subject("DELETE", "doc %s#%s" % (slug, section), request)
-        )
-        return PlainTextResponse(
-            "OK",
-            headers=commit_headers(
-                {"ETag": '"%s"' % blob_sha(new_text.encode("utf-8"))}, committed
-            ),
-        )
+    def write():
+        if not path.exists():
+            raise HTTPException(status_code=404, detail="not found")
+        require_precondition(path, request)
 
-    path.unlink()
-    committed = git_commit(commit_subject("DELETE", "doc %s" % slug, request))
-    return PlainTextResponse("OK", headers=commit_headers({}, committed))
+        if section:
+            new_text = section_delete_text(
+                path, section,
+                "deleting section '%s' would leave doc '%s' empty; delete the "
+                "whole doc instead (DELETE /docs/%s with no ?section)"
+                % (section, slug, slug),
+            )
+            path.write_bytes(new_text.encode("utf-8"))   # not write_text: os.linesep would reintroduce CRLF
+            committed = git_commit(
+                commit_subject("DELETE", "doc %s#%s" % (slug, section), request)
+            )
+            return PlainTextResponse(
+                "OK",
+                headers=commit_headers(
+                    {"ETag": '"%s"' % blob_sha(new_text.encode("utf-8"))}, committed
+                ),
+            )
+
+        path.unlink()
+        committed = git_commit(commit_subject("DELETE", "doc %s" % slug, request))
+        return PlainTextResponse("OK", headers=commit_headers({}, committed))
+
+    return await locked_write(write)
 
 
 # --------------------------------------------------------------------------

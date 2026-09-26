@@ -319,6 +319,16 @@ old = s.read(s.sign(old_value, 1), 1)
 check("an hour-old session is still valid", bool(old), True)
 check("an hour-old session is not fresh for 15 min", old.fresh(900), False)
 
+# -- Throttle: bounded key memory (ultrareview #1 follow-up)
+gt2 = webauth.Throttle(max_attempts=2, window_sec=300)
+gt2.record("a"); gt2.record("a")
+check("per-key limit still applies", gt2.allow("a"), False)
+check("another key is still allowed", gt2.allow("b"), True)
+gt3 = webauth.Throttle(max_attempts=10 ** 6, window_sec=300)
+gt3.hits = {"old-%d" % n: [0.0] for n in range(webauth.Throttle.MAX_KEYS)}
+gt3.record("fresh")
+check("record sweeps expired keys past MAX_KEYS", len(gt3.hits), 1)
+
 print("----")
 print("PASS=%d FAIL=%d" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)

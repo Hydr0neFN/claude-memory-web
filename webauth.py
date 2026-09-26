@@ -41,6 +41,7 @@ import hmac
 import json
 import os
 import secrets
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -539,29 +540,46 @@ class Throttle:
     pointless, and neither credential here is guessable in the first place.
     """
 
+    # Past this many keys, record() drops every key whose last attempt is older
+    # than the window, so a stream of made-up keys (CF-Connecting-IP is
+    # client-supplied, see client_key) cannot grow the dict without bound.
+    MAX_KEYS = 4096
+
     def __init__(self, max_attempts: int = 5, window_sec: int = 300) -> None:
         self.max = max_attempts
         self.window = window_sec
         self.hits: dict = {}
+        # The sync OAuth routes call in from threadpool workers concurrently.
+        self._lock = threading.Lock()
 
     def allow(self, key: str) -> bool:
         now = time.time()
-        lst = [t for t in self.hits.get(key, []) if now - t < self.window]
-        # Drop an emptied key: the OAuth endpoints are public, and every
-        # scanner IP would otherwise leave an [] behind for the process life.
-        if lst:
-            self.hits[key] = lst
-        else:
-            self.hits.pop(key, None)
-        return len(lst) < self.max
+        with self._lock:
+            lst = [t for t in self.hits.get(key, []) if now - t < self.window]
+            # Drop an emptied key: the OAuth endpoints are public, and every
+            # scanner IP would otherwise leave an [] behind for the process life.
+            if lst:
+                self.hits[key] = lst
+            else:
+                self.hits.pop(key, None)
+            return len(lst) < self.max
 
     def record(self, key: str) -> None:
-        self.hits.setdefault(key, []).append(time.time())
+        now = time.time()
+        with self._lock:
+            if key not in self.hits and len(self.hits) >= self.MAX_KEYS:
+                self.hits = {k: v for k, v in self.hits.items()
+                             if v and now - v[-1] < self.window}
+            self.hits.setdefault(key, []).append(now)
 
 
 def client_key(request) -> str:
     """Throttle key. Behind the Cloudflare Tunnel the socket peer is always
-    127.0.0.1, so the real client only exists in CF-Connecting-IP."""
+    127.0.0.1, so the real client only exists in CF-Connecting-IP. A process
+    on this box calling the loopback port directly can forge it, and nothing in
+    the request tells it apart from cloudflared; closing that needs the tunnel
+    on a unix socket (ultrareview 2026-09-26 #1, deferred). The throttled
+    secrets are 256-bit, so the throttle is not what keeps them safe."""
     cf = (request.headers.get("cf-connecting-ip") or "").strip()
     if cf:
         return cf[:64]
