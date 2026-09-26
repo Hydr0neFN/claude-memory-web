@@ -8,7 +8,12 @@
 . "$(dirname "$(readlink -f "$0")")/lib.sh"
 : "${CF_TOKEN_FILE:=/etc/claude-memory/cf-dns.token}" "${CF_ZONE:?}" "${TUNNEL_tw:?}" "${TUNNEL_nl:?}"
 tok=$(cat "$CF_TOKEN_FILE" 2>/dev/null) || { log "no CF token"; exit 1; }
-api() { curl -sS -m 20 -H "Authorization: Bearer $tok" -H "Content-Type: application/json" "$@"; }
+# The token goes in on stdin as curl config, not as an -H argument: argv is
+# readable by every user on the box through ps / /proc/<pid>/cmdline.
+api() {
+    printf 'header = "Authorization: Bearer %s"\n' "$tok" \
+        | curl -sS -m 20 -K - -H "Content-Type: application/json" "$@"
+}
 record() {  # "<id> <content>" for the CNAME of $1
     api "https://api.cloudflare.com/client/v4/zones/$CF_ZONE/dns_records?type=CNAME&name=$1" \
         | python3 -c 'import json,sys; r=json.load(sys.stdin); x=r["result"]; assert r["success"] and len(x)==1; print(x[0]["id"], x[0]["content"])'

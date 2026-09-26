@@ -32,9 +32,10 @@ USAGE = """usage: manage_auth.py <command> [args]
                                from the terminal, never from argv, so it does
                                not land in shell history or /proc
   allow <provider> <email> ...  add addresses to that provider's allowlist
-  deny  <provider> <email> ...  remove addresses
-  disable <provider>           forget that provider's config entirely
-  sign-out-everyone            invalidate every browser session (bumps keyver)
+  deny  <provider> <email> ...  remove addresses (bumps keyver: signs everyone out)
+  disable <provider>           forget that provider's config entirely (bumps keyver)
+  sign-out-everyone            invalidate every browser session, and every key
+                               and connector created from one (bumps keyver)
 
   <provider> is one of: %s
 
@@ -167,13 +168,21 @@ def cmd_allow(argv, add: bool) -> None:
     if isinstance(current, str):
         current = [current]
     current = [str(e).strip().lower() for e in current]
+    removed = False
     for email in (norm(e) for e in argv[1:]):
         if add and email not in current:
             current.append(email)
         elif not add and email in current:
             current.remove(email)
+            removed = True
     cfg["allowed_emails"] = current
     data[name] = cfg
+    if removed:
+        # A session is a signed cookie the allowlist is never re-checked
+        # against, so a removed address would stay signed in for up to 30
+        # days. Bumping keyver ends every session (and every key and connector
+        # minted under it) -- the removed address included.
+        bump_keyver(data)
     save(data)
     cmd_status()
 
@@ -186,16 +195,23 @@ def cmd_disable(argv) -> None:
     if not data.pop(name, None):
         print("%s was not configured; nothing to do" % name)
         return
+    bump_keyver(data)   # sessions signed in through it would outlive it otherwise
     save(data)
     print("%s sign-in disabled. The API token still signs in at /." % name)
 
 
+def bump_keyver(data: dict) -> None:
+    data["keyver"] = int(data.get("keyver", 1)) + 1
+    print("keyver is now %d -- every existing browser session is invalid, and so is"
+          % data["keyver"])
+    print("every API key and connector grant created from one (older ones carry no")
+    print("keyver and survive). The master bearer token is unaffected.")
+
+
 def cmd_sign_out_everyone() -> None:
     data = load()
-    data["keyver"] = int(data.get("keyver", 1)) + 1
+    bump_keyver(data)
     save(data)
-    print("keyver is now %d -- every existing browser session is invalid." % data["keyver"])
-    print("Agents using the bearer token are unaffected.")
 
 
 def main(argv) -> int:

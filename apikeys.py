@@ -129,7 +129,7 @@ class KeyStore:
 
     # -- use ---------------------------------------------------------------
 
-    def verify(self, presented: str):
+    def verify(self, presented: str, keyver: int = None):
         """Return the key record a bearer string matches, or None.
 
         compare_digest against every stored hash rather than a dict lookup:
@@ -151,6 +151,11 @@ class KeyStore:
                 if not isinstance(stored, str) or not stored:
                     continue
                 if hmac.compare_digest(want, stored):
+                    # A key minted under an older keyver died with that
+                    # keyver's sessions (sign-out-everyone). Records from
+                    # before keys carried "kv" have none and stay valid.
+                    if keyver is not None and "kv" in rec and rec["kv"] != keyver:
+                        return None
                     return dict(rec)
         return None
 
@@ -185,7 +190,7 @@ class KeyStore:
                     for r in self._load_locked().get("keys", [])
                     if isinstance(r, dict)]
 
-    def create(self, name: str):
+    def create(self, name: str, keyver: int = None):
         """(record, secret). The secret is returned once and never stored."""
         name = (name or "").strip()
         if not NAME_RE.match(name):
@@ -210,6 +215,8 @@ class KeyStore:
             rec = {"id": secrets.token_hex(8), "name": name,
                    "hash": hash_secret(secret), "created": now_iso(),
                    "last_used": None}
+            if keyver is not None:
+                rec["kv"] = keyver
             rows.append(rec)
             self._save_locked(data)
         return dict(rec), secret

@@ -200,6 +200,19 @@ check("the file is still valid JSON after the races",
 check("no temp files were left behind",
       [f.name for f in tmp.parent.glob("*.tmp")], [])
 
+# -- keyver binding (audit 2026-09-26 Medium): a key minted from a session dies
+# with that session's keyver; a legacy record without "kv" survives.
+tmpkv = Path(tempfile.mkdtemp()) / "apikeys.json"
+kvs = apikeys.KeyStore(tmpkv)
+rec_kv, sec_kv = kvs.create("bound", 3)
+check("minted key records its keyver", rec_kv.get("kv"), 3)
+check("bound key verifies under its keyver", bool(kvs.verify(sec_kv, 3)), True)
+check("bound key refused after a keyver bump", kvs.verify(sec_kv, 4), None)
+check("keyver not given -> no binding check", bool(kvs.verify(sec_kv)), True)
+rec_old, sec_old = kvs.create("legacy")
+check("key minted without keyver carries no kv", "kv" in rec_old, False)
+check("legacy key survives a keyver bump", bool(kvs.verify(sec_old, 9)), True)
+
 print("----")
 print("PASS=%d FAIL=%d" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)

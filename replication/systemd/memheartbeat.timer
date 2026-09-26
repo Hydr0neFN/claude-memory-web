@@ -2,7 +2,10 @@
 Description=Memory replication heartbeat (every minute)
 
 [Timer]
-OnBootSec=1min
+# Early: a node that was promoted away from while it was down boots with
+# ROLE=primary and memgate starts its units; this heartbeat is what fences it
+# once it sees the public hostname served by the peer.
+OnBootSec=15s
 OnUnitActiveSec=1min
 AccuracySec=5s
 

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/bash -p
 # ExecCondition= for every memory unit: start only on the node holding the
 # writer lease. A non-zero exit makes systemd SKIP the start without failing
 # the unit, so Restart=on-failure cannot revive a node whose lease is gone.
@@ -6,6 +6,9 @@
 # memgate <inst>: an instance with its own lease (a drill sandbox) has
 # /etc/claude-memory/replication-<inst>.conf; everything else shares the
 # node's main one.
+# Runs as the service user, not root (see gate-template.conf), with the unit's
+# EnvironmentFile loaded -- so nothing here may need root, and bash -p keeps a
+# BASH_ENV from that file from running before the first line.
 if [ -n "${1:-}" ] && [ -z "${REPL_CONF:-}" ] && [ -e "/etc/claude-memory/replication-$1.conf" ]; then
     REPL_CONF=/etc/claude-memory/replication-$1.conf
 fi

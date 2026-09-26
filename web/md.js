@@ -20,7 +20,9 @@ window.MD = (function () {
   var FENCE = /^\s*(```|~~~)(.*)$/;
   var HR = /^\s*(-{3,}|\*{3,}|_{3,})\s*$/;
   var TABLE_SEP = /^\s*\|?[\s:|-]+\|[\s:|-]*$/;
-  var SAFE_URL = /^(https?:\/\/|mailto:|#|\/)/i;
+  // A lone '/' is a same-origin path; '//' and '/\' are protocol-relative URLs
+  // to another host, so the slash must not be followed by either.
+  var SAFE_URL = /^(https?:\/\/|mailto:|#|\/(?![\/\\]))/i;
 
   function esc(s) {
     return String(s).replace(/[&<>"']/g, function (c) {
@@ -117,17 +119,38 @@ window.MD = (function () {
       return '<a href="#/c/' + cat + '" class="xref">' + cat + '</a>';
     });
 
-    out = out.replace(/\[([^\]]*)\]\(([^)\s]+)\)/g, function (m, t, u) { return link(u, t || u); });
-    out = out.replace(/(^|[\s(])((?:https?:\/\/)[^\s<>()\[\]]+)/g, function (m, pre, u) {
-      return pre + link(u, u);
+    // Every link is built whole and parked behind a placeholder, like the code
+    // spans above, and restored only after the last inline rule has run. The
+    // autolink rule used to scan the output of the [t](u) rule, and a '(' inside
+    // an href let it insert a second <a href="..."> there -- whose '"' closed
+    // the outer attribute and turned the rest of the URL into attacker-named
+    // attributes (stored XSS, audit 2026-09-26). Parked, a built tag is opaque
+    // to every rule after it. A URL may not contain a placeholder itself.
+    var links = [];
+    function park(html) {
+      links.push(html);
+      return '\u0000L' + (links.length - 1) + '\u0000';
+    }
+    out = out.replace(/\[([^\]]*)\]\(([^)\s\u0000]+)\)/g, function (m, t, u) {
+      return park(link(u, t ? emphasis(t) : u));
     });
-    out = out.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-    out = out.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
-    out = out.replace(/~~([^~]+)~~/g, '<del>$1</del>');
+    out = out.replace(/(^|[\s(])((?:https?:\/\/)[^\s<>()\[\]\u0000]+)/g, function (m, pre, u) {
+      return pre + park(link(u, u));
+    });
+    out = emphasis(out);
 
+    out = out.replace(/\u0000L(\d+)\u0000/g, function (_, i) { return links[i]; });
     return out.replace(/\u0000(\d+)\u0000/g, function (_, i) {
       return '<code>' + codes[i] + '</code>';
     });
+  }
+
+  // Emphasis only ever wraps text in quote-free tags, so running it over a
+  // link's text before the link is parked cannot reach an attribute.
+  function emphasis(s) {
+    s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+    return s.replace(/~~([^~]+)~~/g, '<del>$1</del>');
   }
 
   /* section list (also used for the outline) -------------------------------

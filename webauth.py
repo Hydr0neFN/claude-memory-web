@@ -219,7 +219,8 @@ class Credentials:
             emails = [emails]
         for email in emails:
             want = (email or "").strip().lower()
-            if want and any(hmac.compare_digest(want, a) for a in allowed):
+            if want and any(hmac.compare_digest(want.encode("utf-8"), a.encode("utf-8"))
+                               for a in allowed):
                 return email
         return None
 
@@ -384,11 +385,17 @@ def exchange_code(name: str, cfg: dict, code: str, verifier: str) -> list:
 class SessionInfo:
     """Truthy result of reading a valid cookie."""
 
-    __slots__ = ("subject", "email")
+    __slots__ = ("subject", "email", "issued")
 
-    def __init__(self, subject: str, email: str = "") -> None:
+    def __init__(self, subject: str, email: str = "", issued: int = 0) -> None:
         self.subject = subject
         self.email = email
+        # When the sign-in happened: main.py require_recent_auth checks it
+        # before handing out a credential that outlives the session.
+        self.issued = issued
+
+    def fresh(self, max_age: int) -> bool:
+        return 0 <= time.time() - self.issued <= max_age
 
     def __repr__(self) -> str:
         return "SessionInfo(%r, %r)" % (self.subject, self.email)
@@ -462,7 +469,7 @@ class Session:
         if cookie_kv != keyver:
             return None
         want = hmac.new(self.key(cookie_kv), value.encode("utf-8"), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(mac, want):
+        if not hmac.compare_digest(mac.encode("utf-8"), want.encode("utf-8")):
             return None
         try:
             issued = int(issued_s)
@@ -476,7 +483,7 @@ class Session:
                 email = b64u_decode(email_b64).decode("utf-8")
             except Exception:
                 email = ""
-        return SessionInfo(subject, email)
+        return SessionInfo(subject, email, issued)
 
     # -- the short-lived handshake cookie ----------------------------------
 
@@ -513,13 +520,13 @@ class Session:
         if cookie_kv != keyver:
             return None
         want = hmac.new(self.key(cookie_kv), value.encode("utf-8"), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(mac, want):
+        if not hmac.compare_digest(mac.encode("utf-8"), want.encode("utf-8")):
             return None
         if not (0 <= time.time() - issued <= OAUTH_SECONDS):
             return None
-        if not hmac.compare_digest(parts[3], provider):
+        if not hmac.compare_digest(parts[3].encode("utf-8"), provider.encode("utf-8")):
             return None
-        if not hmac.compare_digest(parts[4], state):
+        if not hmac.compare_digest(parts[4].encode("utf-8"), (state or "").encode("utf-8")):
             return None
         return parts[5]
 

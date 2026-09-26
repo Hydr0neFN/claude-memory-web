@@ -150,9 +150,14 @@ clear_stale_index_lock()
 # schema is the one thing here that needs no auth to be interesting.
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 # READONLY / ALERT flag files set by the replication scripts; see replflag.py.
-app.add_middleware(replflag.ReplicationFlags,
-                   flag_dir=os.environ.get("MEMORY_FLAG_DIR") or str(DATA_DIR.parent),
+FLAG_DIR = os.environ.get("MEMORY_FLAG_DIR") or str(DATA_DIR.parent)
+app.add_middleware(replflag.ReplicationFlags, flag_dir=FLAG_DIR,
                    node=os.environ.get("MEMORY_NODE", ""))
+# The middleware checks READONLY once, when the request arrives. A write that
+# passed it and was still uploading its body when a handback set READONLY and
+# drained would land afterwards and never be pushed, so every write checks the
+# flag again, after its body is in and immediately before it touches disk.
+_readonly_flag = replflag._Flag(os.path.join(FLAG_DIR, "READONLY"))
 
 # MEMORY_SESSION_KEY, when set, signs cookies instead of the API token, so the
 # token can be rotated without signing every browser out (and vice versa).
@@ -186,18 +191,25 @@ def check_auth(request: Request) -> str:
     auth = request.headers.get("authorization", "")
     if auth.startswith("Bearer "):
         presented = auth[7:]
-        if secrets.compare_digest(presented, TOKEN):
+        if token_matches(presented):
             return "bearer"
         # A minted key is a bearer credential exactly like the master token and
         # gets the same read and write rights. The only thing it cannot do is
         # manage keys -- see require_browser().
-        rec = keystore.verify(presented)
+        rec = keystore.verify(presented, creds.keyver)
         if rec:
             keystore.touch(rec)
             return "bearer"
     if session.read(request.cookies.get(webauth.COOKIE_NAME), creds.keyver):
         return "cookie"
     raise HTTPException(status_code=401, detail="unauthorized")
+
+
+def token_matches(presented: str) -> bool:
+    """compare_digest on two str raises TypeError when either holds a
+    non-ASCII character -- a 500 instead of a 401, and a login failure the
+    throttle never counts. Bytes compare fine whatever they hold."""
+    return secrets.compare_digest(presented.encode("utf-8"), TOKEN.encode("utf-8"))
 
 
 def check_write_auth(request: Request) -> None:
@@ -242,7 +254,7 @@ def refuse_readonly(category: str) -> None:
 
 
 def validate_category(category: str) -> Path:
-    if not CATEGORY_RE.match(category):
+    if not CATEGORY_RE.fullmatch(category):
         raise HTTPException(status_code=400, detail="invalid category name")
     if category in RESERVED_CATEGORIES:
         raise HTTPException(
@@ -296,7 +308,7 @@ def require_rostered(category: str) -> None:
 
 
 def validate_doc(slug: str) -> Path:
-    if not CATEGORY_RE.match(slug):
+    if not CATEGORY_RE.fullmatch(slug):
         raise HTTPException(status_code=400, detail="invalid doc slug")
     if slug in RESERVED_DOCS:
         raise HTTPException(
@@ -366,7 +378,16 @@ def require_precondition(path: Path, request: Request) -> None:
 
     Existing category -> If-Match with the current etag is mandatory.
     New category      -> If-None-Match: * is mandatory.
+
+    Every write calls this after awaiting its body and just before writing,
+    so it is also where the READONLY fence is re-checked (see _readonly_flag).
     """
+    if _readonly_flag.read() is not None:
+        raise HTTPException(
+            status_code=503, headers={"Retry-After": "3600"},
+            detail="this vault became read-only on this node while the request "
+                   "was in flight; nothing was written",
+        )
     if_match = request.headers.get("if-match")
     if_none_match = request.headers.get("if-none-match", "").strip()
 
@@ -469,7 +490,7 @@ def actor(request: Request) -> str:
     short, boring character set.
     """
     named = (request.headers.get("x-memory-actor") or "").strip()
-    if ACTOR_RE.match(named):
+    if ACTOR_RE.fullmatch(named):
         return named
     return (request.headers.get("user-agent") or "unknown")[:80]
 
@@ -869,7 +890,7 @@ async def login(request: Request):
     except Exception:
         supplied = ""
 
-    if not supplied or not secrets.compare_digest(supplied, TOKEN):
+    if not supplied or not token_matches(supplied):
         login_throttle.record(key)
         raise HTTPException(status_code=401, detail="invalid token")
 
@@ -1064,6 +1085,23 @@ def require_browser(request: Request) -> None:
         )
 
 
+# Minting a key or consenting to a connector hands out a credential that
+# outlives the session, so it takes a sign-in from the last few minutes, not
+# any cookie up to 30 days old: script running in a signed-in tab (the
+# 2026-09-26 audit's kill chain) cannot quietly mint itself a permanent key.
+RECENT_AUTH_SECONDS = 15 * 60
+
+
+def require_recent_auth(request: Request) -> None:
+    info = session.read(request.cookies.get(webauth.COOKIE_NAME), creds.keyver)
+    if not info or not info.fresh(RECENT_AUTH_SECONDS):
+        raise HTTPException(
+            status_code=403,
+            detail="sign out and sign in again to create a key "
+                   "(needs a sign-in from the last %d minutes)" % (RECENT_AUTH_SECONDS // 60),
+        )
+
+
 @app.get("/auth/keys")
 def list_keys(request: Request):
     require_browser(request)
@@ -1073,12 +1111,13 @@ def list_keys(request: Request):
 @app.post("/auth/keys")
 async def create_key(request: Request):
     require_browser(request)
+    require_recent_auth(request)
     try:
         name = str((await request.json()).get("name") or "")
     except Exception:
         name = ""
     try:
-        rec, secret = keystore.create(name)
+        rec, secret = keystore.create(name, creds.keyver)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     sys.stderr.write("memory: minted api key %s (%s)\n" % (rec["id"], rec["name"]))
@@ -1334,7 +1373,7 @@ def get_category(category: str, request: Request, rev: str = "", section: str = 
     path = validate_category(category)
 
     if rev:
-        if not REV_RE.match(rev):
+        if not REV_RE.fullmatch(rev):
             raise HTTPException(status_code=400, detail="invalid rev")
         show = git("show", "%s:%s" % (rev, path.name), check=False)
         if show.returncode != 0:
@@ -1485,7 +1524,7 @@ def get_doc(slug: str, request: Request, rev: str = "", section: str = ""):
     path = validate_doc(slug)
 
     if rev:
-        if not REV_RE.match(rev):
+        if not REV_RE.fullmatch(rev):
             raise HTTPException(status_code=400, detail="invalid rev")
         show = git("show", "%s:docs/%s.md" % (rev, slug), check=False)
         if show.returncode != 0:
@@ -1640,13 +1679,13 @@ def mcp_actor(request: Request):
     if not auth.startswith("Bearer "):
         return None
     presented = auth[7:].strip()
-    if secrets.compare_digest(presented, TOKEN):
+    if token_matches(presented):
         return "mcp"
-    rec = keystore.verify(presented)
+    rec = keystore.verify(presented, creds.keyver)
     if rec:
         keystore.touch(rec)
         return actor_suffix(rec.get("name"))
-    grant = oauth.verify_access(presented)
+    grant = oauth.verify_access(presented, creds.keyver)
     if grant and grant.get("resource") == mcp_resource(request):
         return actor_suffix(grant.get("client_name"))
     return None
@@ -1821,6 +1860,8 @@ def oauth_authorize(request: Request):
                           % (js_string(here), esc(here)))
 
     info = session.read(request.cookies.get(webauth.COOKIE_NAME), creds.keyver)
+    if info and not info.fresh(RECENT_AUTH_SECONDS):
+        info = None   # consent takes a recent sign-in; see require_recent_auth
     name = esc(client["name"])
     dest = esc(urllib.parse.urlsplit(p["redirect_uri"]).netloc)
     if not info:
@@ -1858,7 +1899,7 @@ async def oauth_authorize_post(request: Request):
     if origin != public_base(request):
         return authz_page("Refused", "<h1>Refused</h1><p>Bad origin.</p>", 403)
     info = session.read(request.cookies.get(webauth.COOKIE_NAME), creds.keyver)
-    if not info:
+    if not info or not info.fresh(RECENT_AUTH_SECONDS):
         return authz_page("Signed out", "<h1>Your session expired</h1><p>Go back to "
                           "Claude and connect again.</p>", 401)
     form = urllib.parse.parse_qs((await request.body()).decode("utf-8", "replace"))
@@ -1869,7 +1910,8 @@ async def oauth_authorize_post(request: Request):
     q = {}
     if (form.get("decision") or [""])[0] == "allow":
         q["code"] = oauth.issue_code(p["client_id"], p["redirect_uri"], p["code_challenge"],
-                                     mcp_resource(request), info.email or info.subject)
+                                     mcp_resource(request), info.email or info.subject,
+                                     creds.keyver)
         sys.stderr.write("memory: oauth consent for %s by %s\n"
                          % (client["name"], info.email or info.subject))
     else:
@@ -1899,7 +1941,8 @@ async def oauth_token(request: Request):
                                     f.get("redirect_uri", ""), f.get("code_verifier", ""),
                                     resource)
         elif grant_type == "refresh_token":
-            out = oauth.refresh(f.get("refresh_token", ""), f.get("client_id", ""), resource)
+            out = oauth.refresh(f.get("refresh_token", ""), f.get("client_id", ""), resource,
+                                creds.keyver)
         else:
             raise mcpoauth.OAuthError("unsupported_grant_type")
     except mcpoauth.OAuthError as exc:
@@ -1922,4 +1965,23 @@ def delete_grant(request: Request, grant_id: str):
 # a mount at "/" only ever sees paths no route above claimed.
 # --------------------------------------------------------------------------
 
-app.mount("/", StaticFiles(directory=str(WEB_DIR), html=True), name="web")
+# The SPA renders stored markdown into innerHTML, so a renderer bug is stored
+# XSS; this CSP is the second wall. app.js/md.js/diff.js are external files
+# and there is no inline <script> or on* attribute anywhere, so script-src
+# 'self' costs nothing. style-src keeps 'unsafe-inline' for the style="..."
+# attributes app.js builds (CSS cannot run script). img-src data: is the
+# favicon. frame-ancestors matches authz_page.
+WEB_CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+           "img-src 'self' data:; object-src 'none'; base-uri 'none'; "
+           "form-action 'self'; frame-ancestors 'none'")
+
+
+class WebFiles(StaticFiles):
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Content-Security-Policy"] = WEB_CSP
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
+
+
+app.mount("/", WebFiles(directory=str(WEB_DIR), html=True), name="web")

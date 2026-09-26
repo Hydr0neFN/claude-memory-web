@@ -309,6 +309,16 @@ for host, want in [("localhost:8787", False), ("127.0.0.1:8787", False),
                    ("memory.example.com", True), ("", False)]:
     check("cookie_secure(%r)" % host, webauth.cookie_secure(FakeRequest(host)), want)
 
+# -- SessionInfo.issued / fresh(): recent-auth gate for minting credentials
+import time as _t  # noqa: E402
+fi = s.read(s.issue(webauth.SUBJECT_TOKEN, 1), 1)
+check("session info carries its issue time", abs(fi.issued - _t.time()) < 5, True)
+check("a just-issued session is fresh", fi.fresh(900), True)
+old_value = "%s:%d:%d:%s" % (webauth.SUBJECT_TOKEN, 1, int(_t.time()) - 3600, "ab" * 8)
+old = s.read(s.sign(old_value, 1), 1)
+check("an hour-old session is still valid", bool(old), True)
+check("an hour-old session is not fresh for 15 min", old.fresh(900), False)
+
 print("----")
 print("PASS=%d FAIL=%d" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)

@@ -67,9 +67,17 @@ set_role() {
 }
 
 flag_file() { printf '%s/%s' "$(iv FLAGDIR "$1")" "$2"; }
-flag_set() { local f; f=$(flag_file "$1" "$2"); printf '%s\n' "$3" > "$f.tmp" && mv -f "$f.tmp" "$f"; }
+# FLAGDIR is the instance's state directory, owned by its service user. Root
+# writing "$f.tmp" there by name would follow a symlink that user planted
+# (arbitrary file write as root, audit 2026-09-26), so the write -- and the
+# read, whose text is logged -- run as that user. rm -f of a name only ever
+# removes the link itself, so flag_clear stays as is.
+flag_set() {
+    local f; f=$(flag_file "$1" "$2")
+    as_inst "$1" sh -c 'printf "%s\n" "$2" > "$1.tmp" && mv -f "$1.tmp" "$1"' flag_set "$f" "$3"
+}
 flag_clear() { rm -f "$(flag_file "$1" "$2")"; }
-flag_text() { head -n1 "$(flag_file "$1" "$2")" 2>/dev/null; }
+flag_text() { as_inst "$1" head -n1 "$(flag_file "$1" "$2")" 2>/dev/null; }
 
 # equal | ahead | behind | diverged | missing -- local HEAD against REF.
 classify() {
@@ -155,14 +163,36 @@ state_tar() {  # write a tar of this instance's state files to stdout
     # shellcheck disable=SC2086
     tar -C "$d" -cf - $files
 }
+# A copied .env becomes the unit's EnvironmentFile on this node. Only the keys
+# the app reads from it pass, with plain values: no LD_PRELOAD/BASH_ENV/PATH,
+# no MEMORY_FLAG_DIR or MEMORY_READONLY_CATEGORIES to lift a fence, no quote
+# (a value may sit in one pair of double quotes) or trailing backslash for
+# systemd's line continuation. Blank and # lines pass.
+: "${ENV_KEYS:=CLAUDE_MEMORY_TOKEN MEMORY_SESSION_KEY MEMORY_PORT MEMORY_INSTANCE_NAME MEMORY_PUBLIC_URL}"
+env_ok() {
+    local line k
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line%$'\r'}
+        case $line in ''|'#'*) continue ;; esac
+        [[ $line =~ ^([A-Z_][A-Z0-9_]*)=(\"?)[A-Za-z0-9._:/@+=~,-]*(\"?)$ ]] || return 1
+        [ "${BASH_REMATCH[2]}" = "${BASH_REMATCH[3]}" ] || return 1   # quotes come in pairs
+        k=${BASH_REMATCH[1]}
+        case " $ENV_KEYS " in *" $k "*) ;; *) return 1 ;; esac
+    done < "$1"
+}
 state_install() {  # read a tar from stdin; install only the known names, as the instance user
-    local inst=$1 d tmp f u n=0; d=$(iv STATEDIR "$inst"); u=$(iv USER "$inst")
+    local inst=$1 d tmp f n=0; d=$(iv STATEDIR "$inst")
     tmp=$(mktemp -d); trap 'rm -rf "$tmp"' RETURN
     tar -C "$tmp" -xf - --no-same-owner --no-same-permissions 2>/dev/null || { log "$inst: bad state tar"; return 1; }
     for f in $STATE_FILES; do
         [ -e "$tmp/$f" ] || continue
         if [ -L "$tmp/$f" ] || [ ! -f "$tmp/$f" ]; then log "$inst: $f is not a regular file, refused"; return 1; fi
-        install -m 600 ${u:+-o "$u" -g "$u"} "$tmp/$f" "$d/$f.new" && mv -f "$d/$f.new" "$d/$f" && n=$((n+1))
+        if [ "$f" = .env ] && ! env_ok "$tmp/$f"; then log "$inst: .env has a line outside the allowlist, refused"; return 1; fi
+        # Written as the instance user, like flag_set: $d is that user's own
+        # directory, and root creating "$f.new" there by name would follow a
+        # symlink the user planted (agy review 2026-09-26).
+        as_inst "$inst" sh -c 'umask 077; cat > "$1.new" && mv -f "$1.new" "$1"' state_install "$d/$f" \
+            < "$tmp/$f" && n=$((n+1))
     done
     log "$inst: installed $n state file(s)"
     [ $n -gt 0 ]

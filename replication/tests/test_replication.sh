@@ -247,6 +247,22 @@ check "no auth.json planted" no "$(has "$T/nl/state/dad/auth.json")"
 SSH_ORIGINAL_COMMAND="state-recv ../../etc" REPL_CONF=$T/nl/conf bash "$HERE/memctl" < /dev/null 2>/dev/null
 check "unknown instance refused" 64 $?
 on nl memstate-xfer push dad; check "a standby cannot push state into the primary" 1 $?
+# .env becomes the peer unit's EnvironmentFile: only the app's own keys pass.
+good_env=$(cat "$T/nl/state/dad/.env")
+mkdir -p "$T/evilenv"
+for bad in 'LD_PRELOAD=/tmp/x.so' 'BASH_ENV=/tmp/x' 'MEMORY_FLAG_DIR=/tmp' 'CLAUDE_MEMORY_TOKEN="a b"' 'CLAUDE_MEMORY_TOKEN="a' 'CLAUDE_MEMORY_TOKEN=a\'; do
+    printf 'CLAUDE_MEMORY_TOKEN=ok\n%s\n' "$bad" > "$T/evilenv/.env"
+    tar -C "$T/evilenv" -cf "$T/evilenv.tar" .env
+    SSH_ORIGINAL_COMMAND="state-recv dad" REPL_CONF=$T/nl/conf bash "$HERE/memctl" < "$T/evilenv.tar" 2>/dev/null
+    check ".env line refused: $bad" 1 $?
+done
+check "refused .env left the old one in place" "$good_env" "$(cat "$T/nl/state/dad/.env")"
+printf '# comment\n\nCLAUDE_MEMORY_TOKEN=abc-_.~\r\nMEMORY_PUBLIC_URL="https://x.test"\n' > "$T/evilenv/.env"
+tar -C "$T/evilenv" -cf "$T/evilenv.tar" .env
+SSH_ORIGINAL_COMMAND="state-recv dad" REPL_CONF=$T/nl/conf bash "$HERE/memctl" < "$T/evilenv.tar" 2>/dev/null
+check "allowlisted .env (comments, CRLF, quoted value) accepted" 0 $?
+check "installed .env is the one sent" "$(cat "$T/evilenv/.env")" "$(cat "$T/nl/state/dad/.env")"
+printf '%s\n' "$good_env" > "$T/nl/state/dad/.env"
 
 echo "=== 8. TW only unreachable over Tailscale, still serving: promotion refused ==="
 touch "$T/ts_down"

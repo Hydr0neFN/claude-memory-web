@@ -50,6 +50,26 @@ check('no bold inside code span', /<code>a \*\*b\*\* c<\/code>/.test(cs), cs);
 check('no em inside code span', /<code>x\*y\*z<\/code>/.test(cs), cs);
 check('placeholder sentinel gone', cs.indexOf('\u0000') === -1);
 
+/* --- link attribute breakout (audit 2026-09-26, Critical 1) -------------
+ * The autolink rule used to rescan the [t](u) rule's output and insert a
+ * second <a href="..."> inside the first href, closing it early. */
+// every '<a ' must open a tag whose attributes are exactly the ones link() writes
+function anchorsWellFormed(html) {
+  const tags = html.match(/<a\s[^>]*>/g) || [];
+  return tags.every(t => /^<a href="[^"<>]*"( target="_blank" rel="noopener noreferrer")?( class="xref")?>$/.test(t));
+}
+const breakout = MD.render('[x](https://a.example/(https://b.example/"onmouseover=alert`1`)');
+check('no attribute breakout from nested autolink', anchorsWellFormed(breakout) && !/onmouseover=/.test(breakout.replace(/&quot;onmouseover=/g, '')), breakout);
+const breakout2 = MD.render('see [t](http://x/(http://y/x"autofocus/onfocus=alert`1`) now');
+check('no attribute breakout, http variant', anchorsWellFormed(breakout2) && !/ onfocus=/.test(breakout2), breakout2);
+const lt = MD.render('[**bold** and `code`](https://ok.example/) then https://auto.example/ end');
+check('link text keeps emphasis and code', /<a href="https:\/\/ok\.example\/"[^>]*><strong>bold<\/strong> and <code>code<\/code><\/a>/.test(lt), lt);
+check('autolink still works outside links', /<a href="https:\/\/auto\.example\/"/.test(lt) && anchorsWellFormed(lt), lt);
+check('link placeholder sentinel gone', lt.indexOf('\u0000') === -1, lt);
+const pr = MD.render('[a](//evil.example/) [b](/\\evil.example/) [c](/c/protocol)');
+check('protocol-relative // and /\\ not linked', !/href="\/\//.test(pr) && !/href="\/\\/.test(pr), pr);
+check('same-origin /path still linked', /href="\/c\/protocol"/.test(pr), pr);
+
 /* --- snake_case must not become emphasis -------------------------------- */
 const snake = MD.render('call git_commit and check_write_auth now');
 check('snake_case untouched', /git_commit/.test(snake) && !/<em>/.test(snake), snake);

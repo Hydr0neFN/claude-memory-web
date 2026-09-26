@@ -123,6 +123,11 @@ def redirect_matches(registered: list, presented: str) -> bool:
     (RFC 8252 s7.3: the client picks a free port at request time)."""
     if presented in registered:
         return True
+    # The port-only relaxation below compares scheme/host/path/query and would
+    # let userinfo, a fragment or a backslash host through; the presented URI
+    # has to pass the same rules a registered one did.
+    if not redirect_allowed(presented) or "\\" in presented:
+        return False
     try:
         p = urllib.parse.urlsplit(presented)
     except ValueError:
@@ -137,6 +142,13 @@ def redirect_matches(registered: list, presented: str) -> bool:
         if (q.scheme, q.hostname, q.path, q.query) == (p.scheme, p.hostname, p.path, p.query):
             return True
     return False
+
+
+def kv_ok(grant: dict, keyver) -> bool:
+    """A grant consented under an older keyver died with that keyver's
+    sessions (sign-out-everyone). Grants from before grants carried "kv" have
+    none and stay valid."""
+    return keyver is None or "kv" not in grant or grant["kv"] == keyver
 
 
 def pkce_ok(verifier: str, challenge: str) -> bool:
@@ -258,7 +270,7 @@ class Store:
     # -- authorization codes -----------------------------------------------
 
     def issue_code(self, client_id: str, redirect_uri: str, challenge: str,
-                   resource: str, email: str) -> str:
+                   resource: str, email: str, keyver: int = None) -> str:
         code = secrets.token_urlsafe(32)
         now = time.time()
         with self._lock:
@@ -266,7 +278,7 @@ class Store:
             self._codes[hash_secret(code)] = {
                 "client_id": client_id, "redirect_uri": redirect_uri,
                 "challenge": challenge, "resource": resource, "email": email,
-                "exp": now + CODE_SECONDS,
+                "kv": keyver, "exp": now + CODE_SECONDS,
             }
         return code
 
@@ -288,11 +300,13 @@ class Store:
         client = self.client(client_id)
         if not client:
             raise OAuthError("invalid_client", "unknown client", 401)
-        return self._new_grant(client_id, client["name"], rec["email"], rec["resource"])
+        return self._new_grant(client_id, client["name"], rec["email"], rec["resource"],
+                               rec.get("kv"))
 
     # -- grants and tokens ---------------------------------------------------
 
-    def _new_grant(self, client_id: str, client_name: str, email: str, resource: str) -> dict:
+    def _new_grant(self, client_id: str, client_name: str, email: str, resource: str,
+                   keyver: int = None) -> dict:
         access = ACCESS_PREFIX + secrets.token_urlsafe(32)
         refresh = REFRESH_PREFIX + secrets.token_urlsafe(32)
         now = int(time.time())
@@ -310,6 +324,7 @@ class Store:
                 "access_hash": hash_secret(access), "access_exp": now + ACCESS_SECONDS,
                 "refresh_hash": hash_secret(refresh),
                 "refresh_exp": now + REFRESH_DAYS * 86400,
+                **({"kv": keyver} if keyver is not None else {}),
             })
             self._save(data)
         return self._token_response(access, refresh)
@@ -319,7 +334,8 @@ class Store:
         return {"access_token": access, "token_type": "Bearer",
                 "expires_in": ACCESS_SECONDS, "refresh_token": refresh, "scope": SCOPE}
 
-    def refresh(self, refresh_token: str, client_id: str, resource: str) -> dict:
+    def refresh(self, refresh_token: str, client_id: str, resource: str,
+                keyver: int = None) -> dict:
         want = hash_secret(refresh_token or "")
         now = int(time.time())
         with self._lock:
@@ -329,6 +345,8 @@ class Store:
                     continue
                 if g.get("refresh_exp", 0) < now:
                     raise OAuthError("invalid_grant", "refresh token expired")
+                if not kv_ok(g, keyver):
+                    raise OAuthError("invalid_grant", "grant was revoked by sign-out-everyone")
                 if client_id and client_id != g.get("client_id"):
                     raise OAuthError("invalid_grant", "refresh token belongs to another client")
                 if resource and resource != g.get("resource"):
@@ -342,7 +360,7 @@ class Store:
                 return self._token_response(access, refresh_token)
         raise OAuthError("invalid_grant", "refresh token is invalid or revoked")
 
-    def verify_access(self, presented: str):
+    def verify_access(self, presented: str, keyver: int = None):
         """Return the grant an access token belongs to, or None (unknown,
         expired, or revoked)."""
         if not presented or not presented.startswith(ACCESS_PREFIX):
@@ -352,7 +370,9 @@ class Store:
         with self._lock:
             for g in self._load()["grants"]:
                 if hmac.compare_digest(str(g.get("access_hash", "")), want):
-                    return dict(g) if g.get("access_exp", 0) >= now else None
+                    if g.get("access_exp", 0) < now or not kv_ok(g, keyver):
+                        return None
+                    return dict(g)
         return None
 
     # -- administration (web UI) ---------------------------------------------
