@@ -8,7 +8,7 @@ hand a model a tool, and the same endpoint serves Claude Code.
 Every tool is a thin wrapper over an existing REST route, called in-process
 through the ASGI app rather than reimplemented. So the ETag precondition,
 roster gate, section splicing, git commit and every validation rule apply to
-MCP writes exactly as they do to memapi.py and the web UI, and cannot drift.
+MCP writes exactly as they do to REST callers and the web UI, and cannot drift.
 
 Transport: Streamable HTTP, stateless. Each POST carries one JSON-RPC message
 (or a batch, for 2025-03-26 clients) and gets a plain application/json reply;
@@ -16,10 +16,9 @@ no SSE stream and no Mcp-Session-Id, since nothing here is long-running or
 server-initiated. GET /mcp is 405, which the spec defines as "no SSE stream".
 
 The concurrency rule carries over as an argument instead of a cache: a tool
-that writes takes the `etag` a previous read returned. memapi.py enforces
-get-before-put with a per-session cache; claude.ai has no such session, so the
-etag travels through the model's own context instead, which is the rule the
-protocol already gives non-Claude-Code sessions (re-get before every put).
+that writes takes the `etag` a previous read returned. No session keeps a
+cache here, so the etag travels through the model's own context instead, which
+is the rule the protocol already gives every session (re-get before every put).
 """
 import json
 import urllib.parse

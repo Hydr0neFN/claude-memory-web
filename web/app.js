@@ -1508,8 +1508,7 @@
             'Copy it now \u2014 it is never shown again.</p>' +
             '<code id="key-val">' + e(k.value) + '</code>' +
             '<p class="muted small">Use it as <code>Authorization: Bearer &lt;key&gt;</code>, ' +
-            'or put it in <code>MEMORY_API_TOKEN</code> / <code>~/.claude/.memory-token</code> ' +
-            'for <code>memapi.py</code>.</p></div>';
+            'for example as the bearer key of an MCP client.</p></div>';
           viewKeysRefresh();
         });
       }).catch(function (e2) {

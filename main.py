@@ -34,7 +34,6 @@ import mcpoauth
 import mcpserver
 import replflag
 import searchrank
-import versiongate
 import webauth
 
 # One code directory can serve several instances, each with its own state (see
@@ -150,7 +149,6 @@ clear_stale_index_lock()
 # No /docs, /redoc or /openapi.json: this app is on a public hostname and the
 # schema is the one thing here that needs no auth to be interesting.
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
-app.add_middleware(versiongate.VersionGate)  # refuse too-old memapi clients; see versiongate.py
 # READONLY / ALERT flag files set by the replication scripts; see replflag.py.
 app.add_middleware(replflag.ReplicationFlags,
                    flag_dir=os.environ.get("MEMORY_FLAG_DIR") or str(DATA_DIR.parent),
@@ -182,7 +180,7 @@ token_throttle = webauth.Throttle(max_attempts=20, window_sec=300)
 def check_auth(request: Request) -> str:
     """Authorize a read. Returns which credential matched: 'bearer' or 'cookie'.
 
-    Bearer is the agent path (memapi.py, claude.ai) and is unchanged. Cookie is
+    Bearer is the agent path (API keys, claude.ai) and is unchanged. Cookie is
     the browser path; callers that write care about the difference.
     """
     auth = request.headers.get("authorization", "")

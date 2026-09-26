@@ -9,8 +9,8 @@ parent of DATA_DIR, i.e. next to .env and the json state):
                rejection, the NL watchdog while handing back). Cleared only
                by a person or their agent -- never automatically.
   ALERT     -- present => its first line rides on every response as
-               X-Memory-Alert, so a client (the SessionStart hook, memapi.py)
-               can surface it. Used for "running on the NL standby" and
+               X-Memory-Alert, so a client (the SessionStart hook, an MCP
+               tool reply) can surface it. Used for "running on the NL standby" and
                "TW returned diverged".
 
 Every response also carries X-Memory-Node (MEMORY_NODE, e.g. "tw"/"nl") when
@@ -18,8 +18,8 @@ set, so a watchdog can tell WHICH node the public hostname reaches -- a 200
 alone cannot distinguish "I am serving" from "the standby took over".
 
 READONLY implies an alert too: its reason is sent as X-Memory-Alert when no
-ALERT file exists. Both are read per request by (mtime, size), like
-min-client, so setting or clearing a flag needs no restart.
+ALERT file exists. Both are read per request by (mtime, size), so setting
+or clearing a flag needs no restart.
 
 Only the vault is fenced. Signing in, minting keys and the OAuth endpoints keep
 working: they change this node's own state files, not the replicated history,

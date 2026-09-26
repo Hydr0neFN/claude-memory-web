@@ -48,7 +48,7 @@
 
 金鑰無法簽發或刪除金鑰，那只能透過 cookie 完成；否則一把外洩的金鑰可以自行簽出接班者，比它自己被撤销還活得久。秘密只顯示一次且不儲存 —— `apikeys.json`（600、在 `main.py` 旁邊、絕不在 `data/` 內）只存它的 SHA-256。256 位元的 `secrets.token_urlsafe` 不需要慢速 KDF，因為沒有可暴力破解的空間。
 
-使用方式：`Authorization: Bearer <key>`，或放進 `MEMORY_API_TOKEN` / `~/.claude/.memory-token` 給 `memapi.py` 用。
+使用方式：`Authorization: Bearer <key>`，例如作為 MCP 用戶端送往 `/mcp` 的金鑰。
 
 ### 設定登入提供者
 
@@ -77,7 +77,6 @@ sudo -u claudemem $APP_DIR/venv/bin/python $APP_DIR/manage_auth.py \
 | `manage_auth.py` | `$APP_DIR/manage_auth.py` | 管理 `auth.json`：Google 用戶端、允許清單、`keyver` |
 | `web/` | `$APP_DIR/web/` | `index.html`、`app.css`、`app.js`、`md.js`、`diff.js` |
 | `test-web.sh` | `$APP_DIR/test-web.sh` | 伺服器測試套件，於主機上執行 |
-| `memapi.py` | 用戶端任意位置 | 此 API 的命令列用戶端 |
 | `devstub.py` | — | 本地 UI 開發用的假後端，僅限開發使用 |
 | `rendertest.js` | — | 針對 `md.js` / `diff.js` 的 28 項檢查，僅限開發使用 |
 | `fixtures/` | — | 算繪測試所執行的合成語料庫 |

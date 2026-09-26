@@ -75,7 +75,7 @@ HISTORY = [
     {"sha": "a" * 40, "short": "aaaaaaaa", "date": "2026-08-09T09:00:00+02:00", "bytes": 8600,
      "message": "PUT protocol via memory-web"},
     {"sha": "b" * 40, "short": "bbbbbbbb", "date": "2026-08-01T18:30:00+02:00", "bytes": 8100,
-     "message": "PUT protocol via claude-code-memapi/2.0"},
+     "message": "PUT protocol via mcp"},
 ]
 
 # slug -> markdown. Two share a prefix (so the sidebar tree groups them under

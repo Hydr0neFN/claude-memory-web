@@ -127,8 +127,8 @@ once and never stored — `apikeys.json` (mode 600, beside `main.py`, never insi
 `data/`) holds only its SHA-256. A 256-bit `secrets.token_urlsafe` needs no slow
 KDF; there is nothing to brute-force.
 
-Use one as `Authorization: Bearer <key>`, or put it in `MEMORY_API_TOKEN` or
-`~/.claude/.memory-token` for `memapi.py`.
+Use one as `Authorization: Bearer <key>` — for example as the key an MCP client
+sends to `/mcp`.
 
 ### Configuring a provider
 
@@ -203,11 +203,9 @@ the public name.
 | `apikeys.py` | `$APP_DIR/apikeys.py` | named revocable bearer keys, minted from the browser |
 | `mcpserver.py` | `$APP_DIR/mcpserver.py` | `/mcp`: JSON-RPC dispatch and the eight tools |
 | `mcpoauth.py` | `$APP_DIR/mcpoauth.py` | OAuth 2.1 server for `/mcp`: registration, codes, grants |
-| `versiongate.py` | `$APP_DIR/versiongate.py` | 426 for `memapi.py` clients below `min-client` |
 | `web/` | `$APP_DIR/web/` | `index.html`, `app.css`, `app.js`, `md.js`, `diff.js` |
 | `test-web.sh` | `$APP_DIR/test-web.sh` | server test suite, run on the box |
-| `tests/` | `$APP_DIR/tests/` | unit tests: `test_webauth.py` (offline), `test_etag_regression.py`; `test_mcp_live.py` runs the whole connector flow against a live app; `test_isolation_live.py` proves two instances refuse each other's credentials |
-| `memapi.py` | anywhere on a client | command-line client for this API |
+| `tests/` | `$APP_DIR/tests/` | unit tests: `test_webauth.py` (offline), `test_etag_crlf.py`; `test_mcp_live.py` runs the whole connector flow against a live app; `test_isolation_live.py` proves two instances refuse each other's credentials |
 | `devstub.py` | — | fake backend for local UI work, dev only |
 | `rendertest.js` | — | 28 checks over `md.js` / `diff.js`, dev only |
 | `fixtures/` | — | synthetic corpus the render tests run against |
@@ -268,7 +266,6 @@ code, which is how a single install has always worked.
 | `MEMORY_AUTH_FILE` | `auth.json` | sign-in providers, allowlists, `keyver` |
 | `MEMORY_KEYS_FILE` | `apikeys.json` | named `mem_` keys |
 | `MEMORY_OAUTH_FILE` | `mcpoauth.json` | MCP connector grants |
-| `MEMORY_MIN_CLIENT_FILE` | `min-client` | memapi version gate |
 | `MEMORY_PUBLIC_URL` | the request's Host | issuer / resource URL for `/mcp` |
 | `MEMORY_SESSION_KEY` | derived from `CLAUDE_MEMORY_TOKEN` | cookie-signing secret |
 | `MEMORY_INSTANCE_NAME` | `owner` | whose vault: named in `/mcp` serverInfo and instructions, list/index output, the consent page |

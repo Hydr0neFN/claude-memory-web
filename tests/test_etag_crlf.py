@@ -16,7 +16,7 @@ The contract now asserted here:
 
 Run it against a disposable instance:
 
-    MEMORY_API_BASE=http://127.0.0.1:8787 python3 tests/test_etag_crlf.py
+    MEMORY_API_BASE=http://127.0.0.1:8787 MEMORY_API_TOKEN=... python3 tests/test_etag_crlf.py
 
 It creates and deletes a scratch category and doc, so point it at a dev instance
 (`devstub.py`) or accept a few commits in the store's git log. Set MEMORY_DATA_DIR to the
@@ -24,18 +24,33 @@ store directory to additionally verify the served ETag against the bytes actuall
 without it those checks are skipped rather than failed.
 """
 import hashlib
-import importlib.util
 import json
 import os
 import sys
+import urllib.error
 import urllib.parse
+import urllib.request
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-spec = importlib.util.spec_from_file_location(
-    "memapi", os.path.join(os.path.dirname(HERE), "memapi.py")
-)
-m = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(m)
+# No default base: this suite writes, and must never land on a real store by accident.
+BASE = os.environ.get("MEMORY_API_BASE", "").rstrip("/")
+TOKEN = os.environ.get("MEMORY_API_TOKEN", "").strip()
+if not BASE or not TOKEN:
+    sys.exit("set MEMORY_API_BASE and MEMORY_API_TOKEN (a disposable instance)")
+
+
+def call(method, path, data=None, extra_headers=None):
+    """Return (status, body, headers). Non-2xx does not raise."""
+    headers = {"Authorization": "Bearer " + TOKEN}
+    if data is not None:
+        headers["Content-Type"] = "text/plain; charset=utf-8"
+    headers.update(extra_headers or {})
+    req = urllib.request.Request(BASE + path, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.status, r.read().decode("utf-8", "replace"), dict(r.headers)
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", "replace"), dict(e.headers)
+
 
 DATA_DIR = os.environ.get("MEMORY_DATA_DIR")
 CAT = "zz-etag-regression-test"
@@ -79,7 +94,7 @@ def tag_of(h):
 
 
 def get(name, is_doc=False):
-    s, b, h = m.call("GET", ("/docs/" if is_doc else "/memory/") + name)
+    s, b, h = call("GET", ("/docs/" if is_doc else "/memory/") + name)
     return s, b, tag_of(h)
 
 
@@ -100,10 +115,10 @@ def check_disk(name, served, cat, is_doc=False):
 
 
 for path in ("/memory/" + CAT, "/docs/" + DOC):
-    m.call("DELETE", path, None, {"If-Match": "*"})
+    call("DELETE", path, None, {"If-Match": "*"})
 
 # ------------------------------------------------------------------ the core
-st, bd, ho = m.call("PUT", "/memory/" + CAT, CRLF_BODY.encode("utf-8"), {"If-None-Match": "*"})
+st, bd, ho = call("PUT", "/memory/" + CAT, CRLF_BODY.encode("utf-8"), {"If-None-Match": "*"})
 check("1 create category with a CRLF body", st in (200, 201), "status=%s %s" % (st, bd[:120]))
 
 st, body, tag = get(CAT)
@@ -117,22 +132,22 @@ check_disk("6 GET ETag == blob sha of the bytes on disk", tag, CAT)
 # a write must hand back an ETag usable as the next If-Match
 check("7 create response ETag == what was stored", tag_of(ho) == tag,
       "put_returned=%s current=%s" % (tag_of(ho), tag))
-st, bd, _ = m.call("PUT", "/memory/" + CAT, CRLF_BODY.encode("utf-8"), {"If-Match": tag_of(ho)})
+st, bd, _ = call("PUT", "/memory/" + CAT, CRLF_BODY.encode("utf-8"), {"If-Match": tag_of(ho)})
 check("8 the returned ETag is accepted as If-Match", st == 200, "status=%s %s" % (st, bd[:120]))
 
 st, body, tag = get(CAT)
-st, bd, _ = m.call("PUT", "/memory/" + CAT, body.encode("utf-8"), {"If-Match": tag})
+st, bd, _ = call("PUT", "/memory/" + CAT, body.encode("utf-8"), {"If-Match": tag})
 check("9 whole-file PUT with the served ETag", st == 200, "status=%s %s" % (st, bd[:120]))
 
 # -------------------------------------------------------------- ?section=
 st, body, tag = get(CAT)
 sec = "/memory/%s?section=%s" % (CAT, urllib.parse.quote("Section Two"))
-_, sec_body, _ = m.call("GET", sec)
-st, bd, _ = m.call("PUT", sec, sec_body.encode("utf-8"), {"If-Match": tag})
+_, sec_body, _ = call("GET", sec)
+st, bd, _ = call("PUT", sec, sec_body.encode("utf-8"), {"If-Match": tag})
 check("10 section PUT with the served ETag", st == 200, "status=%s %s" % (st, bd[:120]))
 
 st, body, tag = get(CAT)
-st, bd, _ = m.call("PUT", sec, "## Section Two\r\n<!-- verified: never -->\r\nCRLF.\r\n".encode("utf-8"),
+st, bd, _ = call("PUT", sec, "## Section Two\r\n<!-- verified: never -->\r\nCRLF.\r\n".encode("utf-8"),
                    {"If-Match": tag})
 check("11 section PUT accepts a CRLF body", st == 200, "status=%s %s" % (st, bd[:120]))
 st, body, tag = get(CAT)
@@ -140,7 +155,7 @@ check("12 section CRLF normalised on disk", "\r" not in body, "%d CR present" % 
 check_disk("13 ETag still matches disk after a section write", tag, CAT)
 
 # ------------------------------------------------------- index ETag agreement
-st, idx, _ = m.call("GET", "/memory/index")
+st, idx, _ = call("GET", "/memory/index")
 check("14 /memory/index still 200", st == 200, "status=%s" % st)
 rows = {r["category"]: r for r in json.loads(idx)} if st == 200 else {}
 st, body, tag = get(CAT)
@@ -149,21 +164,21 @@ check("15 index ETag == GET ETag", rows.get(CAT, {}).get("etag") == tag.strip('"
 
 # --------------------------------------------- invalid UTF-8 must be refused
 st, body, tag = get(CAT)
-st, bd, _ = m.call("PUT", "/memory/" + CAT, b"## Bad\n\xff\xfe not utf-8\n", {"If-Match": tag})
+st, bd, _ = call("PUT", "/memory/" + CAT, b"## Bad\n\xff\xfe not utf-8\n", {"If-Match": tag})
 check("16 invalid UTF-8 refused with 400", st == 400, "status=%s %s" % (st, bd[:120]))
-st2, _, _ = m.call("GET", "/memory/index")
+st2, _, _ = call("GET", "/memory/index")
 check("17 index still works after the bad write", st2 == 200, "status=%s" % st2)
 st3, body3, _ = get(CAT)
 check("18 the bad body was not committed", st3 == 200 and "not utf-8" not in body3)
 
 # ------------------------------------------ locking must still be enforced
 st, body, tag = get(CAT)
-st, bd, _ = m.call("PUT", "/memory/" + CAT, body.encode("utf-8"),
+st, bd, _ = call("PUT", "/memory/" + CAT, body.encode("utf-8"),
                    {"If-Match": '"0000000000000000000000000000000000000000"'})
 check("19 stale ETag still refused with 409", st == 409, "status=%s" % st)
-st, bd, _ = m.call("PUT", "/memory/" + CAT, body.encode("utf-8"), {})
+st, bd, _ = call("PUT", "/memory/" + CAT, body.encode("utf-8"), {})
 check("20 missing If-Match still refused with 428", st == 428, "status=%s" % st)
-st, bd, _ = m.call("PUT", "/memory/" + CAT, body.encode("utf-8"), {"If-None-Match": "*"})
+st, bd, _ = call("PUT", "/memory/" + CAT, body.encode("utf-8"), {"If-None-Match": "*"})
 check("21 If-None-Match on an existing category refused with 412", st == 412, "status=%s" % st)
 
 # ------------------------------- a file that is ALREADY CRLF on disk heals
@@ -172,7 +187,7 @@ if DATA_DIR:
         f.write(b"pre-existing CRLF file\r\n\r\n## Sec\r\nbody\r\n")
     st, body, tag = get(CAT)
     check_disk("22 GET of a disk-CRLF file matches its disk blob", tag, CAT)
-    st, bd, _ = m.call("PUT", "/memory/" + CAT, body.encode("utf-8"), {"If-Match": tag})
+    st, bd, _ = call("PUT", "/memory/" + CAT, body.encode("utf-8"), {"If-Match": tag})
     check("23 the write that used to 409 forever now succeeds", st == 200,
           "status=%s %s" % (st, bd[:120]))
     st, body, tag = get(CAT)
@@ -184,7 +199,7 @@ else:
         skip(n, "set MEMORY_DATA_DIR to enable")
 
 # ------------------------------------------------------------------- /docs
-st, bd, dho = m.call("PUT", "/docs/" + DOC, CRLF_BODY.encode("utf-8"), {"If-None-Match": "*"})
+st, bd, dho = call("PUT", "/docs/" + DOC, CRLF_BODY.encode("utf-8"), {"If-None-Match": "*"})
 check("25 create doc with a CRLF body", st in (200, 201), "status=%s %s" % (st, bd[:120]))
 st, dbody, dtag = get(DOC, True)
 check("26 doc stored without CR", "\r" not in dbody, "%d CR present" % dbody.count("\r"))
@@ -192,9 +207,9 @@ check("27 doc GET ETag == blob sha of served bytes", dtag == blob(dbody.encode("
 check_disk("28 doc GET ETag == disk blob", dtag, DOC, True)
 check("29 doc create response ETag == what was stored", tag_of(dho) == dtag,
       "put_returned=%s current=%s" % (tag_of(dho), dtag))
-st, bd, _ = m.call("PUT", "/docs/" + DOC, dbody.encode("utf-8"), {"If-Match": dtag})
+st, bd, _ = call("PUT", "/docs/" + DOC, dbody.encode("utf-8"), {"If-Match": dtag})
 check("30 doc PUT with the served ETag", st == 200, "status=%s %s" % (st, bd[:120]))
-st, didx, _ = m.call("GET", "/docs/index")
+st, didx, _ = call("GET", "/docs/index")
 check("31 /docs/index still 200", st == 200, "status=%s %s" % (st, didx[:160]))
 if st == 200:
     drows = {r["doc"]: r for r in json.loads(didx)}
@@ -205,15 +220,15 @@ if st == 200:
 for name, path in (("33 /memory/search", "/memory/search?q=test"),
                    ("34 /memory/pins", "/memory/pins"),
                    ("35 /memory list", "/memory")):
-    st, bd, _ = m.call("GET", path)
+    st, bd, _ = call("GET", path)
     check(name + " still 200", st == 200, "status=%s" % st)
 
 # ------------------------------------------------------------------ teardown
 for path in ("/memory/" + CAT, "/docs/" + DOC):
-    m.call("DELETE", path, None, {"If-Match": "*"})
-st, _, _ = m.call("GET", "/memory/" + CAT)
+    call("DELETE", path, None, {"If-Match": "*"})
+st, _, _ = call("GET", "/memory/" + CAT)
 check("36 scratch category cleaned up", st == 404, "status=%s" % st)
-st, _, _ = m.call("GET", "/docs/" + DOC)
+st, _, _ = call("GET", "/docs/" + DOC)
 check("37 scratch doc cleaned up", st == 404, "status=%s" % st)
 
 print("\n%d passed, %d failed, %d skipped" % (len(passed), len(failed), len(skipped)))

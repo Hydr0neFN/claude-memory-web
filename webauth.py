@@ -2,7 +2,7 @@
 
 Two ways in, deliberately asymmetric:
 
-  bearer token   the machine credential (memapi.py, the SessionStart hook,
+  bearer token   the machine credential (API keys, the SessionStart hook,
                  claude.ai). High-entropy, held by programs, and untouched by
                  everything in this file. Presenting it -- as a header, or
                  once through the login form -- already proves possession of
