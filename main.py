@@ -34,6 +34,7 @@ from starlette.concurrency import run_in_threadpool
 import apikeys
 import mcpoauth
 import mcpserver
+import passes
 import replflag
 import searchrank
 import webauth
@@ -167,6 +168,8 @@ _readonly_flag = replflag._Flag(os.path.join(FLAG_DIR, "READONLY"))
 session = webauth.Session(os.environ.get("MEMORY_SESSION_KEY") or TOKEN)
 creds = webauth.Credentials()
 keystore = apikeys.KeyStore()
+# Container passes: short-lived, docs-only bearers -- see passes.py.
+passstore = passes.PassStore()
 oauth = mcpoauth.Store()
 login_throttle = webauth.Throttle(max_attempts=5, window_sec=300)
 # The Google path is slower and involves a third party, so it gets its own
@@ -228,6 +231,52 @@ def check_write_auth(request: Request) -> None:
             status_code=403,
             detail="X-Memory-Actor header required for cookie-authorized writes",
         )
+
+
+# A container pass (passes.py) is accepted by check_doc_auth and nowhere else.
+# check_auth / check_write_auth do not know the prefix, so every route that
+# does not opt in here -- /memory/*, /auth/*, /mcp, DELETE /docs -- answers a
+# pass with 401 exactly as it would an unknown token.
+PASS_MAX_BODY = 8 * 1024 * 1024
+
+
+def check_doc_auth(request: Request, slug: str = "", write: bool = False):
+    """Authorize a /docs route. Returns the pass record when a pass was used,
+    else None (and the ordinary read/write rules applied)."""
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer " + passes.PREFIX) or token_matches(auth[7:]):
+        (check_write_auth if write else check_auth)(request)
+        return None
+    rec = passstore.verify(auth[7:].strip())
+    if rec is None:
+        raise HTTPException(status_code=401, detail="pass expired, revoked or unknown")
+    if slug and not passes.allows(rec, slug, write):
+        raise HTTPException(
+            status_code=403,
+            detail="this pass does not allow %s doc '%s' (covers %s, mode %s)"
+            % ("writing" if write else "reading", slug, ", ".join(rec["slugs"]), rec["mode"]),
+        )
+    request.state.pass_id = rec["id"]
+    return rec
+
+
+async def read_capped_body(request: Request, cap: int) -> bytes:
+    """The body, refused with 413 once it passes `cap` bytes -- counted as it
+    streams, so a chunked upload with no Content-Length cannot be buffered
+    whole first."""
+    try:
+        declared = int(request.headers.get("content-length") or 0)
+    except ValueError:
+        declared = 0
+    if declared > cap:
+        raise HTTPException(status_code=413, detail="over %d bytes" % cap)
+    chunks, size = [], 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > cap:
+            raise HTTPException(status_code=413, detail="over %d bytes" % cap)
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 # Path segments each API claims for its own routes. A category or doc named
@@ -513,6 +562,10 @@ def actor(request: Request) -> str:
     name itself; it is only ever used as commit text, so it is sanitised to a
     short, boring character set.
     """
+    pass_id = getattr(request.state, "pass_id", None)
+    if pass_id:
+        # never the client's own claim: the commit must say a pass wrote it
+        return "pass:" + pass_id
     named = (request.headers.get("x-memory-actor") or "").strip()
     if ACTOR_RE.fullmatch(named):
         return named
@@ -1160,6 +1213,65 @@ def delete_key(request: Request, key_id: str):
     return JSONResponse({"deleted": key_id})
 
 
+# --------------------------------------------------------------------------
+# container passes -- see passes.py. Issued by bearer callers (in practice the
+# memory_issue_pass MCP tool); a pass itself cannot reach these routes, since
+# check_write_auth / check_auth do not accept one, so it cannot mint successors.
+# --------------------------------------------------------------------------
+
+
+@app.post("/auth/passes")
+async def issue_pass(request: Request):
+    check_write_auth(request)
+    try:
+        data = json.loads(await request.body() or b"{}")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="body must be JSON")
+    try:
+        secret, rec = passstore.issue(data.get("slugs"), data.get("mode") or "read", actor(request))
+    except passes.PassError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    sys.stderr.write("memory: issued pass %s (%s, %s) to %s\n"
+                     % (rec["id"], ",".join(rec["slugs"]), rec["mode"], rec["issuer"]))
+    return JSONResponse(dict(rec, secret=secret), headers={"Cache-Control": "no-store"})
+
+
+@app.get("/auth/passes")
+def list_passes(request: Request):
+    check_auth(request)
+    return JSONResponse(passstore.list())
+
+
+@app.delete("/auth/passes")
+def revoke_all_passes(request: Request):
+    check_write_auth(request)
+    return JSONResponse({"revoked": passstore.revoke("")})
+
+
+@app.delete("/auth/passes/{pass_id}")
+def revoke_pass(pass_id: str, request: Request):
+    check_write_auth(request)
+    n = passstore.revoke(pass_id)
+    if not n:
+        raise HTTPException(status_code=404, detail="no such live pass")
+    return JSONResponse({"revoked": n})
+
+
+# The container-side client for passes. Public on purpose: it is published
+# source (clients/memfiles.py, same as the repo) and holds no secret, and a
+# container fetching it before it has exported its pass is the normal order.
+MEMFILES_CLIENT = Path(__file__).parent / "clients" / "memfiles.py"
+
+
+@app.get("/xfer/memfiles.py")
+def memfiles_client():
+    try:
+        return PlainTextResponse(MEMFILES_CLIENT.read_text(encoding="utf-8"),
+                                 media_type="text/x-python; charset=utf-8")
+    except OSError:
+        raise HTTPException(status_code=404, detail="client not installed")
+
+
 @app.post("/auth/logout")
 def logout(request: Request):
     response = JSONResponse({"authenticated": False})
@@ -1510,13 +1622,16 @@ async def delete_category(category: str, request: Request, section: str = ""):
 
 @app.get("/docs")
 def list_docs(request: Request):
-    check_auth(request)
-    return JSONResponse(sorted(p.stem for p in DOCS_DIR.glob("*.md")))
+    rec = check_doc_auth(request)
+    names = sorted(p.stem for p in DOCS_DIR.glob("*.md"))
+    if rec is not None:
+        names = [n for n in names if passes.allows(rec, n, False)]
+    return JSONResponse(names)
 
 
 @app.get("/docs/index")
 def doc_index(request: Request):
-    check_auth(request)
+    check_auth(request)   # not pass-reachable: it would list every doc's sections
     out = []
     for path in sorted(DOCS_DIR.glob("*.md")):
         raw = path.read_bytes()   # blob sha of disk bytes, same as GET and the write guard
@@ -1545,14 +1660,14 @@ def doc_index(request: Request):
 
 @app.get("/docs/{slug}/history")
 def doc_history(slug: str, request: Request, limit: int = 50):
-    check_auth(request)
+    check_doc_auth(request, slug)
     path = validate_doc(slug)
     return JSONResponse(history_of("docs/%s.md" % slug, path, limit))
 
 
 @app.get("/docs/{slug}")
 def get_doc(slug: str, request: Request, rev: str = "", section: str = ""):
-    check_auth(request)
+    check_doc_auth(request, slug)
     path = validate_doc(slug)
 
     if rev:
@@ -1581,11 +1696,17 @@ def get_doc(slug: str, request: Request, rev: str = "", section: str = ""):
 async def put_doc(
     slug: str, request: Request, section: str = "", mode: str = "", rename_to: str = ""
 ):
-    check_write_auth(request)
+    rec = check_doc_auth(request, slug, write=True)
     path = validate_doc(slug)
-    body = await request.body()   # see put_category: body before precondition
+    if rec is not None:
+        body = await read_capped_body(request, PASS_MAX_BODY)
+    else:
+        body = await request.body()   # see put_category: body before precondition
 
     def write():
+        if rec is not None and not passstore.alive(rec["id"]):
+            # revoked or expired while the body was uploading
+            raise HTTPException(status_code=401, detail="pass expired or revoked mid-request")
         require_precondition(path, request)
 
         if section:

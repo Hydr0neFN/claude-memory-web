@@ -125,7 +125,7 @@ st, _, _ = req("POST", "/mcp", {"jsonrpc": "2.0", "method": "notifications/initi
 check("notification -> 202", st, 202)
 st, _, out = rpc(TOKEN, "tools/list")
 names = [t["name"] for t in out["result"]["tools"]]
-check("8 tools", len(names), 8)
+check("10 tools", len(names), 10)
 st, _, out = rpc(TOKEN, "nope/nope")
 check("unknown method -> -32601", out["error"]["code"], -32601)
 
