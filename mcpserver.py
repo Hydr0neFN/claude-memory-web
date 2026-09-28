@@ -197,7 +197,7 @@ TOOLS += [
         "title": "Issue a container pass",
         "description": "Only when YOU have a code-execution container and the user wants "
                        "files moved between it and vault docs. Returns a short-lived "
-                       "bearer the container uses with curl or the memfiles.py helper, so "
+                       "bearer the container uses with plain curl, so"
                        "file bytes never pass through your context. Docs only, only the "
                        "slugs/globs you name (use the narrowest, e.g. `finflow-source` or "
                        "`finflow-*`; a bare `*` is refused); dies after 5 min idle (each use extends it), 2 h max. "
@@ -230,19 +230,17 @@ PASS_HOWTO = """\
 pass: {secret}
 id {id} | docs: {slugs} | {mode} | expires after 5 min idle (each use extends it), 2 h max
 
-Run in the code-execution container (the pass is a secret: keep it in the env var):
+For the code-execution environment; keep the pass in an environment variable:
   export MEMORY_URL={base} MEMORY_PASS={secret}
-  curl -fsSO "$MEMORY_URL/xfer/memfiles.py"
-  python3 memfiles.py get    <slug> <out.md>              # prints the etag
-  python3 memfiles.py put    <slug> <file.md> --etag <etag> --note "..."   (--create for a new doc)
-  python3 memfiles.py pack   <slug> <root> <path>... --etag <etag>|--create --note "..."
-  python3 memfiles.py unpack <slug> <out_dir>
-pack = one '## <relative path>' section per file, verified byte-exact after upload;
-unpack restores such a doc. Plain curl works too:
-  curl -H "Authorization: Bearer $MEMORY_PASS" "$MEMORY_URL/docs/<slug>"
-  curl -T file.md -H "Authorization: Bearer $MEMORY_PASS" -H 'If-Match: "<etag>"' \\
-       -H "User-Agent: memfiles" "$MEMORY_URL/docs/<slug>"
-Writes need the doc's current etag (or If-None-Match: * to create); 409 = re-read and merge."""
+Download a doc (the ETag response header is its current etag):
+  curl -fsS -D headers.txt -H "Authorization: Bearer $MEMORY_PASS" "$MEMORY_URL/docs/<slug>" -o doc.md
+Upload a doc (readwrite passes only; send If-None-Match: * instead of If-Match to create one):
+  curl -fsS -T doc.md -H "Authorization: Bearer $MEMORY_PASS" -H 'If-Match: "<etag>"' \\
+       -H "X-Memory-Note: <short note>" "$MEMORY_URL/docs/<slug>"
+A 409 means the doc changed since that etag: download it again and merge.
+Snapshot docs hold one '## <relative path>' section per file, each a fenced code block.
+Optional: $MEMORY_URL/xfer/memfiles.py packs/unpacks that format with a verified round trip --
+only needed to upload a directory whose files contain lines starting with three backticks."""
 
 
 class ToolError(Exception):
