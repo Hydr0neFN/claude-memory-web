@@ -5,8 +5,12 @@
 #
 #   pushed / already there  -> fine
 #   network or remote down  -> exit 1, the timer retries
-#   rejected (non-ff or any "!" in --porcelain) -> another writer exists:
-#       READONLY on this node + notify. Cleared only by a person.
+#   rejected ("!" in --porcelain) -> fetch that remote and compare:
+#       it is an ancestor of ours -> not a fork, the remote just refused
+#           (GitHub answers "[remote rejected] (Internal Server Error)" on its
+#           own 5xx, 2026-09-29): exit 1, the timer retries, notify once.
+#       diverged, behind, missing, or the fetch fails -> another writer may
+#           exist: READONLY on this node + notify. Cleared only by a person.
 #
 # MEMSYNC_HANDBACK=1 (set by memctl prepare-handback) pushes although this
 # node is fenced read-only for the handback itself.
@@ -33,15 +37,28 @@ for r in $REMOTES; do
     [ -e "$tmp/$r.rc" ] || continue   # skipped: already there
     if grep -q '^!' "$tmp/$r.out"; then
         why=$(grep '^!' "$tmp/$r.out" | head -n1 | cut -f3)
-        flag_set "$inst" READONLY "push to $r rejected $why at $(stamp); local ${head:0:12}"
-        notify "$inst: push to $r REJECTED $why -- another writer? vault is now READ-ONLY here"
-        rc=3
+        c=unknown
+        git_i "$inst" fetch -q "$r" 2>/dev/null && c=$(classify "$inst" "$r/$(branch "$inst")")
+        case $c in
+        equal)
+            log "$inst: $r at ${head:0:12} (rejected $why, but it holds our head)"
+            echo "$head" > "$STATE_DIR/pushed.$inst.$r"
+            notify_reset "push-$inst-$r" ;;
+        ahead)
+            notify_once "push-$inst-$r" "$inst: push to $r refused $why; $r is behind us, not diverged -- retrying, vault stays writable"
+            [ $rc = 0 ] && rc=1 ;;
+        *)
+            flag_set "$inst" READONLY "push to $r rejected $why ($r: $c) at $(stamp); local ${head:0:12}"
+            notify "$inst: push to $r REJECTED $why ($r: $c) -- another writer? vault is now READ-ONLY here"
+            rc=3 ;;
+        esac
     elif [ "$(cat "$tmp/$r.rc")" != 0 ]; then
         log "$inst: push to $r failed (will retry): $(tail -n1 "$tmp/$r.out")"
         [ $rc = 0 ] && rc=1
     else
         log "$inst: $r at ${head:0:12}"
         echo "$head" > "$STATE_DIR/pushed.$inst.$r"
+        notify_reset "push-$inst-$r"
     fi
 done
 exit $rc

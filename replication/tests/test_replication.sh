@@ -176,6 +176,20 @@ git -C "$T/gh/dad.git" update-ref refs/heads/main "$gh_before"
 rm -f "$T/tw/flags/dad/READONLY"; rm -rf "$T/rogue"
 on tw memsync-push dad; check "push ok after repair" 0 $?
 
+echo "=== 3b. push refused by the remote (5xx) while not diverged -> retry, stay writable ==="
+printf '#!/bin/sh\necho "Internal Server Error" >&2\nexit 1\n' > "$T/gh/dad.git/hooks/pre-receive"
+chmod +x "$T/gh/dad.git/hooks/pre-receive"
+: > "$T/notify.log"
+write tw dad "w-during-5xx"
+on tw memsync-push dad; check "push exits 1 (retry) on a non-fork refusal" 1 $?
+check "no READONLY on a non-fork refusal" no "$(has "$T/tw/flags/dad/READONLY")"
+write tw dad "w-still-writable"; check "app write still accepted" 0 $?
+on tw memsync-push dad; check "second refusal also retries" 1 $?
+check "notified once, not per retry" 1 "$(grep -c "not diverged" "$T/notify.log")"
+rm -f "$T/gh/dad.git/hooks/pre-receive"
+on tw memsync-push dad; check "push ok once the remote recovers" 0 $?
+check "GitHub caught up" "$(head_of tw dad)" "$(git -C "$T/gh/dad.git" rev-parse main)"
+
 echo "=== 4. heartbeat: silence is flagged and notified once, never acted on ==="
 on nl memheartbeat-check
 check "unarmed before the first heartbeat: no alert" no "$(has "$T/nl/repl/PEER_SILENT")"
