@@ -1,0 +1,11 @@
+# Runtime packages for the service (main.py and everything it imports).
+#   $APP_DIR/venv/bin/pip install -r requirements.txt
+# Lower bounds only: the Pi takes what its pip resolves. Last tested with
+# fastapi 0.139.2, starlette 1.3.1, uvicorn 0.51.0, python-dotenv 1.2.4,
+# cryptography 50.0.2.
+fastapi>=0.110
+uvicorn>=0.29
+python-dotenv>=1.0
+# passkeys.py only: ES256 / RS256 / Ed25519 signature verification. Verifying
+# three signature schemes is not a place to be dependency-free.
+cryptography>=42

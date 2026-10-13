@@ -12,6 +12,16 @@
   var WARN_BYTES = 16384;   // protocol soft cap is ~20 KB; start warning early
   var CAP_BYTES = 20480;
   var STALE_DAYS = 90;
+  var RECENT_MAX = 8;
+  var PALETTE_MAX = 30;
+
+  // localStorage keys. The sidebar used to keep a list of *collapsed* names in
+  // 'mem.collapsed'; the tree now stores explicit open/closed choices instead,
+  // under a new key, and that old key is simply never read.
+  var K_TREE = 'mem.tree';
+  var K_GROUPS = 'mem.nav.groups';
+  var K_STARRED = 'mem.starred';
+  var K_RECENT = 'mem.recent';
 
   var e = MD.escape;
   var $ = function (id) { return document.getElementById(id); };
@@ -68,6 +78,21 @@
     el.className = 'toast' + (bad ? ' bad' : '');
     clearTimeout(toast._t);
     toast._t = setTimeout(function () { el.className = 'toast hidden'; }, bad ? 6000 : 3000);
+  }
+
+  // Storage is a convenience, never a dependency: private mode and quota
+  // errors fall back to the default.
+  function lsGet(key) {
+    try { return localStorage.getItem(key); } catch (_) { return null; }
+  }
+  function lsSet(key, val) {
+    try { localStorage.setItem(key, JSON.stringify(val)); } catch (_) { /* private mode */ }
+  }
+  // a stored list of strings; anything else reads as empty
+  function lsList(key) {
+    var v;
+    try { v = JSON.parse(lsGet(key) || '[]'); } catch (_) { return []; }
+    return Array.isArray(v) ? v.filter(function (x) { return typeof x === 'string'; }) : [];
   }
 
   function modal(html) {
@@ -135,20 +160,26 @@
     me = authInfo;
     $('app').classList.add('hidden');
     $('login').classList.remove('hidden');
+    // The passkey button is the primary way in, but only when the server has
+    // passkeys configured AND this browser can do WebAuthn.
+    var pk = !!(me && me.passkey === true && window.PublicKeyCredential && Passkey.supported());
+    $('login-passkey').classList.toggle('hidden', !pk);
     // A provider button appears only when the server says that handshake is
     // configured -- offering one that answers 503 is worse than not offering
     // it, because the token field below is the actual way in.
     var on = (me && me.providers) || [];
-    var any = false;
+    var oauth = false;
     ['google', 'github'].forEach(function (name) {
       var el = $('login-' + name);
       if (!el) return;
       var ok = on.indexOf(name) !== -1;
       el.classList.toggle('hidden', !ok);
-      any = any || ok;
+      // one primary button at a time: the passkey one outranks the redirects
+      el.classList.toggle('primary', !pk);
+      oauth = oauth || ok;
     });
-    $('login-oauth-note').classList.toggle('hidden', !any);
-    if (!any) {
+    $('login-oauth-note').classList.toggle('hidden', !oauth);
+    if (!pk && !oauth) {
       $('login-token-wrap').open = true;
       setTimeout(function () { $('login-token').focus(); }, 30);
     }
@@ -159,6 +190,25 @@
     $('app').classList.remove('hidden');
     return refreshIndexes().then(route);
   }
+
+  // quiet = the user dismissed something; it reads as a note, not as a failure
+  function loginMessage(text, quiet) {
+    var err = $('login-error');
+    err.textContent = text;
+    err.className = (quiet ? 'muted' : 'error') + ' small';
+  }
+
+  $('login-passkey').addEventListener('click', function () {
+    var btn = $('login-passkey');
+    $('login-error').classList.add('hidden');
+    btn.disabled = true;
+    Passkey.login().then(function () {
+      return showApp();
+    }).catch(function (err) {
+      var x = Passkey.explain(err, 'login');
+      loginMessage(x.text, x.quiet);
+    }).then(function () { btn.disabled = false; });
+  });
 
   $('login-form').addEventListener('submit', function (ev) {
     ev.preventDefault();
@@ -173,14 +223,12 @@
     }).then(function (res) {
       if (res.ok) { input.value = ''; return showApp(); }
       return res.text().then(function (t) {
-        err.textContent = res.status === 429
+        loginMessage(res.status === 429
           ? 'Too many attempts. Wait a few minutes.'
-          : detail(t, res.status);
-        err.classList.remove('hidden');
+          : detail(t, res.status));
       });
     }).catch(function () {
-      err.textContent = 'Network error.';
-      err.classList.remove('hidden');
+      loginMessage('Network error.');
     });
   });
 
@@ -214,42 +262,10 @@
   // count rides along: any edit can add or remove a pin marker.
   function refreshIndexes() { return Promise.all([loadIndex(), loadDocs(), loadPinsCount()]); }
 
-  /* The store is flat -- names must match ^[a-z0-9-]+$ -- but the convention is
-   * `<parent>-<sub>`, so the hierarchy is recoverable from the names alone.
-   * Parent = the LONGEST existing category that is a prefix of this one, which
-   * is what puts infra-pc-tuning under infra-pc rather than under infra. A name
-   * whose prefix has no category of its own just stays at the root. */
-  function buildTree(index) {
-    var node = {};
-    index.forEach(function (c) { node[c.category] = { cat: c, kids: [], parent: null, depth: 0 }; });
-    var names = Object.keys(node).sort();
-
-    names.forEach(function (n) {
-      var best = null;
-      names.forEach(function (p) {
-        if (p !== n && n.indexOf(p + '-') === 0 && (!best || p.length > best.length)) best = p;
-      });
-      if (best) { node[n].parent = best; node[best].kids.push(n); }
-    });
-    names.forEach(function (n) {
-      var d = 0, p = node[n].parent;
-      while (p) { d++; p = node[p].parent; }
-      node[n].depth = d;
-    });
-    return { node: node, roots: names.filter(function (n) { return !node[n].parent; }) };
-  }
-
-  function collapsedSet() {
-    try { return JSON.parse(localStorage.getItem('mem.collapsed') || '[]'); } catch (_) { return []; }
-  }
-  function setCollapsed(list) {
-    try { localStorage.setItem('mem.collapsed', JSON.stringify(list)); } catch (_) { /* private mode */ }
-  }
-
   // slug -> [category, ...] that reference it via [[doc:slug]]. A doc absent
   // here has no owning category and falls into the "Unattached docs" group.
   function docOwnersOf(index) {
-    var owners = {};
+    var owners = Object.create(null);
     index.forEach(function (c) {
       (c.docs || []).forEach(function (slug) {
         (owners[slug] = owners[slug] || []).push(c.category);
@@ -263,7 +279,7 @@
   // both are forward edges the server reports per-file; the "Referenced by"
   // views on category/doc pages are just this map read backwards.
   function catReferencersOf(index) {
-    var referencers = {};
+    var referencers = Object.create(null);
     index.forEach(function (c) {
       (c.refs || []).forEach(function (name) {
         (referencers[name] = referencers[name] || []).push(c.category);
@@ -283,148 +299,273 @@
       }).join('') + '</div>';
   }
 
-  // which rows a caret toggle affects, ancestor force-open for the currently
-  // active row (category or, via its owning category/ies, a doc), and the
-  // filter's visible set. Collapse state is stored as "c:name" -- docs have
-  // no expand state of their own, they ride their owning category's.
-  function treeOpenState(tree, activeKind, activeName, filter, docOwners) {
-    var collapsed = collapsedSet();
-    var forced = {};
+  /* ---- sidebar state ------------------------------------------------------
+   * Everything here is per-browser and lives in localStorage:
+   *   K_TREE    { name: true|false }  explicit open/closed choice per category.
+   *             Only choices the user made are stored, so a category that did
+   *             not exist yet still gets the default (see Nav.defaultOpen).
+   *   K_GROUPS  { pinned, recent, unattached: bool }  group open/closed.
+   *   K_STARRED ['c:name' | 'd:slug', ...]  the user's pins, in the order added.
+   *   K_RECENT  same shape, most recent first, capped at RECENT_MAX.
+   */
+  var GROUP_DEFAULT = { pinned: true, recent: true, unattached: false };
+
+  function readOverrides() { return Nav.parseOverrides(lsGet(K_TREE)); }
+
+  function readGroups() {
+    var out = {}, v;
+    try { v = JSON.parse(lsGet(K_GROUPS) || '{}'); } catch (_) { v = {}; }
+    Object.keys(GROUP_DEFAULT).forEach(function (k) {
+      out[k] = v && typeof v[k] === 'boolean' ? v[k] : GROUP_DEFAULT[k];
+    });
+    return out;
+  }
+
+  function refKey(kind, name) { return kind + ':' + name; }
+
+  function isStarred(kind, name) { return lsList(K_STARRED).indexOf(refKey(kind, name)) >= 0; }
+
+  function toggleStar(kind, name) {
+    var list = lsList(K_STARRED), k = refKey(kind, name), i = list.indexOf(k);
+    if (i >= 0) list.splice(i, 1); else list.push(k);
+    lsSet(K_STARRED, list.slice(-100));
+    renderSidebar();
+    return i < 0;
+  }
+
+  function touchRecent(kind, name) {
+    if (!name) return;
+    var k = refKey(kind, name);
+    var list = lsList(K_RECENT).filter(function (x) { return x !== k; });
+    list.unshift(k);
+    lsSet(K_RECENT, list.slice(0, RECENT_MAX));
+  }
+
+  // 'c:infra' -> { kind, name, label, href }, or null when it no longer exists
+  // (deleted or renamed since it was stored, or the index has not loaded yet).
+  function resolveRef(ref) {
+    var kind = ref.charAt(0), name = ref.slice(2);
+    if (kind === 'c') {
+      if (!state.index.some(function (c) { return c.category === name; })) return null;
+      return { kind: 'c', name: name, label: name, href: '#/c/' + encodeURIComponent(name) };
+    }
+    if (kind === 'd') {
+      var d = state.docs.filter(function (x) { return x.doc === name; })[0];
+      if (!d) return null;
+      return { kind: 'd', name: name, label: d.title || name, href: '#/d/' + encodeURIComponent(name) };
+    }
+    return null;
+  }
+
+  /* ---- sidebar rendering -------------------------------------------------- */
+
+  var unforced = Object.create(null);   // forced-open ancestors the user has just collapsed by hand
+
+  // Indent is capped: nesting is unbounded by design (the tree is derived
+  // from names, not stored), but past a few levels the indent would eat the
+  // 272px sidebar and leave nothing for the name.
+  function guides(depth) {
+    return new Array(Math.min(depth, 6) + 1).join('<i class="g"></i>');
+  }
+
+  function sizeDot(bytes) {
+    if (bytes >= CAP_BYTES) {
+      return '<span class="sdot over" title="' + fmtBytes(bytes) + ' — over the ' + fmtBytes(CAP_BYTES) +
+        ' cap, consider splitting"></span>';
+    }
+    if (bytes >= WARN_BYTES) {
+      return '<span class="sdot warn" title="' + fmtBytes(bytes) + ' — nearing the ' + fmtBytes(CAP_BYTES) +
+        ' cap"></span>';
+    }
+    return '';
+  }
+
+  function leafRowHTML(href, label, title, active, depth, isDoc, flat) {
+    return '<div class="catrow leaf' + (flat ? ' flat' : '') + '">' + guides(depth) + '<span class="caret ghost"></span>' +
+      '<a class="cat' + (active ? ' active' : '') + '" href="' + href + '" title="' + e(title) + '"' +
+      (active ? ' aria-current="page"' : '') + '>' +
+      (isDoc ? '<span class="docmark" aria-hidden="true"></span>' : '') +
+      '<span class="cat-name">' + e(label) + '</span></a></div>';
+  }
+
+  function docRowHTML(slug, meta, active, depth) {
+    return leafRowHTML('#/d/' + encodeURIComponent(slug), meta ? meta.title : slug, slug, active, depth, true);
+  }
+
+  function catRowHTML(r, tree) {
+    var nd = tree.node[r.name], c = nd.cat;
+    var shown = nd.parent ? r.name.slice(nd.parent.length + 1) : r.name;
+    var active = state.kind === 'c' && r.name === state.cat;
+    var cnt = '';
+    if (r.hidden) {
+      var parts = [];
+      if (r.kids) parts.push(r.kids + ' sub-categor' + (r.kids === 1 ? 'y' : 'ies'));
+      if (r.docs) parts.push(r.docs + ' doc' + (r.docs === 1 ? '' : 's'));
+      cnt = '<span class="cnt" title="' + parts.join(', ') + '">' + r.hidden + '</span>';
+    }
+    return '<div class="catrow' + (r.depth === 0 ? ' root' : '') + '">' + guides(r.depth) +
+      (r.expandable
+        ? '<button type="button" class="caret" data-toggle="' + e(r.name) + '" aria-expanded="' + r.open +
+          '" aria-label="' + (r.open ? 'Collapse ' : 'Expand ') + e(r.name) + '"></button>'
+        : '<span class="caret ghost"></span>') +
+      '<a class="cat' + (active ? ' active' : '') + '" href="#/c/' + encodeURIComponent(r.name) +
+      '" title="' + e(r.name) + '"' + (active ? ' aria-current="page"' : '') + '>' +
+      '<span class="cat-name">' + e(shown) + '</span>' + sizeDot(c.bytes) + cnt + '</a></div>';
+  }
+
+  function groupHeadHTML(id, label, count, open) {
+    return '<button type="button" class="group-head" data-group="' + id + '" aria-expanded="' + open + '">' +
+      '<span class="gcaret" aria-hidden="true"></span>' + label + '<span class="gcount">' + count + '</span></button>';
+  }
+
+  // Pinned / Recent rows: flat, no tree position, so the label is the full name.
+  function refRowsHTML(refs) {
+    return refs.map(function (r) {
+      var active = state.kind === r.kind && (r.kind === 'c' ? state.cat : state.doc) === r.name;
+      return leafRowHTML(r.href, r.label, r.name, active, 0, r.kind === 'd', true);
+    }).join('');
+  }
+
+  function renderSidebar(reveal) {
+    var list = $('catlist'), scroll = list.scrollTop;
+    var filter = ($('filter').value || '').toLowerCase().trim();
+    var tree = Nav.buildTree(state.index);
+    var docOwners = docOwnersOf(state.index);
+    var docMeta = Object.create(null), docTitles = Object.create(null);
+    state.docs.forEach(function (d) { docMeta[d.doc] = d; docTitles[d.doc] = d.title || ''; });
+    var unattached = state.docs.filter(function (d) { return !docOwners[d.doc]; });
+    if (filter) {
+      unattached = unattached.filter(function (d) {
+        return d.doc.indexOf(filter) >= 0 || (d.title || '').toLowerCase().indexOf(filter) >= 0;
+      });
+    }
+    var activeName = state.kind === 'd' ? state.doc : state.cat;
+    var groups = readGroups();
+
+    // The active row's ancestors are open for this render only (nothing is
+    // stored), and a doc opens every category that references it.
+    var forced = Object.create(null);
     function forceAncestors(name) {
       for (var p = tree.node[name] ? tree.node[name].parent : null; p; p = tree.node[p].parent) forced[p] = true;
     }
-    if (activeKind === 'c' && activeName && tree.node[activeName]) {
+    if (state.kind === 'c' && activeName && tree.node[activeName]) {
       forceAncestors(activeName);
-    } else if (activeKind === 'd' && activeName) {
+    } else if (state.kind === 'd' && activeName) {
       (docOwners[activeName] || []).forEach(function (owner) {
         forced[owner] = true;   // open the owner itself, so its doc children render
         forceAncestors(owner);
       });
     }
-    var visible = null;
-    if (filter) {
-      visible = {};
-      Object.keys(tree.node).forEach(function (n) {
-        var docMatch = (tree.node[n].cat.docs || []).some(function (d) { return d.indexOf(filter) >= 0; });
-        if (n.indexOf(filter) < 0 && !docMatch) return;
-        visible[n] = true;
-        for (var a = tree.node[n].parent; a; a = tree.node[a].parent) visible[a] = true;
-      });
+
+    // Pinned, then Recent (minus whatever is already pinned), in their own box
+    // above the tree so scrolling the tree never carries them out of sight. A
+    // group with nothing in it is not drawn at all, and neither shows while
+    // filtering: the filter is about the tree.
+    var top = [];
+    if (!filter) {
+      var starredKeys = lsList(K_STARRED);
+      var starred = starredKeys.map(resolveRef).filter(Boolean);
+      var recent = lsList(K_RECENT).filter(function (k) { return starredKeys.indexOf(k) < 0; })
+        .map(resolveRef).filter(Boolean);
+      if (starred.length) {
+        top.push(groupHeadHTML('pinned', 'Pinned', starred.length, groups.pinned));
+        if (groups.pinned) top.push(refRowsHTML(starred));
+      }
+      if (recent.length) {
+        top.push(groupHeadHTML('recent', 'Recent', recent.length, groups.recent));
+        if (groups.recent) top.push(refRowsHTML(recent));
+      }
     }
-    return {
-      visible: visible,
-      isOpen: function (n) { return !!filter || forced[n] || collapsed.indexOf('c:' + n) < 0; }
-    };
-  }
+    $('navtop').innerHTML = top.join('');
+    $('navtop').classList.toggle('hidden', !top.length);
 
-  function docRowHTML(slug, meta, active, padLeft) {
-    return '<div class="catrow docrow" style="padding-left:' + padLeft + 'px">' +
-      '<span class="caret ghost">·</span>' +
-      '<a class="cat docref' + (active ? ' active' : '') + '" href="#/d/' + encodeURIComponent(slug) +
-      '" title="' + e(slug) + '">' +
-      '<div class="cat-name"><span class="docmark" aria-hidden="true">📄</span> ' +
-      e(meta ? meta.title : slug) + '</div></a></div>';
-  }
+    var html = [];
 
-  // Renders the category tree, with each category's referenced docs as child
-  // rows (one level deeper, after any sub-categories) riding the same caret.
-  function renderTree(html, tree, activeKind, activeName, filter, docOwners, docMeta) {
-    var st = treeOpenState(tree, activeKind, activeName, filter, docOwners);
-    function walk(name) {
-      if (st.visible && !st.visible[name]) return;
-      var nd = tree.node[name], c = nd.cat;
-      var shown = nd.parent ? name.slice(nd.parent.length + 1) : name;
-      var open = st.isOpen(name);
-      var kids = st.visible ? nd.kids.filter(function (k) { return st.visible[k]; }) : nd.kids;
-      var docs = c.docs || [];
-      var hasChildren = kids.length > 0 || docs.length > 0;
+    Nav.rows(tree, {
+      overrides: readOverrides(), forced: forced, unforced: unforced,
+      visible: filter ? Nav.filterVisible(tree, filter, docTitles) : null
+    }).forEach(function (r) {
+      html.push(r.t === 'c'
+        ? catRowHTML(r, tree)
+        : docRowHTML(r.slug, docMeta[r.slug], state.kind === 'd' && r.slug === activeName, r.depth));
+    });
 
-      var pct = Math.min(100, Math.round(c.bytes / CAP_BYTES * 100));
-      var cls = c.bytes >= CAP_BYTES ? ' over' : c.bytes >= WARN_BYTES ? ' warn' : '';
-      var meta = '<div class="bar' + cls + '"><i style="width:' + pct + '%"></i></div>' +
-        '<div class="cat-meta"><span>' + fmtBytes(c.bytes) + ' · ' + c.sections.length + ' §</span>' +
-        '<span>' + fmtAgo(c.mtime) + '</span></div>';
-
-      html.push(
-        // indent is capped: nesting is unbounded by design (the tree is derived
-        // from names, not stored), but past a few levels the indent would eat
-        // the 272px sidebar and the name would wrap to nothing
-        '<div class="catrow" style="padding-left:' + (Math.min(nd.depth, 5) * 13) + 'px">' +
-        (hasChildren
-          ? '<button class="caret" data-toggle="c:' + e(name) + '" title="' +
-            (open ? 'Collapse' : 'Expand') + '">' + (open ? '▾' : '▸') + '</button>'
-          : '<span class="caret ghost">·</span>') +
-        '<a class="cat' + (activeKind === 'c' && name === activeName ? ' active' : '') + '" href="#/c/' +
-        encodeURIComponent(name) + '" title="' + e(name) + '">' +
-        '<div class="cat-name">' + e(shown) +
-        (kids.length && !open ? ' <span class="pill sub">' + kids.length + '</span>' : '') +
-        // the badge is a collapsed-state summary -- once expanded, the doc
-        // rows themselves are the answer to "how many", so it steps aside
-        (docs.length && !open
-          ? ' <span class="pill" title="' + e(docs.join(', ')) + '">' + docs.length + ' docs</span>'
-          : '') + '</div>' +
-        meta + '</a></div>'
-      );
-      if (open) {
-        kids.forEach(walk);
-        var padLeft = Math.min(nd.depth + 1, 6) * 13;
-        docs.forEach(function (slug) {
-          html.push(docRowHTML(slug, docMeta[slug], activeKind === 'd' && slug === activeName, padLeft));
+    // docs no category references still need a home -- labelled as what they
+    // are (unattached), not as "Docs", collapsed by default behind a count, and
+    // omitted entirely when empty.
+    if (unattached.length) {
+      var uOpen = !!filter || groups.unattached ||
+        (state.kind === 'd' && unattached.some(function (d) { return d.doc === activeName; }));
+      html.push(groupHeadHTML('unattached', 'Unattached docs', unattached.length, uOpen));
+      if (uOpen) {
+        unattached.forEach(function (d) {
+          html.push(docRowHTML(d.doc, d, state.kind === 'd' && d.doc === activeName, 0));
         });
       }
     }
-    tree.roots.forEach(walk);
-  }
 
-  function renderSidebar() {
-    var filter = ($('filter').value || '').toLowerCase().trim();
-    var tree = buildTree(state.index);
-    var docOwners = docOwnersOf(state.index);
-    var docMeta = {};
-    state.docs.forEach(function (d) { docMeta[d.doc] = d; });
-    var unattached = state.docs.filter(function (d) { return !docOwners[d.doc]; });
-    if (filter) unattached = unattached.filter(function (d) { return d.doc.indexOf(filter) >= 0; });
-
-    var html = [];
-    renderTree(html, tree, state.kind, state.kind === 'd' ? state.doc : state.cat, filter, docOwners, docMeta);
-
-    // docs no category references still need a home -- labelled as what they
-    // are (unattached), not as "Docs", and omitted entirely when empty so an
-    // ordinary store with everything cross-referenced shows no trailing group.
-    if (unattached.length) {
-      html.push('<div class="group-head">Unattached docs</div>');
-      unattached.forEach(function (d) {
-        html.push(docRowHTML(d.doc, d, state.kind === 'd' && d.doc === state.doc, 13));
-      });
-    }
-
-    $('catlist').innerHTML = html.join('') ||
+    list.innerHTML = html.join('') ||
       '<p class="small muted" style="padding:8px">No match.</p>';
+    list.scrollTop = scroll;
+    if (reveal) revealActive();
 
     var total = state.index.reduce(function (a, c) { return a + c.bytes; }, 0);
     var over = state.index.filter(function (c) { return c.bytes >= WARN_BYTES; }).length;
     $('store-stats').innerHTML = state.index.length + ' categories · ' + fmtBytes(total) +
-      (over ? ' · <span class="pill warn">' + over + ' near cap</span>' : '') +
+      (over ? ' · <a class="pill warn" href="#/health" title="Open the health view">' + over + ' near cap</a>' : '') +
       (state.docs.length ? ' · ' + state.docs.length + ' docs' : '');
   }
 
-  $('catlist').addEventListener('click', function (ev) {
+  // Scroll the active row into view inside the sidebar only. scrollIntoView
+  // would also move every other scrollable ancestor, including the drawer.
+  function revealActive() {
+    // the copy in Pinned/Recent (.flat) is not where the row lives in the tree
+    var list = $('catlist'), el = list.querySelector('.catrow:not(.flat) > .cat.active');
+    if (!el) return;
+    var r = el.getBoundingClientRect(), lr = list.getBoundingClientRect();
+    if (!lr.height) return;       // drawer closed on a phone: no geometry to go by
+    if (r.top < lr.top + 4) list.scrollTop -= lr.top + 4 - r.top + 24;
+    else if (r.bottom > lr.bottom - 4) list.scrollTop += r.bottom - lr.bottom + 4 + 24;
+  }
+
+  function onSidebarClick(ev) {
+    var head = ev.target.closest('.group-head[data-group]');
+    if (head) {
+      var groups = readGroups(), id = head.getAttribute('data-group');
+      groups[id] = head.getAttribute('aria-expanded') !== 'true';
+      lsSet(K_GROUPS, groups);
+      renderSidebar();
+      return;
+    }
     var btn = ev.target.closest('.caret[data-toggle]');
     if (!btn) return;
     ev.preventDefault();
+    // while filtering every match is open regardless; a stored choice made now
+    // would only surprise the user once the filter is cleared
+    if (($('filter').value || '').trim()) return;
     var name = btn.getAttribute('data-toggle');
-    var list = collapsedSet();
-    var i = list.indexOf(name);
-    if (i >= 0) list.splice(i, 1); else list.push(name);
-    setCollapsed(list);
+    var wasOpen = btn.getAttribute('aria-expanded') === 'true';
+    var overrides = readOverrides();
+    overrides[name] = !wasOpen;
+    if (state.index.length) {
+      var known = Object.create(null);
+      state.index.forEach(function (c) { known[c.category] = true; });
+      Object.keys(overrides).forEach(function (k) { if (!known[k]) delete overrides[k]; });
+    }
+    lsSet(K_TREE, overrides);
+    // collapsing an ancestor of the active row has to beat the force-open
+    if (wasOpen) unforced[name] = true; else delete unforced[name];
     renderSidebar();
-  });
+  }
+  $('catlist').addEventListener('click', onSidebarClick);
+  $('navtop').addEventListener('click', onSidebarClick);
 
-  $('filter').addEventListener('input', renderSidebar);
+  $('filter').addEventListener('input', function () { renderSidebar(); });
 
   $('menu-btn').addEventListener('click', function () {
     $('sidebar').classList.toggle('open');
     $('scrim').classList.toggle('hidden');
+    revealActive();
   });
   $('scrim').addEventListener('click', closeDrawer);
   function closeDrawer() {
@@ -487,54 +628,45 @@
 
   /* ------------------------------------------------------------ home view */
 
+  // An overview, not an inventory: one card per root category, then what
+  // changed lately. The long lists (largest, near cap, stale) live in #/health.
   function viewHome() {
     state.cat = null;
     state.doc = null;
     state.kind = null;
-    renderSidebar();
+    renderSidebar(true);
     var total = state.index.reduce(function (a, c) { return a + c.bytes; }, 0);
-    var big = state.index.slice().sort(function (a, b) { return b.bytes - a.bytes; }).slice(0, 5);
-    var recent = state.index.slice().sort(function (a, b) {
-      return Date.parse(b.mtime) - Date.parse(a.mtime);
-    }).slice(0, 5);
+    var tree = Nav.buildTree(state.index);
 
-    var stale = [];
-    state.index.forEach(function (c) {
-      c.sections.forEach(function (s) {
-        if (s.verified && MD.daysSince(s.verified) > STALE_DAYS) {
-          stale.push({ cat: c.category, name: s.name, verified: s.verified });
-        }
-      });
-    });
+    var cards = tree.roots.map(function (name) {
+      var st = Nav.subtreeStats(tree, name, WARN_BYTES);
+      return '<a class="rootcard" href="#/c/' + encodeURIComponent(name) + '">' +
+        '<span class="rc-name">' + e(name) + '</span>' +
+        '<span class="rc-meta">' + st.count + ' categor' + (st.count === 1 ? 'y' : 'ies') + ' · ' +
+        fmtBytes(st.bytes) + '</span>' +
+        '<span class="rc-when">' + (st.mtime ? 'changed ' + fmtAgo(new Date(st.mtime).toISOString()) : '') +
+        (st.warn ? ' <span class="pill warn" title="categories at or over ' + fmtBytes(WARN_BYTES) + '">' +
+          st.warn + ' near cap</span>' : '') + '</span></a>';
+    }).join('');
 
-    function rows(items, right) {
-      return '<div class="revs">' + items.map(function (c) {
-        return '<div class="rev"><a class="msg" href="#/c/' + encodeURIComponent(c.category) + '">' +
-          e(c.category) + '</a><span class="when">' + right(c) + '</span></div>';
-      }).join('') + '</div>';
-    }
+    // categories and docs in one list, newest first
+    var changed = state.index.map(function (c) {
+      return { t: Date.parse(c.mtime), href: '#/c/' + encodeURIComponent(c.category), label: c.category, doc: false };
+    }).concat(state.docs.map(function (d) {
+      return { t: Date.parse(d.mtime), href: '#/d/' + encodeURIComponent(d.doc), label: d.title || d.doc, doc: true };
+    })).sort(function (a, b) { return (b.t || 0) - (a.t || 0); }).slice(0, 8);
 
     main(
       '<div class="vhead"><h1>Memory store</h1></div>' +
       '<p class="vsub">' + state.index.length + ' categories · ' + fmtBytes(total) +
-      ' · soft cap ' + fmtBytes(CAP_BYTES) + ' per category</p>' +
-      '<h3>Largest</h3>' + rows(big, function (c) {
-        return fmtBytes(c.bytes) + (c.bytes >= CAP_BYTES ? ' <span class="pill stale">split</span>'
-          : c.bytes >= WARN_BYTES ? ' <span class="pill warn">near cap</span>' : '');
-      }) +
-      '<h3 style="margin-top:22px">Recently changed</h3>' + rows(recent, function (c) { return fmtAgo(c.mtime); }) +
-      (state.docs.length
-        ? '<h3 style="margin-top:22px">Docs</h3><div class="revs">' + state.docs.map(function (d) {
-            return '<div class="rev"><a class="msg" href="#/d/' + encodeURIComponent(d.doc) + '">' +
-              e(d.title) + '</a><span class="when">' + fmtBytes(d.bytes) + '</span></div>';
-          }).join('') + '</div>'
-        : '') +
-      (stale.length
-        ? '<h3 style="margin-top:22px">Sections unverified for over ' + STALE_DAYS + ' days</h3>' +
-          '<div class="revs">' + stale.slice(0, 12).map(function (s) {
-            return '<div class="rev"><a class="msg" href="#/c/' + encodeURIComponent(s.cat) + '">' +
-              e(s.cat) + ' <span class="muted">›</span> ' + e(s.name) + '</a>' +
-              '<span class="when">' + e(s.verified) + '</span></div>';
+      (state.docs.length ? ' · ' + state.docs.length + ' docs' : '') +
+      ' · <a href="#/health">Health</a></p>' +
+      (cards ? '<div class="rootgrid">' + cards + '</div>' : '<p class="muted">Nothing here yet.</p>') +
+      (changed.length
+        ? '<h3 class="home-h">Recently changed</h3><div class="revs">' + changed.map(function (c) {
+            return '<div class="rev"><a class="msg" href="' + c.href + '">' + e(c.label) + '</a>' +
+              (c.doc ? '<span class="pill">doc</span>' : '') +
+              '<span class="when">' + (c.t ? fmtAgo(new Date(c.t).toISOString()) : '') + '</span></div>';
           }).join('') + '</div>'
         : '')
     );
@@ -542,11 +674,34 @@
 
   /* ------------------------------------------------------------ read view */
 
+  // The star in a read view's header: pins the category/doc to the sidebar.
+  function starButtonHTML(kind, name) {
+    var on = isStarred(kind, name);
+    return '<button type="button" class="btn star' + (on ? ' on' : '') + '" data-act="star" aria-pressed="' + on +
+      '" aria-label="' + (on ? 'Unpin from the sidebar' : 'Pin to the sidebar') + '" title="' +
+      (on ? 'Unpin from the sidebar' : 'Pin to the sidebar') + '">' + (on ? '★' : '☆') + '</button>';
+  }
+
+  function wireStar(kind, name) {
+    var b = $('main').querySelector('[data-act="star"]');
+    if (!b) return;
+    b.onclick = function () {
+      var on = toggleStar(kind, name);
+      b.classList.toggle('on', on);
+      b.setAttribute('aria-pressed', on);
+      b.textContent = on ? '★' : '☆';
+      b.title = on ? 'Unpin from the sidebar' : 'Pin to the sidebar';
+      b.setAttribute('aria-label', b.title);
+      toast(on ? 'Pinned' : 'Unpinned');
+    };
+  }
+
   function viewCategory(cat, line, heading) {
     state.cat = cat;
     state.kind = 'c';
     state.editing = false;
-    renderSidebar();
+    touchRecent('c', cat);
+    renderSidebar(true);
     loading();
     getCategory(cat).then(function (r) {
       state.body = r.body;
@@ -559,7 +714,7 @@
 
       main(
         '<div class="vhead"><h1>' + e(cat) + '</h1>' + capPill +
-        '<span class="spacer"></span><div class="actions">' +
+        '<span class="spacer"></span><div class="actions">' + starButtonHTML('c', cat) +
         '<button class="btn" data-act="edit">Edit</button>' +
         '<a class="btn" href="#/c/' + encodeURIComponent(cat) + '/history">History</a>' +
         '<button class="btn danger" data-act="delete">Delete</button>' +
@@ -582,6 +737,7 @@
         location.hash = '#/c/' + encodeURIComponent(cat) + '/edit';
       };
       $('main').querySelector('[data-act="delete"]').onclick = function () { askDelete(cat); };
+      wireStar('c', cat);
 
       if (line) setTimeout(function () { scrollToLine(line); }, 30);
       if (heading) setTimeout(function () { scrollToHeadingId(heading); }, 30);
@@ -592,11 +748,12 @@
 
   /* ------------------------------------------------------------ doc read view */
 
-  function viewDoc(slug, line) {
+  function viewDoc(slug, line, heading) {
     state.doc = slug;
     state.kind = 'd';
     state.editing = false;
-    renderSidebar();
+    touchRecent('d', slug);
+    renderSidebar(true);
     loading();
     getDoc(slug).then(function (r) {
       state.body = r.body;
@@ -608,7 +765,7 @@
       main(
         '<div class="vhead"><h1>' + e(title) +
         (title !== slug ? ' <span class="muted small">' + e(slug) + '</span>' : '') + '</h1>' +
-        '<span class="spacer"></span><div class="actions">' +
+        '<span class="spacer"></span><div class="actions">' + starButtonHTML('d', slug) +
         '<button class="btn" data-act="edit">Edit</button>' +
         '<a class="btn" href="#/d/' + encodeURIComponent(slug) + '/history">History</a>' +
         '<button class="btn danger" data-act="delete">Delete</button>' +
@@ -625,8 +782,10 @@
         location.hash = '#/d/' + encodeURIComponent(slug) + '/edit';
       };
       $('main').querySelector('[data-act="delete"]').onclick = function () { askDelete(slug, 'd'); };
+      wireStar('d', slug);
 
       if (line) setTimeout(function () { scrollToLine(line); }, 30);
+      if (heading) setTimeout(function () { scrollToHeadingId(heading); }, 30);
     }).catch(function (err) {
       main('<div class="banner bad">' + e(err.message) + '</div>');
     });
@@ -981,7 +1140,8 @@
     state.cat = cat;
     state.kind = 'c';
     state.editing = true;
-    renderSidebar();
+    touchRecent('c', cat);
+    renderSidebar(true);
     loading();
     getCategory(cat).then(function (r) {
       state.body = r.body;
@@ -999,7 +1159,8 @@
     state.doc = slug;
     state.kind = 'd';
     state.editing = true;
-    renderSidebar();
+    touchRecent('d', slug);
+    renderSidebar(true);
     loading();
     getDoc(slug).then(function (r) {
       state.body = r.body;
@@ -1018,7 +1179,7 @@
     state.kind = 'c';
     state.editing = true;
     state.etag = null;
-    renderSidebar();
+    renderSidebar(true);
     var seed = TEMPLATE.replace('DATE', new Date().toISOString().slice(0, 10));
     mainEdit(editorHTML('c', '', seed, true));
     wireEditor('c', null, true);
@@ -1031,7 +1192,7 @@
     state.kind = 'd';
     state.editing = true;
     state.etag = null;
-    renderSidebar();
+    renderSidebar(true);
     var seed = DOC_TEMPLATE;
     mainEdit(editorHTML('d', '', seed, true));
     wireEditor('d', null, true);
@@ -1078,7 +1239,7 @@
             wireEditor(kind, cat, false);
             setDirty(false);
           }
-          renderSidebar();
+          renderSidebar(true);
         });
       })
       .catch(function (err) { $('save').disabled = false; toast(err.message, true); });
@@ -1161,7 +1322,7 @@
     if (kind === 'd') { state.doc = cat; } else { state.cat = cat; }
     state.kind = kind;
     state.editing = false;
-    renderSidebar();
+    renderSidebar(true);
     loading();
     var label = kind === 'd' ? 'doc' : 'category';
     apiJSON(basePath(kind) + encodeURIComponent(cat) + '/history?limit=100').then(function (revs) {
@@ -1188,7 +1349,7 @@
     if (kind === 'd') { state.doc = cat; } else { state.cat = cat; }
     state.kind = kind;
     state.editing = false;
-    renderSidebar();
+    renderSidebar(true);
     loading();
     Promise.all([getItem(kind, cat, sha), getItem(kind, cat).catch(function () { return null; })])
       .then(function (r) {
@@ -1237,7 +1398,7 @@
     state.doc = null;
     state.kind = null;
     state.editing = false;
-    renderSidebar();
+    renderSidebar(true);
     $('search-input').value = q;
     loading();
     var terms = q.split(/\s+/).filter(Boolean);
@@ -1249,7 +1410,7 @@
       }
 
       function renderGroups(list, kind, key) {
-        var groups = {};
+        var groups = Object.create(null);
         list.forEach(function (h) { (groups[h[key]] = groups[h[key]] || []).push(h); });
         return Object.keys(groups).map(function (name) {
           return '<div class="hitgroup"><h3><a href="#/' + kind + '/' + encodeURIComponent(name) + '">' +
@@ -1267,8 +1428,8 @@
       // so a handoff never looks like it lives in the same list as a fact.
       var memHits = hits.filter(function (h) { return h.kind !== 'doc'; });
       var docHits = hits.filter(function (h) { return h.kind === 'doc'; });
-      var catCount = {}; memHits.forEach(function (h) { catCount[h.category] = 1; });
-      var docCount = {}; docHits.forEach(function (h) { docCount[h.doc] = 1; });
+      var catCount = Object.create(null); memHits.forEach(function (h) { catCount[h.category] = 1; });
+      var docCount = Object.create(null); docHits.forEach(function (h) { docCount[h.doc] = 1; });
 
       main('<div class="vhead"><h1>' + hits.length + ' hits</h1></div>' +
         '<p class="vsub">for <code>' + e(q) + '</code> across ' + Object.keys(catCount).length + ' categories' +
@@ -1304,12 +1465,199 @@
   // on screen with an empty box, which reads as broken rather than cleared
   $('search-input').addEventListener('search', submitSearch);
 
-  $('new-btn').addEventListener('click', function (ev) {
-    ev.stopPropagation();
-    $('new-menu').classList.toggle('hidden');
+  /* ---------------------------------------------------------------- menus */
+
+  // Disclosure menus ("+ New", the overflow "⋯"): the button toggles, a click
+  // anywhere else or Escape closes, arrows move between items. A click that
+  // came from the keyboard (detail === 0) lands focus on the first item.
+  var menus = [];
+
+  function wireMenu(btn, menu) {
+    function items() { return Array.prototype.slice.call(menu.querySelectorAll('[role="menuitem"]')); }
+    function isOpen() { return !menu.classList.contains('hidden'); }
+    function close(refocus) {
+      menu.classList.add('hidden');
+      btn.setAttribute('aria-expanded', 'false');
+      if (refocus) btn.focus();
+    }
+    function open(focusFirst) {
+      closeMenus();
+      menu.classList.remove('hidden');
+      btn.setAttribute('aria-expanded', 'true');
+      if (focusFirst) { var first = items()[0]; if (first) first.focus(); }
+    }
+    btn.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      if (isOpen()) close(false); else open(ev.detail === 0);
+    });
+    btn.addEventListener('keydown', function (ev) {
+      if (ev.key === 'ArrowDown') { ev.preventDefault(); open(true); }
+      else if (ev.key === 'Escape' && isOpen()) { ev.stopPropagation(); close(false); }
+    });
+    menu.addEventListener('keydown', function (ev) {
+      var list = items(), i = list.indexOf(document.activeElement);
+      if (ev.key === 'Escape') { ev.stopPropagation(); close(true); }
+      else if (ev.key === 'ArrowDown') { ev.preventDefault(); list[(i + 1) % list.length].focus(); }
+      else if (ev.key === 'ArrowUp') { ev.preventDefault(); list[(i - 1 + list.length) % list.length].focus(); }
+      else if (ev.key === 'Home') { ev.preventDefault(); list[0].focus(); }
+      else if (ev.key === 'End') { ev.preventDefault(); list[list.length - 1].focus(); }
+      else if (ev.key === 'Tab') close(false);
+    });
+    // choosing an item closes the menu; the item's own link/handler still runs
+    menu.addEventListener('click', function () { close(false); });
+    menus.push(close);
+  }
+
+  function closeMenus() { menus.forEach(function (close) { close(false); }); }
+  document.addEventListener('click', closeMenus);
+
+  wireMenu($('new-btn'), $('new-menu'));
+  wireMenu($('more-btn'), $('more-menu'));
+
+  /* -------------------------------------------------------- quick jump */
+
+  /* Ctrl/Cmd+K (or "/" outside a text field) opens a palette over categories,
+   * docs and their "##" sections. It navigates by setting location.hash, so the
+   * router's unsaved-changes guard applies to it exactly as to a link click. */
+  var palette = null;
+  var isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent || '');
+  var KBD_LABEL = isMac ? '⌘K' : 'Ctrl K';
+  Array.prototype.forEach.call(document.querySelectorAll('.kbd'), function (k) { k.textContent = KBD_LABEL; });
+
+  function typingIn(el) {
+    var t = el && el.tagName;
+    return t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT' || !!(el && el.isContentEditable);
+  }
+
+  function goTo(href) {
+    // setting the same hash fires no hashchange, so a jump to where we already
+    // are (e.g. the same section) has to re-run the route by hand
+    if (location.hash === href) route(); else location.hash = href;
+  }
+
+  function openPalette() {
+    if (palette || $('app').classList.contains('hidden')) return;
+    if ($('modal-root').firstChild) return;      // never stack on another modal
+    var opener = document.activeElement;
+    var items = Nav.buildItems(state.index, state.docs, MD.slug);
+    var byId = Object.create(null);
+    items.forEach(function (it) { byId[it.id] = it; });
+
+    var bg = document.createElement('div');
+    bg.className = 'modal-bg pal-bg';
+    bg.innerHTML = '<div class="pal" role="dialog" aria-modal="true" aria-label="Quick jump">' +
+      '<input id="pal-input" class="pal-input" type="text" role="combobox" aria-expanded="true" ' +
+      'aria-controls="pal-list" aria-autocomplete="list" autocomplete="off" spellcheck="false" ' +
+      'placeholder="Jump to a category, doc or section…" aria-label="Jump to">' +
+      '<div id="pal-cap" class="pal-cap"></div>' +
+      '<div id="pal-list" class="pal-list" role="listbox" aria-label="Results"></div>' +
+      '<div class="pal-foot">↑↓ move · Enter open · Esc close</div></div>';
+    $('modal-root').appendChild(bg);
+
+    var input = bg.querySelector('#pal-input'), list = bg.querySelector('#pal-list'), cap = bg.querySelector('#pal-cap');
+    var results = [], sel = 0;
+
+    // empty query: what you opened lately, else what you pinned, else what changed
+    function idle() {
+      var refs = lsList(K_RECENT);
+      var label = 'Recent';
+      if (!refs.length) { refs = lsList(K_STARRED); label = 'Pinned'; }
+      var found = refs.map(function (k) { return byId[k]; }).filter(Boolean);
+      if (!found.length) {
+        label = 'Recently changed';
+        found = state.index.slice().sort(function (a, b) {
+          return Date.parse(b.mtime) - Date.parse(a.mtime);
+        }).slice(0, RECENT_MAX).map(function (c) { return byId['c:' + c.category]; });
+      }
+      return { label: label, items: found.slice(0, PALETTE_MAX) };
+    }
+
+    var KIND = { c: 'cat', d: 'doc', s: 'sec' };
+
+    function draw() {
+      var q = input.value.trim();
+      if (q) { results = Nav.search(items, q, PALETTE_MAX); cap.textContent = results.length ? '' : 'No matches'; }
+      else { var i = idle(); results = i.items; cap.textContent = results.length ? i.label : ''; }
+      if (sel >= results.length) sel = Math.max(0, results.length - 1);
+      list.innerHTML = results.map(function (it, n) {
+        return '<div class="pal-row' + (n === sel ? ' sel' : '') + '" role="option" id="pal-o-' + n +
+          '" aria-selected="' + (n === sel) + '" data-i="' + n + '">' +
+          '<span class="pal-kind k-' + it.kind + '">' + KIND[it.kind] + '</span>' +
+          '<span class="pal-label">' + e(it.label) + '</span>' +
+          (it.sub ? '<span class="pal-sub">' + e(it.sub) + '</span>' : '') + '</div>';
+      }).join('');
+      mark();
+    }
+
+    function mark() {
+      var rows = list.children;
+      for (var n = 0; n < rows.length; n++) {
+        rows[n].classList.toggle('sel', n === sel);
+        rows[n].setAttribute('aria-selected', n === sel);
+      }
+      if (rows[sel]) {
+        input.setAttribute('aria-activedescendant', rows[sel].id);
+        rows[sel].scrollIntoView({ block: 'nearest' });
+      } else {
+        input.removeAttribute('aria-activedescendant');
+      }
+    }
+
+    function close(restore) {
+      document.removeEventListener('keydown', onKey, true);
+      bg.remove();
+      palette = null;
+      if (restore && opener && opener.isConnected && opener.focus) opener.focus();
+    }
+
+    function go(it) {
+      if (!it) return;
+      close(true);
+      goTo(it.href);
+    }
+
+    function onKey(ev) {
+      if (ev.key === 'Escape') { ev.preventDefault(); close(true); }
+    }
+
+    input.addEventListener('input', function () { sel = 0; draw(); });
+    input.addEventListener('keydown', function (ev) {
+      var n = results.length;
+      if (ev.key === 'ArrowDown') { ev.preventDefault(); if (n) { sel = (sel + 1) % n; mark(); } }
+      else if (ev.key === 'ArrowUp') { ev.preventDefault(); if (n) { sel = (sel - 1 + n) % n; mark(); } }
+      else if (ev.key === 'Enter') { ev.preventDefault(); go(results[sel]); }
+      else if (ev.key === 'Tab') { ev.preventDefault(); }       // the input is the only stop
+    });
+    list.addEventListener('mousemove', function (ev) {
+      var row = ev.target.closest('.pal-row');
+      if (row && +row.getAttribute('data-i') !== sel) { sel = +row.getAttribute('data-i'); mark(); }
+    });
+    list.addEventListener('click', function (ev) {
+      var row = ev.target.closest('.pal-row');
+      if (row) go(results[+row.getAttribute('data-i')]);
+    });
+    bg.addEventListener('mousedown', function (ev) { if (ev.target === bg) close(true); });
+    document.addEventListener('keydown', onKey, true);
+
+    palette = { close: close };
+    draw();
+    input.focus();
+  }
+
+  $('jump-btn').addEventListener('click', openPalette);
+  $('kbd-hint').addEventListener('click', openPalette);
+
+  document.addEventListener('keydown', function (ev) {
+    if ($('app').classList.contains('hidden')) return;
+    var k = ev.key;
+    if ((ev.ctrlKey || ev.metaKey) && !ev.altKey && !ev.shiftKey && (k === 'k' || k === 'K')) {
+      ev.preventDefault();
+      if (palette) palette.close(true); else openPalette();
+    } else if (k === '/' && !ev.ctrlKey && !ev.metaKey && !ev.altKey && !palette && !typingIn(ev.target)) {
+      ev.preventDefault();
+      openPalette();
+    }
   });
-  $('new-menu').addEventListener('click', function () { $('new-menu').classList.add('hidden'); });
-  document.addEventListener('click', function () { $('new-menu').classList.add('hidden'); });
 
   /* ----------------------------------------------------------------- pins */
 
@@ -1334,7 +1682,7 @@
     state.doc = null;
     state.kind = null;
     state.editing = false;
-    renderSidebar();
+    renderSidebar(true);
     loading();
     apiJSON('/memory/pins').then(function (list) {
       updatePinsBadge(list.length);
@@ -1347,10 +1695,10 @@
 
       // category -> section -> [pin, ...], in the order scan_pins() returned
       // them (file order, then line order within a file).
-      var byCat = {};
+      var byCat = Object.create(null);
       var order = [];
       list.forEach(function (p) {
-        if (!byCat[p.category]) { byCat[p.category] = {}; order.push(p.category); }
+        if (!byCat[p.category]) { byCat[p.category] = Object.create(null); order.push(p.category); }
         var sec = p.section || '(preamble)';
         (byCat[p.category][sec] = byCat[p.category][sec] || []).push(p);
       });
@@ -1406,7 +1754,7 @@
     state.doc = null;
     state.kind = null;
     state.editing = false;
-    renderSidebar();
+    renderSidebar(true);
     loading();
     api('/auth/keys').then(function (res) {
       if (!res.ok) {
@@ -1481,7 +1829,13 @@
       });
       html.push('</tbody></table>');
     }
+    // Passkeys are a section of this page rather than a page of their own: the
+    // keys above and the passkeys below are both "ways in", managed together.
+    // The server reports whether it is configured; when it is not, nothing here.
+    if (authInfo.passkey === true) html.push(passkeysSectionHTML());
+
     main(html.join(''));
+    if (authInfo.passkey === true) wirePasskeys();
 
     Array.prototype.forEach.call(document.querySelectorAll('[data-grant]'), function (b) {
       b.onclick = function () {
@@ -1548,6 +1902,90 @@
     });
   }
 
+  /* ------------------------------------------------------------ passkeys */
+
+  function passkeysSectionHTML() {
+    return '<h2 class="keyh2">Passkeys</h2>' +
+      '<p class="vsub">Sign in with this device\'s own unlock (Windows Hello, Touch ID, a phone or a ' +
+      'security key) instead of the master token. Adding one needs a sign-in from the last 15 minutes.</p>' +
+      (Passkey.supported()
+        ? '<form id="pk-new" class="keyform">' +
+          '<input id="pk-name" type="text" placeholder="Name this passkey (e.g. laptop, phone)" ' +
+          'maxlength="40" spellcheck="false" aria-label="Passkey name">' +
+          '<button type="submit" class="btn primary" id="pk-add">Add a passkey</button></form>'
+        : '<p class="vsub">This browser does not support passkeys (WebAuthn), so one cannot be added ' +
+          'from here. Existing passkeys can still be removed.</p>') +
+      '<p id="pk-err" class="error small hidden"></p>' +
+      '<div id="pk-list"><p class="vsub">Loading…</p></div>';
+  }
+
+  function passkeyMessage(text, quiet) {
+    var el = $('pk-err');
+    if (!el) return;
+    el.textContent = text;
+    el.className = (quiet ? 'muted' : 'error') + ' small';
+  }
+
+  function loadPasskeys() {
+    return api('/auth/passkeys').then(function (res) {
+      var box = $('pk-list');
+      if (!box) return;
+      if (!res.ok) {
+        return res.text().then(function (t) {
+          box.innerHTML = '<p class="vsub error">' + e(detail(t, res.status)) + '</p>';
+        });
+      }
+      return res.json().then(function (data) {
+        var list = data.passkeys || [];
+        if (!list.length) { box.innerHTML = '<p class="vsub">No passkeys yet.</p>'; return; }
+        box.innerHTML = '<table class="keytable"><thead><tr><th>Name</th><th>Created</th>' +
+          '<th>Last used</th><th></th></tr></thead><tbody>' + list.map(function (k) {
+            return '<tr><td>' + e(k.name) + '</td><td class="muted small">' +
+              e((k.created || '').slice(0, 10)) + '</td><td class="muted small">' +
+              e(k.last_used ? k.last_used.slice(0, 10) : 'never') +
+              '</td><td><button class="btn small danger" data-pkdel="' + e(k.id) +
+              '" data-name="' + e(k.name) + '">Delete</button></td></tr>';
+          }).join('') + '</tbody></table>';
+      });
+    }).catch(function (err) { if ($('pk-list')) $('pk-list').innerHTML = '<p class="vsub error">' + e(err.message) + '</p>'; });
+  }
+
+  function wirePasskeys() {
+    loadPasskeys();
+
+    var form = $('pk-new');
+    if (form) form.addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      var name = $('pk-name').value.trim(), btn = $('pk-add');
+      $('pk-err').classList.add('hidden');
+      if (!name) { passkeyMessage('Give the passkey a name first.'); return; }
+      btn.disabled = true;
+      Passkey.register(name).then(function () {
+        $('pk-name').value = '';
+        toast('Passkey added');
+        return loadPasskeys();
+      }).catch(function (err) {
+        if (err && err.status === 401) { showLogin(); return; }
+        var x = Passkey.explain(err, 'register');
+        passkeyMessage(x.text, x.quiet);
+      }).then(function () { btn.disabled = false; });
+    });
+
+    $('pk-list').addEventListener('click', function (ev) {
+      var b = ev.target.closest('[data-pkdel]');
+      if (!b) return;
+      if (!confirm('Delete passkey "' + b.getAttribute('data-name') +
+                   '"? It can no longer be used to sign in.')) return;
+      api('/auth/passkeys/' + encodeURIComponent(b.getAttribute('data-pkdel')), { method: 'DELETE' })
+        .then(function (res) {
+          if (!res.ok) return res.text().then(function (t) { throw new Error(detail(t, res.status)); });
+          toast('Passkey deleted');
+          return loadPasskeys();
+        })
+        .catch(function (err) { toast(err.message, true); });
+    });
+  }
+
   // Re-list without wiping the freshly shown secret above it.
   function viewKeysRefresh() {
     api('/auth/keys').then(function (res) {
@@ -1560,12 +1998,14 @@
     });
   }
 
-  function viewStale() {
+  // The one place that answers "what needs attention": size first, then
+  // freshness. #/stale (the old route) lands here too.
+  function viewHealth() {
     state.cat = null;
     state.doc = null;
     state.kind = null;
     state.editing = false;
-    renderSidebar();
+    renderSidebar(true);
 
     var threshold = staleThreshold();
     var rows = [];
@@ -1591,16 +2031,33 @@
     });
     rows.sort(function (a, b) { return b.age - a.age; });
 
+    var big = state.index.slice().sort(function (a, b) { return b.bytes - a.bytes; }).slice(0, 10);
+    var over = state.index.filter(function (c) { return c.bytes >= CAP_BYTES; }).length;
+    var near = state.index.filter(function (c) { return c.bytes >= WARN_BYTES && c.bytes < CAP_BYTES; }).length;
+
     var html = [
-      '<div class="vhead"><h1>Stale sections</h1><span class="spacer"></span>' +
-      '<div class="seg" id="stale-seg" role="tablist">' +
+      '<div class="vhead"><h1>Health</h1></div>',
+      '<p class="vsub">' + state.index.length + ' categories · ' + over + ' over the ' + fmtBytes(CAP_BYTES) +
+      ' soft cap · ' + near + ' near it (from ' + fmtBytes(WARN_BYTES) + ')</p>',
+      '<h2 class="keyh2 first">Largest</h2>',
+      '<div class="revs">' + big.map(function (c) {
+        var pct = Math.min(100, Math.round(c.bytes / CAP_BYTES * 100));
+        var cls = c.bytes >= CAP_BYTES ? ' over' : c.bytes >= WARN_BYTES ? ' warn' : '';
+        return '<div class="rev"><a class="msg" href="#/c/' + encodeURIComponent(c.category) + '">' +
+          e(c.category) + '</a><div class="bar hbar' + cls + '"><i style="width:' + pct + '%"></i></div>' +
+          '<span class="when">' + fmtBytes(c.bytes) + '</span>' +
+          (c.bytes >= CAP_BYTES ? '<span class="pill stale">split</span>'
+            : c.bytes >= WARN_BYTES ? '<span class="pill warn">near cap</span>' : '') + '</div>';
+      }).join('') + '</div>',
+      '<div class="vhead stalehead"><h2 class="keyh2">Stale sections</h2><span class="spacer"></span>' +
+      '<div class="seg always" id="stale-seg" role="tablist" aria-label="Staleness threshold">' +
       STALE_THRESHOLDS.map(function (d) {
         return '<button data-d="' + d + '" class="' + (d === threshold ? 'on' : '') +
-          '" role="tab">' + d + 'd</button>';
+          '" role="tab" aria-selected="' + (d === threshold) + '">' + d + 'd</button>';
       }).join('') + '</div></div>',
       '<p class="vsub">' + rows.length + ' section' + (rows.length === 1 ? '' : 's') +
       ' unverified for over ' + threshold + ' days' +
-      (noMarkerCount ? ' (' + noMarkerCount + ' with no <!-- verified: --> marker at all)' : '') +
+      (noMarkerCount ? ' (' + noMarkerCount + ' with no &lt;!-- verified: --&gt; marker at all)' : '') +
       ' · ' + stableCount + ' section' + (stableCount === 1 ? '' : 's') + ' marked stable</p>'
     ];
 
@@ -1622,7 +2079,7 @@
       var b = ev.target.closest('button[data-d]');
       if (!b) return;
       setStaleThreshold(parseInt(b.getAttribute('data-d'), 10));
-      viewStale();
+      viewHealth();
     });
   }
 
@@ -1630,6 +2087,7 @@
 
   function route() {
     if (state.suppressRoute) { state.suppressRoute = false; return; }
+    unforced = Object.create(null);
     closeDrawer();
     var h = location.hash.replace(/^#/, '');
 
@@ -1653,7 +2111,8 @@
 
     if (parts[0] === 'pins') return viewPins();
     if (parts[0] === 'keys') return viewKeys();
-    if (parts[0] === 'stale') return viewStale();
+    // #/stale predates the health view and stays valid for old links
+    if (parts[0] === 'health' || parts[0] === 'stale') return viewHealth();
 
     if (parts[0] === 'c' && parts[1]) {
       var cat = decodeURIComponent(parts[1]);
@@ -1671,6 +2130,7 @@
       if (parts[2] === 'history') return viewHistory('d', slug);
       if (parts[2] === 'rev' && parts[3]) return viewRev('d', slug, parts[3]);
       if (parts[2] === 'l' && parts[3]) return viewDoc(slug, parseInt(parts[3], 10));
+      if (parts[2] === 'h' && parts[3]) return viewDoc(slug, null, decodeURIComponent(parts[3]));
       return viewDoc(slug);
     }
     return viewHome();
@@ -1704,7 +2164,7 @@
       // whether Google is configured, and showLogin() needs it later if the
       // session expires while the tab is open.
       if (me && me.providers) authInfo = me;
-      if (me.email) $('logout-btn').title = 'Signed in as ' + me.email;
+      if (me.email) $('logout-btn').title = 'Sign out (signed in as ' + me.email + ')';
       return me.authenticated ? showApp() : showLogin(me);
     })
     .catch(function () { showLogin(); });

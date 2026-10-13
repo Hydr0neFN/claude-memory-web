@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Administer auth.json -- the OAuth sign-in config for the memory web UI.
+"""Administer auth.json -- the OAuth sign-in config for the memory web UI --
+and list or delete the passkeys in passkeys.json.
 
 Run it on the box, as the service user, so the file it writes is already owned
 by the account that has to read it:
@@ -36,6 +37,8 @@ USAGE = """usage: manage_auth.py <command> [args]
   disable <provider>           forget that provider's config entirely (bumps keyver)
   sign-out-everyone            invalidate every browser session, and every key
                                and connector created from one (bumps keyver)
+  passkeys                     list the registered passkeys
+  passkey-delete <id>          delete one; it can no longer sign in, at once
 
   <provider> is one of: %s
 
@@ -45,7 +48,11 @@ answers 503. The API token still signs in at / regardless.
 
 MEMORY_AUTH_FILE overrides the file location (default: auth.json next to
 main.py). It must NOT be inside data/ -- that is a git repo that keeps every
-version of every file in it forever.""" % ", ".join(PROVIDERS)
+version of every file in it forever. MEMORY_PASSKEY_FILE does the same for
+passkeys.json.
+
+Passkeys are registered from the browser, never here: creating one takes the
+authenticator. Whether they are offered at all is MEMORY_RP_ID in .env.""" % ", ".join(PROVIDERS)
 
 
 def path() -> Path:
@@ -206,12 +213,68 @@ def bump_keyver(data: dict) -> None:
           % data["keyver"])
     print("every API key and connector grant created from one (older ones carry no")
     print("keyver and survive). The master bearer token is unaffected.")
+    # A passkey is not a session and is not tied to keyver: the owner's own
+    # must keep working after this, or signing everyone out would lock the
+    # owner out too. So one registered by whoever is being signed out survives
+    # as well, and has to be looked for by hand.
+    print("Registered passkeys are NOT removed and can sign straight back in. If a")
+    print("session may have been stolen, check the list for one you did not create:")
+    print("  manage_auth.py passkeys")
 
 
 def cmd_sign_out_everyone() -> None:
     data = load()
     bump_keyver(data)
     save(data)
+
+
+def passkey_store():
+    """passkeys.py pulls in `cryptography`, which nothing else in this file
+    needs, so it is imported only by the two commands that use it: the OAuth
+    commands keep working from any python."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        import passkeys
+    except ImportError as exc:
+        die("cannot load passkeys.py (%s); run this with the service's venv python" % exc)
+    return passkeys, passkeys.PasskeyStore()
+
+
+def cmd_passkeys() -> None:
+    passkeys, store = passkey_store()
+    p = store.path
+    print("file        %s%s" % (p, "" if p.exists() else "  (does not exist yet)"))
+    if p.exists():
+        mode = stat.S_IMODE(p.stat().st_mode)
+        print("mode        %o%s" % (mode, "" if mode == 0o600 else "   <-- should be 600"))
+    if store.damaged:
+        # The service reads such a file as "no passkeys": nobody can sign in
+        # with one until it is repaired. Say that, not an empty list.
+        die("%s is not a readable passkey store; the service treats it as empty" % p)
+    rows = [r for r in store.load().get("passkeys", []) if isinstance(r, dict)]
+    if not rows:
+        print("no passkeys registered")
+        return
+    print("%-17s %-6s %-21s %-21s %s" % ("id", "alg", "created", "last used", "name"))
+    for r in rows:
+        print("%-17s %-6s %-21s %-21s %s"
+              % (r.get("id"), passkeys.ALG_NAMES.get(r.get("alg"), "?"),
+                 r.get("created") or "-", r.get("last_used") or "never", r.get("name")))
+
+
+def cmd_passkey_delete(argv) -> None:
+    if len(argv) != 1:
+        die("give the id of one passkey (see: manage_auth.py passkeys)")
+    passkeys, store = passkey_store()
+    try:
+        found = store.delete(argv[0])
+    except passkeys.StoreError as exc:
+        die(str(exc))
+    if not found:
+        die("no passkey with id %r" % argv[0])
+    # Sessions it already opened are ordinary sessions and are still valid.
+    print("deleted passkey %s. It can no longer sign in; a session it already" % argv[0])
+    print("opened lives on until it expires -- sign-out-everyone ends those.")
 
 
 def main(argv) -> int:
@@ -231,6 +294,10 @@ def main(argv) -> int:
         cmd_disable(rest)
     elif cmd == "sign-out-everyone":
         cmd_sign_out_everyone()
+    elif cmd == "passkeys":
+        cmd_passkeys()
+    elif cmd == "passkey-delete":
+        cmd_passkey_delete(rest)
     else:
         die("unknown command %r\n\n%s" % (cmd, USAGE))
     return 0

@@ -1,6 +1,6 @@
 """Browser-session auth for the memory web UI.
 
-Two ways in, deliberately asymmetric:
+Two kinds of way in, deliberately asymmetric:
 
   bearer token   the machine credential (API keys, the SessionStart hook,
                  claude.ai). High-entropy, held by programs, and untouched by
@@ -24,13 +24,20 @@ Two ways in, deliberately asymmetric:
                  the spot -- which of the two is available is a fact about the
                  provider on the day, not a design decision.
 
-Both end at the same HMAC-signed, HttpOnly cookie: JavaScript can never read
-it, and the signing key is derived from the API token, so there is no second
-secret to store or back up, and rotating the API token logs every browser out.
+  a passkey      the human credential that needs no third party, added
+                 2026-10-13. Everything about the key pair is in passkeys.py;
+                 what lives here is the session subject a passkey sign-in ends
+                 at and the signed cookie that carries a WebAuthn challenge
+                 back from the browser it was issued to.
+
+All of them end at the same HMAC-signed, HttpOnly cookie: JavaScript can never
+read it, and the signing key is derived from the API token, so there is no
+second secret to store or back up, and rotating the API token logs every
+browser out.
 An instance that wants the two decoupled sets MEMORY_SESSION_KEY; main.py then
 hands that to Session in place of the token.
 
-Both paths read the identity over a direct back-channel call, so no token
+Both OAuth paths read the identity over a direct back-channel call, so no token
 signature has to be verified here: nothing between us and the provider's token
 endpoint can substitute a response, which is the property JWT verification
 exists to establish. That is what keeps this dependency-free.
@@ -55,6 +62,14 @@ OAUTH_COOKIE = "mem_oauth"
 # The OAuth handshake is a page load and a form submit; ten minutes is already
 # generous, and this cookie carries the PKCE verifier, so it should not linger.
 OAUTH_SECONDS = 600
+PASSKEY_COOKIE = "mem_pk"
+# One WebAuthn ceremony: a fingerprint prompt, or the walk to another device's
+# QR code. The same figure is the `timeout` the browser is given, so a
+# challenge never outlives the prompt it was issued for.
+PASSKEY_SECONDS = 300
+# The two ceremonies, spelled as clientDataJSON.type spells them minus the
+# "webauthn." prefix. Signed into the challenge cookie: see issue_challenge.
+PASSKEY_CEREMONIES = ("create", "get")
 
 # Bumping this string invalidates every existing session without touching the
 # API token -- the emergency "log every browser out" lever. `keyver` in
@@ -64,7 +79,8 @@ KEY_CONTEXT = b"memory-webui-v1"
 SUBJECT_TOKEN = "web"   # signed in by presenting the API token
 SUBJECT_GOOGLE = "ggl"  # signed in with Google
 SUBJECT_GITHUB = "ghb"  # signed in with GitHub
-SUBJECTS = (SUBJECT_TOKEN, SUBJECT_GOOGLE, SUBJECT_GITHUB)
+SUBJECT_PASSKEY = "pky"  # signed in with a passkey (passkeys.py)
+SUBJECTS = (SUBJECT_TOKEN, SUBJECT_GOOGLE, SUBJECT_GITHUB, SUBJECT_PASSKEY)
 
 # One row per provider. `pkce` records whether the provider honours a
 # code_challenge: GitHub's OAuth Apps ignore it, so for GitHub the handshake is
@@ -528,6 +544,74 @@ class Session:
         if not hmac.compare_digest(parts[3].encode("utf-8"), provider.encode("utf-8")):
             return None
         if not hmac.compare_digest(parts[4].encode("utf-8"), (state or "").encode("utf-8")):
+            return None
+        return parts[5]
+
+    # -- the WebAuthn challenge cookie -------------------------------------
+
+    @staticmethod
+    def _bind_tag(bind: str) -> str:
+        return hashlib.sha256(bind.encode("utf-8")).hexdigest()[:32]
+
+    def issue_challenge(self, ceremony: str, keyver: int = 1, bind: str = "") -> tuple:
+        """(cookie_value, challenge) for one passkey ceremony.
+
+        Same construction as the OAuth state cookie, for the same reason: the
+        challenge the authenticator signs is only accepted back from the
+        browser that asked for it, because only that browser holds the signed,
+        HttpOnly cookie naming it. A page that merely learns a challenge
+        (login/options is public) has nothing it can complete.
+
+        `wa:` is a prefix no session subject and no other cookie here uses, so
+        a value signed by this method can never be read back as a session or
+        as OAuth state even though all three share one key.
+
+        The ceremony is signed in. login/options hands a challenge to anyone
+        who asks; without the tag that challenge would also satisfy
+        register/verify, and the one check standing between a signed-in tab
+        and a new permanent credential would be something an anonymous caller
+        can obtain.
+
+        `bind` is whatever else the caller wants the cookie tied to -- main.py
+        passes the process's challenge epoch, and for registration the session
+        cookie too. Only a digest of it is stored: the cookie must not carry a
+        second copy of the session."""
+        if ceremony not in PASSKEY_CEREMONIES:
+            raise ValueError("unknown ceremony %r" % ceremony)
+        challenge = b64u(secrets.token_bytes(32))
+        value = "wa:%d:%d:%s:%s:%s" % (keyver, int(time.time()), ceremony,
+                                       self._bind_tag(bind), challenge)
+        return self.sign(value, keyver), challenge
+
+    def read_challenge(self, cookie, ceremony: str, keyver: int = 1, bind: str = ""):
+        """Return the challenge if the cookie is ours, was issued for this
+        ceremony and this `bind`, and is at most PASSKEY_SECONDS old;
+        otherwise None.
+
+        This says nothing about whether the challenge was used before. That
+        needs memory, which a signed cookie does not have: the caller spends
+        the challenge in passkeys.Challenges."""
+        if not cookie or not isinstance(cookie, str) or "." not in cookie:
+            return None
+        value, mac = cookie.rsplit(".", 1)
+        parts = value.split(":")
+        if len(parts) != 6 or parts[0] != "wa":
+            return None
+        try:
+            cookie_kv, issued = int(parts[1]), int(parts[2])
+        except ValueError:
+            return None
+        if cookie_kv != keyver:
+            return None
+        want = hmac.new(self.key(cookie_kv), value.encode("utf-8"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(mac.encode("utf-8"), want.encode("utf-8")):
+            return None
+        if not (0 <= time.time() - issued <= PASSKEY_SECONDS):
+            return None
+        if not hmac.compare_digest(parts[3].encode("utf-8"), ceremony.encode("utf-8")):
+            return None
+        if not hmac.compare_digest(parts[4].encode("utf-8"),
+                                   self._bind_tag(bind).encode("utf-8")):
             return None
         return parts[5]
 

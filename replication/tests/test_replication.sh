@@ -231,6 +231,10 @@ echo "=== 7. handback: NL wrote, minted a grant; TW takes it all back ==="
 write nl yu-i "nl-w1"; check "NL write accepted" 0 $?
 on nl memsync-push yu-i; check "NL pushes to its vault + GitHub" 0 $?
 echo '{"grants":["nl-minted-during-failover"]}' > "$T/nl/state/yu-i/mcpoauth.json"
+# passkeys.json follows the lease like the grants: TW still holds what it had
+# when it was fenced, NL registered one while it was the writer.
+echo '{"passkeys":["tw-before-failover"]}' > "$T/tw/state/yu-i/passkeys.json"
+echo '{"passkeys":["tw-before-failover","nl-registered-during-failover"]}' > "$T/nl/state/yu-i/passkeys.json"
 nl_head=$(head_of nl yu-i)
 : > "$T/trace"
 on tw mem-handback-tw; check "handback exit 0" 0 $?
@@ -238,6 +242,8 @@ check "TW primary" primary "$(role_of tw)"
 check "NL standby" standby "$(role_of nl)"
 check "TW has NL's write" "$nl_head" "$(head_of tw yu-i)"
 check "grant minted on NL copied back" '{"grants":["nl-minted-during-failover"]}' "$(cat "$T/tw/state/yu-i/mcpoauth.json")"
+check "passkey registered on NL copied back" '{"passkeys":["tw-before-failover","nl-registered-during-failover"]}' "$(cat "$T/tw/state/yu-i/passkeys.json")"
+check "an instance with no passkeys.json gets none" no "$(has "$T/tw/state/dad/passkeys.json")"
 check "both hostnames at TW" tw,tw "$(dns)"
 check "no two writers" 0 "$(violations)"
 check "NL units stopped" no "$(running nl yu-i)"
@@ -248,6 +254,11 @@ on tw mem-handback-tw; check "re-run is a no-op" 0 $?
 echo '{"grants":["stale"]}' > "$T/nl/state/dad/mcpoauth.json"; before_dad=$(cat "$T/tw/state/dad/mcpoauth.json")
 on nl memstate-sync; check "standby does not push its state" "$before_dad" "$(cat "$T/tw/state/dad/mcpoauth.json")"
 on tw memstate-sync; check "primary pushes its state" "$before_dad" "$(cat "$T/nl/state/dad/mcpoauth.json")"
+# The same two moves for passkeys.json: a passkey deleted on the primary must
+# not come back from the standby's copy, and must go away on the standby.
+echo '{"passkeys":["tw-kept"]}' > "$T/tw/state/yu-i/passkeys.json"
+on nl memstate-sync; check "standby does not push its passkeys" '{"passkeys":["tw-kept"]}' "$(cat "$T/tw/state/yu-i/passkeys.json")"
+on tw memstate-sync; check "primary pushes its passkeys" '{"passkeys":["tw-kept"]}' "$(cat "$T/nl/state/yu-i/passkeys.json")"
 
 echo "=== 7b. state transfer hardening ==="
 check "state sync carries .env too" "$(cat "$T/tw/state/dad/.env")" "$(cat "$T/nl/state/dad/.env")"
@@ -264,7 +275,7 @@ on nl memstate-xfer push dad; check "a standby cannot push state into the primar
 # .env becomes the peer unit's EnvironmentFile: only the app's own keys pass.
 good_env=$(cat "$T/nl/state/dad/.env")
 mkdir -p "$T/evilenv"
-for bad in 'LD_PRELOAD=/tmp/x.so' 'BASH_ENV=/tmp/x' 'MEMORY_FLAG_DIR=/tmp' 'CLAUDE_MEMORY_TOKEN="a b"' 'CLAUDE_MEMORY_TOKEN="a' 'CLAUDE_MEMORY_TOKEN=a\'; do
+for bad in 'LD_PRELOAD=/tmp/x.so' 'BASH_ENV=/tmp/x' 'MEMORY_FLAG_DIR=/tmp' 'CLAUDE_MEMORY_TOKEN="a b"' 'CLAUDE_MEMORY_TOKEN="a' 'CLAUDE_MEMORY_TOKEN=a\' 'MEMORY_RP_ORIGIN=https://x.test/$(id)' 'MEMORY_PASSKEY_FILE=/tmp/pk.json'; do
     printf 'CLAUDE_MEMORY_TOKEN=ok\n%s\n' "$bad" > "$T/evilenv/.env"
     tar -C "$T/evilenv" -cf "$T/evilenv.tar" .env
     SSH_ORIGINAL_COMMAND="state-recv dad" REPL_CONF=$T/nl/conf bash "$HERE/memctl" < "$T/evilenv.tar" 2>/dev/null
@@ -276,6 +287,15 @@ tar -C "$T/evilenv" -cf "$T/evilenv.tar" .env
 SSH_ORIGINAL_COMMAND="state-recv dad" REPL_CONF=$T/nl/conf bash "$HERE/memctl" < "$T/evilenv.tar" 2>/dev/null
 check "allowlisted .env (comments, CRLF, quoted value) accepted" 0 $?
 check "installed .env is the one sent" "$(cat "$T/evilenv/.env")" "$(cat "$T/nl/state/dad/.env")"
+printf 'CLAUDE_MEMORY_TOKEN=ok\nMEMORY_RP_ID=memory.x.test\nMEMORY_RP_ORIGIN=https://memory.x.test\n' > "$T/evilenv/.env"
+tar -C "$T/evilenv" -cf "$T/evilenv.tar" .env
+SSH_ORIGINAL_COMMAND="state-recv dad" REPL_CONF=$T/nl/conf bash "$HERE/memctl" < "$T/evilenv.tar" 2>/dev/null
+check ".env with the passkey RP id and an https origin accepted" 0 $?
+check "... and installed as sent" "$(cat "$T/evilenv/.env")" "$(cat "$T/nl/state/dad/.env")"
+printf 'CLAUDE_MEMORY_TOKEN=ok\nMEMORY_RP_ORIGIN="http://localhost:8787"\n' > "$T/evilenv/.env"
+tar -C "$T/evilenv" -cf "$T/evilenv.tar" .env
+SSH_ORIGINAL_COMMAND="state-recv dad" REPL_CONF=$T/nl/conf bash "$HERE/memctl" < "$T/evilenv.tar" 2>/dev/null
+check ".env with a quoted origin carrying a port accepted" 0 $?
 printf '%s\n' "$good_env" > "$T/nl/state/dad/.env"
 
 echo "=== 8. TW only unreachable over Tailscale, still serving: promotion refused ==="

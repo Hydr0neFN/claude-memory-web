@@ -9,7 +9,8 @@ session — Claude Code on any machine, claude.ai, the Claude apps — reads and
 writes the same memory. The same app serves a browser UI at `/` for people, so
 there is no CORS, no second host and no build step.
 
-Vanilla JS, no npm, no CDN, no dependencies. It runs off a Raspberry Pi 4.
+Vanilla JS, no npm, no CDN, no build. The server needs four Python packages
+(`requirements.txt`). It runs off a Raspberry Pi 4.
 
 ![no build step](https://img.shields.io/badge/build-none-informational)
 
@@ -151,7 +152,10 @@ status line cannot be used to tell success from failure. GitHub identity comes
 from `GET /user/emails`, which returns every address on the account, so the
 allowlist is matched against the verified ones.
 
-Both paths end at the same cookie. `POST /auth/login` with the token still
+**Or with a passkey**, once one is registered: the phone's own fingerprint or
+PIN, and no third party in the loop at all. See [Passkeys](#passkeys).
+
+All of these end at the same cookie. `POST /auth/login` with the token still
 works and is the way back in when Google is unreachable, when the allowlist is
 wrong, or when there is no browser to run a consent screen.
 
@@ -176,6 +180,59 @@ KDF; there is nothing to brute-force.
 
 A key is what Claude Code sends to `/mcp` as `Authorization: Bearer <key>`; the
 page shows the ready `claude mcp add` command next to the new secret.
+
+### Passkeys
+
+A passkey is a key pair the phone or laptop holds and will only use for this
+site after a fingerprint, face or PIN. The service stores the public half and
+nothing else — `passkeys.json` (mode 600, beside `main.py`, never inside
+`data/`) — so there is nothing on the box worth stealing and no second secret
+to back up. Signing in with one ends at the same `mem_session` cookie as every
+other sign-in, and `/auth/me` reports it as `"via": "passkey"`.
+
+Set `MEMORY_RP_ID` to the public hostname (or set `MEMORY_PUBLIC_URL` and leave
+it to that) and restart; the sign-in page then offers it. With neither set,
+passkeys are off: every passkey route answers 503 and `/auth/me` says
+`"passkey": false`. The relying-party id and origin come from configuration and
+never from the `Host` header — a page that proxies this one under another name
+would otherwise have its own origin accepted.
+
+| Route | Who may call |
+|---|---|
+| `POST /auth/passkey/register/options`, `…/register/verify` | a signed-in browser (cookie + `X-Memory-Actor`) whose sign-in is under 15 minutes old |
+| `POST /auth/passkey/login/options`, `…/login/verify` | anyone; 5 failed sign-ins per client per 5 minutes, then 429 on both |
+| `GET /auth/passkeys`, `DELETE /auth/passkeys/{id}` | a signed-in browser (cookie + `X-Memory-Actor`) |
+
+Registering takes a recent sign-in for the same reason minting a key does: a
+passkey outlives the session that created it, so script running in a tab that
+has been signed in for a week cannot quietly add one. A bearer credential can
+never register one. Deleting takes no recent sign-in — the person who has just
+lost a phone should not first have to find another way in.
+
+What is checked, in short: the challenge was issued to this browser (a signed,
+HttpOnly cookie), for this ceremony, within 5 minutes, and is spent on the first
+attempt whether it succeeds or not; the origin and the hash of the RP id match
+exactly; the authenticator says the user was present *and* verified; the
+signature over `authenticatorData || SHA-256(clientDataJSON)` verifies with the
+stored key (ES256, RS256 or Ed25519, the key's type and size pinned to that
+algorithm); and the sign counter has moved forwards unless the authenticator
+keeps none. `userHandle` is ignored. A refused sign-in is one status and one
+body whatever the reason, so the route cannot be used to learn which
+credentials exist, and the sign-in options never name one.
+
+At most 10 passkeys. `keyver` (sign-out-everyone) ends every passkey *session*
+but leaves the passkeys registered, so the owner can sign straight back in —
+which also means a passkey somebody else registered survives it; read the
+list. On the box:
+
+```bash
+sudo -u claudemem $APP_DIR/venv/bin/python $APP_DIR/manage_auth.py passkeys
+sudo -u claudemem $APP_DIR/venv/bin/python $APP_DIR/manage_auth.py passkey-delete <id>
+```
+
+A damaged `passkeys.json` reads as empty: passkey sign-in fails closed, the
+token and every bearer credential keep working, and nothing overwrites the
+file until it is fixed. Like `auth.json`, it is re-read when its bytes change.
 
 ### Configuring a provider
 
@@ -219,13 +276,15 @@ described above.
 |---|---|---|
 | `main.py` | `$APP_DIR/main.py` | the API, plus `/auth/*` and the static mount |
 | `webauth.py` | `$APP_DIR/webauth.py` | HMAC cookie sessions, the OAuth provider table, login throttle |
-| `manage_auth.py` | `$APP_DIR/manage_auth.py` | administers `auth.json`: provider clients, allowlists, `keyver` |
+| `manage_auth.py` | `$APP_DIR/manage_auth.py` | administers `auth.json`: provider clients, allowlists, `keyver`; lists and deletes passkeys |
 | `apikeys.py` | `$APP_DIR/apikeys.py` | named revocable bearer keys, minted from the browser |
+| `passkeys.py` | `$APP_DIR/passkeys.py` | passkey (WebAuthn) store and checks; the only module that needs `cryptography` |
+| `requirements.txt` | — | the four runtime packages, for `pip install -r` |
 | `mcpserver.py` | `$APP_DIR/mcpserver.py` | `/mcp`: JSON-RPC dispatch and the eight tools |
 | `mcpoauth.py` | `$APP_DIR/mcpoauth.py` | OAuth 2.1 server for `/mcp`: registration, codes, grants |
 | `web/` | `$APP_DIR/web/` | `index.html`, `app.css`, `app.js`, `md.js`, `diff.js` |
 | `test-web.sh` | `$APP_DIR/test-web.sh` | server test suite, run on the box |
-| `tests/` | `$APP_DIR/tests/` | unit tests: `test_webauth.py` (offline), `test_etag_crlf.py`; `test_mcp_live.py` runs the whole connector flow against a live app; `test_isolation_live.py` proves two instances refuse each other's credentials |
+| `tests/` | `$APP_DIR/tests/` | unit tests: `test_webauth.py` (offline), `test_etag_crlf.py`; `test_passkeys.py` (offline); `test_mcp_live.py` runs the whole connector flow against a live app; `test_passkeys_live.py` does the same for passkeys with a software authenticator; `test_isolation_live.py` proves two instances refuse each other's credentials |
 | `devstub.py` | — | fake backend for local UI work, dev only |
 | `rendertest.js` | — | 28 checks over `md.js` / `diff.js`, dev only |
 | `fixtures/` | — | synthetic corpus the render tests run against |
@@ -237,6 +296,7 @@ python devstub.py     # serves web/ on :8123 with a fake API, no token needed
 node rendertest.js    # markdown + diff checks
 python tests/test_webauth.py   # sessions, keyver, PKCE state, allowlist; no network
 python tests/test_apikeys.py   # minting, verifying, revoking; no network
+python tests/test_passkeys.py  # WebAuthn checks, store, challenge cookie; no network
 ```
 
 `devstub.py` fakes the whole API from in-memory fixtures, including a category
@@ -255,12 +315,14 @@ APP_DIR=/opt/claude-memory          # its install directory
 SVC_USER=claudemem                  # the unprivileged user it runs as
 
 ssh $PI_HOST "mkdir -p /tmp/memweb/web"
-scp main.py webauth.py test-web.sh $PI_HOST:/tmp/memweb/
+scp main.py webauth.py passkeys.py requirements.txt test-web.sh $PI_HOST:/tmp/memweb/
 scp web/* $PI_HOST:/tmp/memweb/web/
 ssh $PI_HOST "cd $APP_DIR \
   && cp -a main.py main.py.bak-\$(date +%F) \
+  && $APP_DIR/venv/bin/pip install -q -r /tmp/memweb/requirements.txt \
   && install -o \$SVC_USER -g \$SVC_USER -m 644 /tmp/memweb/main.py . \
   && install -o \$SVC_USER -g \$SVC_USER -m 644 /tmp/memweb/webauth.py . \
+  && install -o \$SVC_USER -g \$SVC_USER -m 644 /tmp/memweb/passkeys.py . \
   && install -o \$SVC_USER -g \$SVC_USER -m 644 /tmp/memweb/web/* web/ \
   && systemctl restart claude-memory && ./test-web.sh"
 ```
@@ -285,8 +347,11 @@ code, which is how a single install has always worked.
 | `MEMORY_DATA_DIR` | `data/` | categories, `docs/`, the git history |
 | `MEMORY_AUTH_FILE` | `auth.json` | sign-in providers, allowlists, `keyver` |
 | `MEMORY_KEYS_FILE` | `apikeys.json` | named `mem_` keys |
+| `MEMORY_PASSKEY_FILE` | `passkeys.json` | registered passkeys (public keys only) |
 | `MEMORY_OAUTH_FILE` | `mcpoauth.json` | MCP connector grants |
-| `MEMORY_PUBLIC_URL` | the request's Host | issuer / resource URL for `/mcp` |
+| `MEMORY_PUBLIC_URL` | the request's Host | issuer / resource URL for `/mcp`; also the passkey RP id when `MEMORY_RP_ID` is unset |
+| `MEMORY_RP_ID` | the host of `MEMORY_PUBLIC_URL`; neither set = passkeys off | passkey relying-party id: the public hostname, never the Host header |
+| `MEMORY_RP_ORIGIN` | `https://<MEMORY_RP_ID>` (or `MEMORY_PUBLIC_URL`'s origin when the id came from there) | the one origin a passkey ceremony is accepted from |
 | `MEMORY_SESSION_KEY` | derived from `CLAUDE_MEMORY_TOKEN` | cookie-signing secret |
 | `MEMORY_INSTANCE_NAME` | `owner` | whose vault: named in `/mcp` serverInfo and instructions, list/index output, the consent page |
 | `MEMORY_FLAG_DIR` | the parent of `MEMORY_DATA_DIR` | `READONLY` / `ALERT` replication flags (see `replflag.py`) |
@@ -299,6 +364,11 @@ set, but it fills in every one that is missing, so a second instance would
 otherwise inherit the first one's `MEMORY_PUBLIC_URL` or provider settings.
 Each instance needs its own `CLAUDE_MEMORY_TOKEN`; tokens, cookies, `mem_`
 keys and `mcpa_` tokens from one are refused by every other.
+
+A templated unit (`claude-memory@.service`) must name every per-instance file,
+`MEMORY_PASSKEY_FILE` included: left unset, an instance sharing the code
+directory reads the owner's `passkeys.json` next to the code, and a standby
+whose state directory is elsewhere never sees the passkeys replicated to it.
 
 ## Notes
 

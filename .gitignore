@@ -15,4 +15,6 @@ auth.json
 auth.json.tmp
 apikeys.json
 apikeys.json*.tmp
+passkeys.json
+passkeys.json*.tmp
 .env

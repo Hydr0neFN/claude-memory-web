@@ -35,6 +35,7 @@ import apikeys
 import mcpoauth
 import mcpserver
 import passes
+import passkeys
 import replflag
 import searchrank
 import webauth
@@ -180,6 +181,23 @@ oauth_throttle = webauth.Throttle(max_attempts=10, window_sec=300)
 # against its budget; the token endpoint counts failures only.
 register_throttle = webauth.Throttle(max_attempts=10, window_sec=3600)
 token_throttle = webauth.Throttle(max_attempts=20, window_sec=300)
+
+# Passkeys (see passkeys.py). Who we are to an authenticator comes from
+# configuration read once, here, and from nowhere else: MEMORY_RP_ID, or failing
+# that the host of MEMORY_PUBLIC_URL. Neither set means off. A value that is set
+# but unusable also means off -- said once, at start-up, instead of as a
+# sign-in that can never succeed.
+try:
+    PASSKEY_RP = passkeys.relying_party()
+except passkeys.ConfigError as exc:
+    PASSKEY_RP = None
+    print("passkeys are OFF: %s" % exc, file=sys.stderr)
+pkstore = passkeys.PasskeyStore()
+pk_challenges = passkeys.Challenges(webauth.PASSKEY_SECONDS)
+# Its own budget, like oauth_throttle: failed passkey sign-ins must not lock an
+# address out of the token login, which is the way back in when the passkey is
+# the thing that is broken -- and the reverse.
+passkey_throttle = webauth.Throttle(max_attempts=5, window_sec=300)
 
 
 # --------------------------------------------------------------------------
@@ -1139,7 +1157,7 @@ def github_callback(request: Request, code: str = "", state: str = "", error: st
     return oauth_callback("github", request, code, state, error)
 
 
-def require_browser(request: Request) -> None:
+def require_browser(request: Request, what: str = "API keys") -> None:
     """Key management is cookie-only, and deliberately so.
 
     A minted key that could mint more keys would be able to issue itself
@@ -1153,7 +1171,7 @@ def require_browser(request: Request) -> None:
     if check_auth(request) != "cookie":
         raise HTTPException(
             status_code=403,
-            detail="API keys can only be managed from a signed-in browser session",
+            detail="%s can only be managed from a signed-in browser session" % what,
         )
     if not request.headers.get("x-memory-actor"):
         raise HTTPException(
@@ -1169,13 +1187,14 @@ def require_browser(request: Request) -> None:
 RECENT_AUTH_SECONDS = 15 * 60
 
 
-def require_recent_auth(request: Request) -> None:
+def require_recent_auth(request: Request, action: str = "create a key") -> None:
     info = session.read(request.cookies.get(webauth.COOKIE_NAME), creds.keyver)
     if not info or not info.fresh(RECENT_AUTH_SECONDS):
         raise HTTPException(
             status_code=403,
-            detail="sign out and sign in again to create a key "
-                   "(needs a sign-in from the last %d minutes)" % (RECENT_AUTH_SECONDS // 60),
+            detail="sign out and sign in again to %s "
+                   "(needs a sign-in from the last %d minutes)"
+                   % (action, RECENT_AUTH_SECONDS // 60),
         )
 
 
@@ -1211,6 +1230,231 @@ def delete_key(request: Request, key_id: str):
         raise HTTPException(status_code=404, detail="no such key")
     sys.stderr.write("memory: deleted api key %s\n" % key_id)
     return JSONResponse({"deleted": key_id})
+
+
+# --------------------------------------------------------------------------
+# passkeys -- see passkeys.py. The routes translate HTTP and decide who may
+# call; every WebAuthn check lives in the module.
+#
+#   register/*   cookie session + X-Memory-Actor + recent sign-in. A passkey is
+#                a credential that outlives the session, so it is gated exactly
+#                like minting a key -- and a bearer caller can no more register
+#                one than it can mint itself a successor.
+#   login/*      public. That is the point of them, so they are the two routes
+#                here written for a caller who holds nothing: throttled,
+#                body-capped, and answering every refusal identically.
+#   passkeys     list and delete: cookie session + X-Memory-Actor, like keys.
+# --------------------------------------------------------------------------
+
+# A real register/verify body is ~1.5 kB (RSA: ~3 kB). Counted as it streams.
+PASSKEY_MAX_BODY = 32 * 1024
+
+
+def require_passkeys() -> passkeys.RelyingParty:
+    """Called first on every passkey route, before who-may-call is looked at:
+    off means 503 for everyone, and says nothing /auth/me does not already
+    tell an anonymous caller."""
+    if PASSKEY_RP is None:
+        raise HTTPException(status_code=503,
+                            detail="passkey sign-in is not configured on this server")
+    return PASSKEY_RP
+
+
+async def passkey_body(request: Request):
+    """The JSON object in the body, or None for anything else -- too large,
+    not JSON, not an object. The caller refuses None the way it refuses any
+    other failed check, so a malformed body is not a distinguishable answer."""
+    try:
+        data = json.loads(await read_capped_body(request, PASSKEY_MAX_BODY))
+    except (HTTPException, ValueError, RecursionError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def passkey_bind(request: Request, ceremony: str) -> str:
+    """What a challenge cookie is tied to besides its ceremony.
+
+    Always the process's challenge epoch (passkeys.Challenges: a cookie from
+    before a restart must not verify, because the list of spent challenges did
+    not survive it). For registration also the session cookie itself, so the
+    challenge is good for the one sign-in it was issued to and not for
+    whichever session the browser holds by the time verify is called."""
+    if ceremony == "create":
+        return pk_challenges.epoch + ":" + (request.cookies.get(webauth.COOKIE_NAME) or "")
+    return pk_challenges.epoch
+
+
+def passkey_options(request: Request, ceremony: str, public_key: dict):
+    cookie_value, challenge = session.issue_challenge(
+        ceremony, creds.keyver, passkey_bind(request, ceremony))
+    response = JSONResponse({"publicKey": dict(public_key, challenge=challenge)},
+                            headers={"Cache-Control": "no-store"})
+    response.set_cookie(
+        webauth.PASSKEY_COOKIE,
+        cookie_value,
+        max_age=webauth.PASSKEY_SECONDS,
+        httponly=True,
+        secure=webauth.cookie_secure(request),
+        # Strict, unlike the OAuth state cookie: nothing in a passkey ceremony
+        # leaves this site, so there is no cross-site return trip to survive.
+        samesite="strict",
+        path="/auth/passkey",
+    )
+    return response
+
+
+def take_challenge(request: Request, ceremony: str):
+    """The challenge this browser was issued for `ceremony`, or None -- and
+    whichever it is, it is spent now. Called before the body is examined, so
+    an attempt that goes on to fail has still used its challenge up: a
+    challenge is one try, not one success."""
+    challenge = session.read_challenge(request.cookies.get(webauth.PASSKEY_COOKIE),
+                                       ceremony, creds.keyver,
+                                       passkey_bind(request, ceremony))
+    if challenge is None or not pk_challenges.spend(challenge):
+        return None
+    return challenge
+
+
+def passkey_user_id(rp: passkeys.RelyingParty) -> str:
+    """The WebAuthn user handle. One owner per instance, so one constant per
+    instance: an authenticator then files every passkey for this site under a
+    single account instead of offering a picker of identical entries. It is
+    derived, not stored, and identifies nothing -- sign-in ignores the
+    userHandle that comes back."""
+    seed = "memory-passkey-user:%s:%s" % (VAULT, rp.id)
+    return webauth.b64u(hashlib.sha256(seed.encode("utf-8")).digest()[:16])
+
+
+@app.post("/auth/passkey/register/options")
+def passkey_register_options(request: Request):
+    rp = require_passkeys()
+    require_browser(request, "passkeys")
+    require_recent_auth(request, "add a passkey")
+    return passkey_options(request, "create", {
+        "rp": {"id": rp.id, "name": "Claude Memory (%s)" % VAULT},
+        "user": {"id": passkey_user_id(rp), "name": VAULT, "displayName": VAULT},
+        "pubKeyCredParams": [{"type": "public-key", "alg": alg}
+                             for alg in passkeys.ALGORITHMS],
+        # Both "required": a discoverable credential is what lets login/options
+        # name no credential at all, and user verification is the second
+        # factor (passkeys.parse_auth_data refuses an assertion without it).
+        "authenticatorSelection": {"residentKey": "required",
+                                   "userVerification": "required"},
+        "attestation": "none",
+        "timeout": webauth.PASSKEY_SECONDS * 1000,
+        "excludeCredentials": [{"type": "public-key", "id": cid}
+                               for cid in pkstore.credential_ids()],
+    })
+
+
+@app.post("/auth/passkey/register/verify")
+async def passkey_register_verify(request: Request):
+    # Who may register is settled before the challenge is touched: a refused
+    # caller neither learns whether its challenge was good nor uses it up.
+    rp = require_passkeys()
+    require_browser(request, "passkeys")
+    require_recent_auth(request, "add a passkey")
+    challenge = take_challenge(request, "create")
+    body = await passkey_body(request)
+    try:
+        if challenge is None:
+            raise passkeys.PasskeyError("this passkey prompt has expired, was already used "
+                                        "or did not start here; try again")
+        if body is None:
+            raise passkeys.PasskeyError("body must be a JSON object")
+        rec = await run_in_threadpool(
+            lambda: pkstore.add(passkeys.parse_registration(rp, challenge, body)))
+    except passkeys.PasskeyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except passkeys.StoreError as exc:
+        sys.stderr.write("memory: passkey store: %s\n" % exc)
+        raise HTTPException(status_code=503, detail="the passkey store is unavailable")
+    sys.stderr.write("memory: registered passkey %s (%s, %s)\n"
+                     % (rec["id"], rec["name"], passkeys.ALG_NAMES[rec["alg"]]))
+    response = JSONResponse({"id": rec["id"], "name": rec["name"], "created": rec["created"]},
+                            headers={"Cache-Control": "no-store"})
+    response.delete_cookie(webauth.PASSKEY_COOKIE, path="/auth/passkey")
+    return response
+
+
+@app.post("/auth/passkey/login/options")
+def passkey_login_options(request: Request):
+    rp = require_passkeys()
+    if not passkey_throttle.allow(webauth.client_key(request)):
+        raise HTTPException(status_code=429, detail="too many attempts; wait a few minutes")
+    # allowCredentials is always empty and the store is never read here: the
+    # answer is the same with no passkey registered as with ten, so asking
+    # teaches a stranger nothing -- not even whether there is anything to attack.
+    return passkey_options(request, "get", {
+        "rpId": rp.id,
+        "userVerification": "required",
+        "allowCredentials": [],
+        "timeout": webauth.PASSKEY_SECONDS * 1000,
+    })
+
+
+@app.post("/auth/passkey/login/verify")
+async def passkey_login_verify(request: Request):
+    rp = require_passkeys()
+    key = webauth.client_key(request)
+    # Checked before anything is parsed, and a locked-out address gets 429 for
+    # a valid assertion too: the lock is on the address, not on being wrong.
+    if not passkey_throttle.allow(key):
+        raise HTTPException(status_code=429, detail="too many attempts; wait a few minutes")
+    challenge = take_challenge(request, "get")
+    body = await passkey_body(request)
+    try:
+        if challenge is None:
+            raise passkeys.PasskeyError("challenge missing, expired or already used")
+        if body is None:
+            raise passkeys.PasskeyError("body is not a JSON object")
+        rec = await run_in_threadpool(
+            lambda: pkstore.sign_in(*passkeys.parse_assertion(rp, challenge, body)))
+    except passkeys.PasskeyError as exc:
+        passkey_throttle.record(key)
+        # The reason goes to the journal and only there. Every refusal -- no
+        # such credential, wrong signature, stale challenge, malformed body --
+        # leaves as this one status and this one body, so the route cannot be
+        # used to find out which credential ids exist.
+        sys.stderr.write("memory: refused passkey sign-in from %r: %s\n" % (key, exc))
+        raise HTTPException(status_code=401, detail="passkey sign-in failed")
+    except passkeys.StoreError as exc:
+        # The assertion was good but the new counter could not be written.
+        # Refused: accepting it would accept the same counter again next time.
+        sys.stderr.write("memory: passkey store: %s\n" % exc)
+        raise HTTPException(status_code=503, detail="the passkey store is unavailable")
+    sys.stderr.write("memory: passkey sign-in with %s (%s)\n" % (rec.get("id"), rec.get("name")))
+    response = JSONResponse({"authenticated": True, "via": "passkey"},
+                            headers={"Cache-Control": "no-store"})
+    set_session_cookie(response, request, webauth.SUBJECT_PASSKEY)
+    response.delete_cookie(webauth.PASSKEY_COOKIE, path="/auth/passkey")
+    return response
+
+
+@app.get("/auth/passkeys")
+def list_passkeys(request: Request):
+    require_passkeys()
+    require_browser(request, "passkeys")
+    return JSONResponse({"passkeys": pkstore.listing()})
+
+
+@app.delete("/auth/passkeys/{passkey_id}")
+def delete_passkey(request: Request, passkey_id: str):
+    # No recent sign-in asked for, as with keys: deleting hands out nothing,
+    # and the owner who has just lost a phone should not first have to find a
+    # way to sign in again.
+    require_passkeys()
+    require_browser(request, "passkeys")
+    try:
+        found = pkstore.delete(passkey_id)
+    except passkeys.StoreError as exc:
+        sys.stderr.write("memory: passkey store: %s\n" % exc)
+        raise HTTPException(status_code=503, detail="the passkey store is unavailable")
+    if not found:
+        raise HTTPException(status_code=404, detail="no such passkey")
+    sys.stderr.write("memory: deleted passkey %s\n" % passkey_id)
+    return JSONResponse({"deleted": passkey_id})
 
 
 # --------------------------------------------------------------------------
@@ -1287,7 +1531,7 @@ def whoami(request: Request):
     It also reports which OAuth providers are configured, so the login page
     shows a button only when pressing it would work."""
     info = session.read(request.cookies.get(webauth.COOKIE_NAME), creds.keyver)
-    via = {webauth.SUBJECT_TOKEN: "token"}
+    via = {webauth.SUBJECT_TOKEN: "token", webauth.SUBJECT_PASSKEY: "passkey"}
     via.update({spec["subject"]: name for name, spec in webauth.PROVIDERS.items()})
     return JSONResponse({
         "authenticated": bool(info),
@@ -1297,6 +1541,9 @@ def whoami(request: Request):
         # Kept for the older shell that only knew about Google, so a browser
         # holding a cached app.js does not lose its sign-in button.
         "google": creds.enabled("google"),
+        # Configured, not "one is registered": whether the owner has a passkey
+        # is nobody's business before they have signed in.
+        "passkey": PASSKEY_RP is not None,
     })
 
 

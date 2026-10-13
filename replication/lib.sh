@@ -158,7 +158,10 @@ dns_point_all() {
 # Per-instance credential/state files that follow the lease (never to GitHub).
 # Node-local settings (port, node name, public URL) live in node.env, which is
 # never copied, so a copied .env cannot re-point the peer's instance.
-: "${STATE_FILES:=.env auth.json apikeys.json mcpoauth.json}"
+# passkeys.json holds public keys only, but it is still what decides who may
+# sign in: a standby promoted without it would refuse the owner's passkey, and
+# one promoted with a stale copy would accept a passkey deleted since.
+: "${STATE_FILES:=.env auth.json apikeys.json mcpoauth.json passkeys.json}"
 valid_inst() { local i; for i in $INSTANCES; do [ "$i" = "$1" ] && return 0; done; return 1; }
 state_tar() {  # write a tar of this instance's state files to stdout
     local d f files=""; d=$(iv STATEDIR "$1")
@@ -172,7 +175,11 @@ state_tar() {  # write a tar of this instance's state files to stdout
 # no MEMORY_FLAG_DIR or MEMORY_READONLY_CATEGORIES to lift a fence, no quote
 # (a value may sit in one pair of double quotes) or trailing backslash for
 # systemd's line continuation. Blank and # lines pass.
-: "${ENV_KEYS:=CLAUDE_MEMORY_TOKEN MEMORY_SESSION_KEY MEMORY_PORT MEMORY_INSTANCE_NAME MEMORY_PUBLIC_URL}"
+# MEMORY_RP_ID / MEMORY_RP_ORIGIN name the public hostname, which is the same
+# on whichever node holds the lease -- a passkey registered against it on one
+# node must verify on the other. The value pattern below already admits an
+# origin ("https://host[:port]" is letters, digits and . : / -).
+: "${ENV_KEYS:=CLAUDE_MEMORY_TOKEN MEMORY_SESSION_KEY MEMORY_PORT MEMORY_INSTANCE_NAME MEMORY_PUBLIC_URL MEMORY_RP_ID MEMORY_RP_ORIGIN}"
 env_ok() {
     local line k
     while IFS= read -r line || [ -n "$line" ]; do

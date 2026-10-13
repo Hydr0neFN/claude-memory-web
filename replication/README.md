@@ -11,7 +11,7 @@ the standby and handing back are two operator scripts.
                                  ├─ git push peer  (NL bare repo, Tailscale)   ff-only
                                  └─ git push gh    (GitHub, deploy key)        ff-only
  NL /srv/memvault/<inst>.git ─post-receive─► memvault-update@<inst> ─► ff standby tree
- TW state files (.env, auth/apikeys/mcpoauth.json) ─► memstate-sync ─► NL
+ TW state files (.env, auth/apikeys/mcpoauth/passkeys.json) ─► memstate-sync ─► NL
  TW memheartbeat (1/min) ─► NL memctl heartbeat ─► memheartbeat-check: flag + notify
 ```
 
@@ -55,7 +55,7 @@ ssh rpi4 mem-handback-tw
 The steps run in this order:
 1. NL goes read-only, drains, and makes a final push.
 2. TW fetches and fast-forwards. A DIVERGED history aborts here: NL stays primary and writable, and an ALERT is raised on TW.
-3. NL's state files (grants, keys) are copied to TW.
+3. NL's state files (grants, keys, passkeys) are copied to TW.
 4. DNS for both hostnames moves back to TW.
 5. TW starts and is verified.
 6. NL is released to standby, but only after the public hostnames have answered from TW for 2 minutes straight. Cloudflare's edge keeps routing some requests to the old tunnel for 45–80 s after a CNAME change; until the release, NL answers those read-only.
@@ -67,6 +67,23 @@ The script is resumable: re-run it after a crash at any step.
 **DIVERGED** means both nodes took writes. Nothing merges automatically.
 Compare `git log tw..nl` and `git log nl..tw` in the vault, keep what should
 survive, then re-run.
+
+## State files
+
+`STATE_FILES` in `lib.sh` -- `.env`, `auth.json`, `apikeys.json`,
+`mcpoauth.json`, `passkeys.json` -- follow the lease and never go to GitHub.
+`memstate-sync` copies them from the primary to the standby on a timer; a
+handback copies them the other way before TW starts. Only those names are
+installed from a transfer, each as the instance's own user.
+
+A copied `.env` becomes the peer unit's `EnvironmentFile`, so it is checked
+line by line against `ENV_KEYS` and refused whole on the first line outside it.
+`MEMORY_RP_ID` and `MEMORY_RP_ORIGIN` are on that list: the passkey relying
+party is the public hostname, which is the same on whichever node serves it,
+and a passkey registered on one node has to verify on the other. Passkeys
+themselves are in `passkeys.json` (public keys and sign counters). A standby
+promoted between two syncs has the previous copy: a passkey registered or
+deleted in that window is not reflected until it is redone on the new primary.
 
 ## A relative's protocol (read-only, owner-managed)
 

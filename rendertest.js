@@ -1,15 +1,17 @@
-/* Node harness: exercise md.js + diff.js against real memory content. */
+/* Node harness: exercise md.js + diff.js against real memory content, and the
+ * DOM-free logic of nav.js (tree, quick-jump matcher) and passkey.js. */
 const fs = require('fs');
 const vm = require('vm');
 
-const ctx = { window: {}, console, Date, Math, RegExp, JSON, String, Array, Number, Uint32Array, setTimeout };
+const ctx = { window: {}, console, Date, Math, RegExp, JSON, String, Array, Number, Uint32Array, setTimeout,
+  Uint8Array, atob, btoa, Object, Promise, Error };
 ctx.globalThis = ctx;
 vm.createContext(ctx);
-for (const f of ['md.js', 'diff.js']) {
+for (const f of ['md.js', 'diff.js', 'nav.js', 'passkey.js']) {
   vm.runInContext(fs.readFileSync(__dirname + '/web/' + f, 'utf8'), ctx, f);
 }
 const FIX = __dirname + '/';
-const MD = ctx.window.MD, Diff = ctx.window.Diff;
+const MD = ctx.window.MD, Diff = ctx.window.Diff, Nav = ctx.window.Nav, Passkey = ctx.window.Passkey;
 
 let pass = 0, fail = 0;
 function check(desc, cond, extra) {
@@ -274,6 +276,270 @@ const t0 = Date.now();
 for (let i = 0; i < 20; i++) MD.render(a);
 check('20 renders under 1s', Date.now() - t0 < 1000, (Date.now() - t0) + 'ms');
 
-console.log('----');
-console.log('PASS=' + pass + ' FAIL=' + fail);
-process.exit(fail ? 1 : 0);
+/* --- sidebar tree: parent derivation and default expansion ---------------- */
+const cat = (category, extra) => Object.assign(
+  { category, bytes: 1000, mtime: '2026-10-01T00:00:00Z', sections: [], docs: [] }, extra || {});
+const TREE_INDEX = [
+  cat('infra'), cat('infra-pc'), cat('infra-pc-tuning', { bytes: 17000 }), cat('infra-pc-gpu'),
+  cat('infra-unifi'), cat('personal'),
+  cat('projects'), cat('projects-web', { docs: ['web-notes'] }), cat('projects-web-denba'),
+  cat('projects-web-denba-api'), cat('solo', { docs: ['solo-doc'] })
+];
+const tree = Nav.buildTree(TREE_INDEX);
+const names = (rows) => rows.filter(r => r.t === 'c').map(r => r.name);
+const rowOf = (rows, n) => rows.filter(r => r.t === 'c' && r.name === n)[0];
+
+check('parent is the LONGEST existing prefix', tree.node['infra-pc-tuning'].parent === 'infra-pc' &&
+  tree.node['infra-pc'].parent === 'infra' && tree.node['infra-pc-tuning'].depth === 2);
+check('a name with no category prefix is a root', tree.roots.join() === 'infra,personal,projects,solo', tree.roots.join());
+
+const def = Nav.rows(tree, {});
+check('default: roots and their direct children are visible',
+  ['infra', 'infra-pc', 'infra-unifi', 'personal', 'projects', 'projects-web', 'solo'].every(n => names(def).indexOf(n) >= 0),
+  names(def).join());
+check('default: depth 2 and deeper are hidden',
+  ['infra-pc-tuning', 'infra-pc-gpu', 'projects-web-denba', 'projects-web-denba-api'].every(n => names(def).indexOf(n) < 0),
+  names(def).join());
+check('default: a collapsed depth-1 row reports its hidden children',
+  rowOf(def, 'infra-pc').hidden === 2 && !rowOf(def, 'infra-pc').open && rowOf(def, 'infra').hidden === 0);
+check('default: roots are open, depth >= 1 are closed',
+  rowOf(def, 'infra').open && rowOf(def, 'projects-web').open === false);
+check('default: docs of a collapsed depth-1 category are not listed',
+  !def.some(r => r.t === 'd' && r.slug === 'web-notes') && rowOf(def, 'projects-web').hidden === 2 &&
+  rowOf(def, 'projects-web').docs === 1);
+check('default: a depth-1 category with only docs is collapsed', (function () {
+  const t = Nav.buildTree([cat('a'), cat('a-b', { docs: ['x'] })]);
+  const r = Nav.rows(t, {});
+  return r.length === 2 && r[1].t === 'c' && !r[1].open && r[1].expandable && r[1].hidden === 1;
+})());
+check('default: a root with docs is open and lists them',
+  def.some(r => r.t === 'd' && r.slug === 'solo-doc' && r.owner === 'solo' && r.depth === 1));
+
+const opened = Nav.rows(tree, { overrides: { 'infra-pc': true } });
+check('opening one caret reveals exactly one more layer',
+  names(opened).indexOf('infra-pc-tuning') >= 0 && names(opened).indexOf('infra-pc-gpu') >= 0 &&
+  names(opened).indexOf('projects-web-denba') < 0, names(opened).join());
+const deep = Nav.rows(tree, { overrides: { 'projects-web': true } });
+check('the revealed children are themselves collapsed',
+  rowOf(deep, 'projects-web-denba') && !rowOf(deep, 'projects-web-denba').open &&
+  names(deep).indexOf('projects-web-denba-api') < 0 && deep.some(r => r.t === 'd' && r.slug === 'web-notes'),
+  names(deep).join());
+const rootClosed = Nav.rows(tree, { overrides: { infra: false } });
+check('a root can be collapsed', names(rootClosed).indexOf('infra-pc') < 0 && rowOf(rootClosed, 'infra').hidden === 2);
+check('an explicit choice beats the default for a new category too',
+  Nav.rows(tree, { overrides: { 'no-such-category': true } }).length === def.length);
+
+const forced = Nav.rows(tree, { forced: { 'projects-web': true, 'projects-web-denba': true } });
+check('forced ancestors open the chain down to the active row', names(forced).indexOf('projects-web-denba-api') >= 0);
+check('forcing does not need (or write) any override', JSON.stringify(Nav.rows(tree, {})) === JSON.stringify(def));
+const unforced = Nav.rows(tree, { forced: { 'projects-web': true }, unforced: { 'projects-web': true } });
+check('a hand-collapsed forced ancestor stays collapsed', names(unforced).indexOf('projects-web-denba') < 0);
+
+const filtered = Nav.rows(tree, { visible: Nav.filterVisible(tree, 'tuning', {}) });
+check('filter force-opens the matches and their ancestors only',
+  names(filtered).join() === 'infra,infra-pc,infra-pc-tuning', names(filtered).join());
+check('filter matches an attached doc by slug or title',
+  Nav.filterVisible(tree, 'web-notes', {})['projects-web'] === true &&
+  Nav.filterVisible(tree, 'handbook', { 'solo-doc': 'The Handbook' }).solo === true);
+
+check('parseOverrides keeps only name -> boolean',
+  JSON.stringify(Nav.parseOverrides('{"a":true,"b":false,"c":1,"d":"x","e":null}')) === '{"a":true,"b":false}');
+check('parseOverrides survives garbage and the old collapsed-list shape',
+  ['', null, undefined, 'not json', '[1,2]', '["c:infra"]', '7', '"s"', 'null'].every(v => {
+    const o = Nav.parseOverrides(v);
+    return o && typeof o === 'object' && Object.keys(o).length === 0;
+  }));
+
+const st = Nav.subtreeStats(tree, 'infra', 16384);
+check('subtreeStats counts the whole subtree', st.count === 5 && st.bytes === 21000 && st.warn === 1, JSON.stringify(st));
+check('subtreeStats reports the newest mtime', st.mtime === Date.parse('2026-10-01T00:00:00Z'));
+
+/* --- quick jump: fuzzy matcher ------------------------------------------- */
+const F = (q, t) => Nav.fuzzy(q, t);
+check('fuzzy: no match is null', F('xyz', 'infra') === null && F('infrax', 'infra') === null);
+check('fuzzy: empty query matches everything', F('', 'anything') === 0 && F('   ', 'anything') === 0);
+check('fuzzy: case-insensitive', F('INFRA', 'Infra-PC') !== null);
+check('fuzzy: subsequence matches', F('ipt', 'infra-pc-tuning') !== null && F('tuni', 'infra-pc-tuning') !== null);
+check('fuzzy: order matters for a subsequence', F('tpi', 'infra-pc-tuning') === null);
+check('fuzzy: ranking exact > prefix > word start > mid-word > subsequence', (function () {
+  const exact = F('pc', 'pc'), prefix = F('pc', 'pcb-notes'), word = F('pc', 'infra-pc'),
+    mid = F('pc', 'tipcx'), sub = F('pc', 'p-c');
+  return exact > prefix && prefix > word && word > mid && mid > sub;
+})());
+check('fuzzy: every word must match', F('pc tun', 'infra-pc-tuning') !== null && F('pc zzz', 'infra-pc-tuning') === null &&
+  F('tun pc', 'infra-pc-tuning') !== null);
+
+const SEARCH_IDX = [
+  cat('infra', { sections: [{ name: 'Overview' }, { name: 'Tuning notes' }] }),
+  cat('infra-pc', { sections: [{ name: 'GPU' }] }),
+  cat('infra-pc-tuning', { sections: [{ name: 'Fan curves' }, { name: 'Overview' }] }),
+  cat('tuning')
+];
+const SEARCH_DOCS = [{ doc: 'tourplan-handoff', title: 'Tourplan handoff', sections: [{ name: 'Next step' }] }];
+const items = Nav.buildItems(SEARCH_IDX, SEARCH_DOCS, MD.slug);
+const top = (q, n) => Nav.search(items, q, n || 30);
+check('search: an exact category name ranks first', top('infra')[0].id === 'c:infra', top('infra').map(i => i.id).join());
+check('search: a category outranks a section of the same name', top('tuning')[0].id === 'c:tuning',
+  top('tuning').map(i => i.id).join());
+check('search: finds sections by name', top('fan').some(i => i.kind === 's' && i.label === 'Fan curves'));
+check('search: section result carries its category and the stale view\'s link',
+  top('fan')[0].sub === 'infra-pc-tuning' &&
+  top('fan')[0].href === '#/c/infra-pc-tuning/h/' + encodeURIComponent(MD.slug('Fan curves')), top('fan')[0].href);
+check('search: category + section words combine', top('tuning overview')[0].id === 'c:infra-pc-tuning#Overview',
+  top('tuning overview').map(i => i.id).join());
+check('search: docs are found by title and by slug',
+  top('handoff')[0].id === 'd:tourplan-handoff' && top('tourplan-h')[0].id === 'd:tourplan-handoff');
+check('search: doc section links use the doc route',
+  top('next step').some(i => i.href === '#/d/tourplan-handoff/h/' + encodeURIComponent(MD.slug('Next step'))));
+check('search: result count is capped',
+  Nav.search(Nav.buildItems(Array.from({ length: 100 }, (_, i) => cat('cat-' + i)), [], MD.slug), 'cat', 30).length === 30);
+check('search: nothing matches -> empty', top('qqqzzz').length === 0);
+
+/* --- passkey client ---------------------------------------------------- */
+check('b64url: no padding, url-safe alphabet', (function () {
+  const raw = new Uint8Array([0xfb, 0xff, 0xfe, 0x00, 0x01]);
+  const enc = Passkey.bufToB64u(raw.buffer);
+  return enc === '-__-AAE' && !/[+/=]/.test(enc);
+})());
+check('b64url: round trip of every length mod 3', [0, 1, 2, 3, 4, 5, 250].every(n => {
+  const raw = new Uint8Array(n).map((_, i) => (i * 37 + 11) & 255);
+  const back = new Uint8Array(Passkey.b64uToBuf(Passkey.bufToB64u(raw.buffer)));
+  return back.length === n && back.every((v, i) => v === raw[i]);
+}));
+check('b64url: null stays null (absent userHandle)', Passkey.bufToB64u(null) === null);
+check('Passkey.supported() is false without WebAuthn', Passkey.supported() === false);
+
+const E = (status, name, extra) => Passkey.explain(Object.assign(new Error('m'), { status, name: name || 'Error' }, extra), 'register');
+check('explain: cancelling the OS sheet is quiet', Passkey.explain({ cancelled: true }, 'login').quiet === true);
+check('explain: 403 on add says to sign in again',
+  /sign out and sign in again, then add the passkey/.test(E(403).text) && !E(403).quiet, E(403).text);
+check('explain: 403 means something else on login',
+  !/sign out and sign in again/.test(Passkey.explain(Object.assign(new Error('nope'), { status: 403 }), 'login').text));
+const E503 = (msg) => Passkey.explain(Object.assign(new Error(msg), { status: 503 }), 'login').text;
+check('explain: 429 and 503 have their own wording',
+  /Too many/.test(E(429).text) && /not enabled/.test(E503('HTTP 503')));
+check('explain: a 503 with a server detail shows that detail',
+  /the passkey store is unavailable/.test(E503('the passkey store is unavailable')), E503('the passkey store is unavailable'));
+// a category literally named "constructor" is valid (^[a-z0-9-]+$) and must
+// not resolve through Object.prototype in the tree/filter maps
+(function () {
+  const idx = [{ category: 'constructor', bytes: 1, mtime: '2026-10-13T00:00:00Z', sections: [], docs: [] },
+               { category: 'infra', bytes: 1, mtime: '2026-10-13T00:00:00Z', sections: [], docs: [] }];
+  const t = Nav.buildTree(idx);
+  const rows = Nav.rows(t, { visible: Nav.filterVisible(t, 'zzzq', {}) }).map(r => r.name || r.slug);
+  check('nav: a filter does not match a category named constructor', rows.length === 0, JSON.stringify(rows));
+})();
+check('explain: server detail passes through', Passkey.explain(new Error('name already used'), 'register').text === 'name already used');
+
+async function passkeyFlows() {
+  // a fake server and a fake authenticator, enough to check what goes on the wire
+  const calls = [];
+  const bytes = (...v) => new Uint8Array(v).buffer;
+  let reply;
+  ctx.fetch = (url, init) => {
+    calls.push({ url, init, body: JSON.parse(init.body) });
+    const r = reply(url);
+    return Promise.resolve({ ok: r.status < 400, status: r.status, text: () => Promise.resolve(JSON.stringify(r.json)) });
+  };
+  ctx.window.PublicKeyCredential = function () {};
+  ctx.navigator = { credentials: { create: () => {}, get: () => {} } };
+  const b64u = (...v) => Passkey.bufToB64u(bytes(...v));
+
+  // --- register
+  let created;
+  ctx.navigator.credentials.create = (o) => {
+    created = o;
+    return Promise.resolve({
+      rawId: bytes(9, 8, 7), response: {
+        clientDataJSON: bytes(1, 2), getAuthenticatorData: () => bytes(3, 4),
+        getPublicKey: () => bytes(5, 6), getPublicKeyAlgorithm: () => -7, getTransports: () => ['internal']
+      }
+    });
+  };
+  reply = (url) => url.endsWith('/options')
+    ? { status: 200, json: { publicKey: { challenge: b64u(1, 2, 3), rp: { id: 'x', name: 'x' },
+        user: { id: b64u(4, 5), name: 'u', displayName: 'u' }, pubKeyCredParams: [],
+        excludeCredentials: [{ type: 'public-key', id: b64u(7, 7) }] } } }
+    : { status: 200, json: { id: 'abc', name: 'laptop', created: 'now' } };
+  const out = await Passkey.register('laptop');
+  const pk = created.publicKey, v = calls[1].body;
+  check('register: challenge, user.id and excludeCredentials are decoded to buffers',
+    new Uint8Array(pk.challenge).join() === '1,2,3' && new Uint8Array(pk.user.id).join() === '4,5' &&
+    new Uint8Array(pk.excludeCredentials[0].id).join() === '7,7' && pk.excludeCredentials[0].type === 'public-key');
+  check('register: posts to the contract routes with credentials and the actor header',
+    calls[0].url === '/auth/passkey/register/options' && calls[1].url === '/auth/passkey/register/verify' &&
+    calls.every(c => c.init.credentials === 'same-origin' && c.init.headers['X-Memory-Actor'] === 'memory-web' &&
+      c.init.headers['Content-Type'] === 'application/json' && c.init.method === 'POST'));
+  check('register: verify body carries every field of the contract, base64url',
+    v.name === 'laptop' && v.id === b64u(9, 8, 7) && v.clientDataJSON === b64u(1, 2) &&
+    v.authenticatorData === b64u(3, 4) && v.publicKey === b64u(5, 6) && v.publicKeyAlgorithm === -7 &&
+    v.transports.join() === 'internal', JSON.stringify(v));
+  check('register: resolves with the server record', out.id === 'abc');
+
+  // getPublicKey() can legitimately be null; missing accessors mean an old browser
+  ctx.navigator.credentials.create = () => Promise.resolve({ rawId: bytes(1), response: {
+    clientDataJSON: bytes(1), getAuthenticatorData: () => bytes(1), getPublicKey: () => null,
+    getPublicKeyAlgorithm: () => -7 } });
+  const n0 = calls.length;
+  let err = await Passkey.register('x').then(() => null, e => e);
+  check('register: a null public key fails with a clear message and posts nothing',
+    err && /public key/.test(err.message) && calls.length === n0 + 1, err && err.message);
+  ctx.navigator.credentials.create = () => Promise.resolve({ rawId: bytes(1), response: { clientDataJSON: bytes(1) } });
+  err = await Passkey.register('x').then(() => null, e => e);
+  check('register: missing WebAuthn L2 accessors fail with a clear message',
+    err && /cannot export the passkey public key/.test(err.message), err && err.message);
+
+  // a stale session surfaces as .status 403 for the caller to explain
+  reply = () => ({ status: 403, json: { detail: 'recent sign-in required' } });
+  err = await Passkey.register('x').then(() => null, e => e);
+  check('register: HTTP errors carry status and detail', err && err.status === 403 && err.message === 'recent sign-in required');
+
+  // cancelling the OS sheet
+  reply = (url) => ({ status: 200, json: { publicKey: { challenge: b64u(1), user: { id: b64u(1) } } } });
+  ctx.navigator.credentials.create = () => Promise.reject(Object.assign(new Error('x'), { name: 'NotAllowedError' }));
+  err = await Passkey.register('x').then(() => null, e => e);
+  check('register: dismissing the OS sheet is a quiet cancel', err && err.cancelled === true &&
+    Passkey.explain(err, 'register').quiet === true);
+
+  // --- login
+  let got;
+  ctx.navigator.credentials.get = (o) => {
+    got = o;
+    return Promise.resolve({ rawId: bytes(9), response: {
+      clientDataJSON: bytes(1), authenticatorData: bytes(2), signature: bytes(3), userHandle: bytes(4) } });
+  };
+  calls.length = 0;
+  reply = (url) => url.endsWith('/options')
+    ? { status: 200, json: { publicKey: { challenge: b64u(8, 8), rpId: 'x', userVerification: 'required',
+        allowCredentials: [], timeout: 1 } } }
+    : { status: 200, json: { authenticated: true, via: 'passkey' } };
+  const res = await Passkey.login();
+  const lv = calls[1].body;
+  check('login: options then verify, challenge decoded', calls[0].url === '/auth/passkey/login/options' &&
+    calls[1].url === '/auth/passkey/login/verify' && new Uint8Array(got.publicKey.challenge).join() === '8,8' &&
+    got.publicKey.rpId === 'x' && got.publicKey.userVerification === 'required');
+  check('login: verify body carries id, clientDataJSON, authenticatorData, signature, userHandle',
+    lv.id === b64u(9) && lv.clientDataJSON === b64u(1) && lv.authenticatorData === b64u(2) &&
+    lv.signature === b64u(3) && lv.userHandle === b64u(4), JSON.stringify(lv));
+  check('login: resolves on 200', res.authenticated === true);
+  ctx.navigator.credentials.get = () => Promise.resolve({ rawId: bytes(9), response: {
+    clientDataJSON: bytes(1), authenticatorData: bytes(2), signature: bytes(3), userHandle: null } });
+  await Passkey.login();
+  check('login: an absent userHandle is sent as null', calls[calls.length - 1].body.userHandle === null);
+  reply = (url) => url.endsWith('/options') ? { status: 200, json: { publicKey: { challenge: b64u(1) } } }
+    : { status: 401, json: { detail: 'Authentication failed' } };
+  err = await Passkey.login().then(() => null, e => e);
+  check('login: a 401 is an error with status 401', err && err.status === 401 &&
+    /not accepted/.test(Passkey.explain(err, 'login').text));
+}
+
+function finish() {
+  console.log('----');
+  console.log('PASS=' + pass + ' FAIL=' + fail);
+  process.exit(fail ? 1 : 0);
+}
+passkeyFlows().then(finish, (err) => {
+  console.log('FAIL: passkey flow threw  -> ' + (err && err.stack || err));
+  fail++;
+  finish();
+});

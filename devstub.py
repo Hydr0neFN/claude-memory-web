@@ -3,12 +3,22 @@ browser without any credential. Serves the real web/ directory and fakes the
 API from local .md fixtures. Test scaffolding only -- never deployed."""
 import hashlib
 import http.server
+import base64
 import io
 import json
 import os
+import random
 import re
 import time
 import urllib.parse
+
+# Dev switches (all optional):
+#   STUB_PORT=8123   port to listen on
+#   STUB_ANON=1      start signed out, so the login page can be exercised
+#   STUB_MANY=1      generate a ~170-category store, to see the sidebar at real scale
+#   STUB_STALE=1     answer 403 to passkey registration (session older than 15 min)
+PORT = int(os.environ.get("STUB_PORT", "8123"))
+SIGNED_IN = {"on": os.environ.get("STUB_ANON") != "1"}
 
 FIX = os.path.dirname(os.path.abspath(__file__))
 WEB = os.path.join(FIX, "web")
@@ -37,7 +47,8 @@ STORE = {}
 for name in ("protocol", "projects-web"):
     with io.open(os.path.join(FIX, name + ".md"), encoding="utf-8") as f:
         STORE[name] = f.read()
-STORE["general"] = "## Scratch\n<!-- verified: 2020-01-01 -->\n\n- deliberately stale\n"
+STORE["general"] = ("## Scratch\n<!-- verified: 2020-01-01 -->\n\n- deliberately stale\n"
+                    "- one pinned decision, so the Pins count has something to show <!-- pin: decided -->\n")
 # writes to this one always 409, to exercise the conflict UI
 STORE["conflict-me"] = "## Notes\n\n- shared line\n- THEIR line\n- another shared line\n"
 STORE["big-one"] = "## Huge\n\n" + ("- filler line to push this past the soft cap\n" * 700)
@@ -59,6 +70,26 @@ for _name, _kb in [
     _head = "## %s\n<!-- verified: 2026-08-0%d -->\n\n" % (_name.replace("-", " ").title(), len(_name) % 9 + 1)
     _line = "- filler fact for %s\n" % _name
     STORE[_name] = _head + _line * max(1, int(_kb * 1024 - len(_head)) // len(_line))
+
+if os.environ.get("STUB_MANY") == "1":
+    _rng = random.Random(7)
+    _roots = ["personal", "university", "career", "projects", "infra", "ai-tooling", "finance",
+              "health", "travel", "home", "hobby", "legal"]
+    _words = ["alpha", "bravo", "core", "dev", "edge", "flow", "grid", "hub", "index", "jobs",
+              "keys", "lab", "map", "notes", "ops", "plan", "queue", "rules", "sync", "tuning"]
+    for _r in _roots:
+        STORE.setdefault(_r, "## %s\n<!-- verified: 2026-08-01 -->\n\n- root\n" % _r.title())
+        for _w in _rng.sample(_words, _rng.randint(5, 9)):
+            _sub = _r + "-" + _w
+            _kb = _rng.choice([0.8, 1.5, 3, 4.5, 6, 8, 10, 12, 14, 16.5, 17.5, 21])
+            _head = "## %s\n<!-- verified: 2026-0%d-1%d -->\n\n" % (_w.title(), _rng.randint(2, 8), _rng.randint(0, 9))
+            _line = "- filler fact for %s\n" % _sub
+            STORE[_sub] = _head + _line * max(1, int(_kb * 1024 - len(_head)) // len(_line))
+            for _w2 in _rng.sample(_words, _rng.choice([0, 0, 1, 2, 3])):
+                _deep = _sub + "-" + _w2
+                if _deep in STORE:
+                    continue
+                STORE[_deep] = "## %s\n\n" % _w2.title() + "- deeper fact\n" * _rng.randint(5, 400)
 
 # [[doc:slug]] refs on a couple of categories, so the sidebar badge, home
 # Docs list, category-read doc list and dead-ref rendering all have something
@@ -95,6 +126,21 @@ DOC_HISTORY = [
     {"sha": "d" * 40, "short": "dddddddd", "date": "2026-08-15T10:00:00+02:00", "bytes": 340,
      "message": "CREATE doc tourplan-handoff via claude-code"},
 ]
+
+
+# sample rows for the keys page, so the Passkeys / Keys / Connected apps
+# sections have something to list and delete
+PASSKEYS = [
+    {"id": "pk1abc", "name": "Windows Hello (desktop)", "created": "2026-09-30T18:02:11Z", "last_used": "2026-10-12T07:40:00Z"},
+    {"id": "pk2def", "name": "Phone", "created": "2026-10-02T09:15:42Z", "last_used": None},
+]
+KEYS = [{"id": "k1", "name": "laptop", "created": "2026-09-01T10:00:00Z", "last_used": "2026-10-11T12:00:00Z"}]
+GRANTS = [{"id": "g1", "client_name": "Claude", "email": "me@example.com",
+           "created": "2026-09-05T10:00:00Z", "last_used": "2026-10-12T08:00:00Z"}]
+
+
+def b64u(raw):
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
 
 def blob_sha(text):
@@ -276,10 +322,21 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         p, q = u.path, urllib.parse.parse_qs(u.query)
 
         if p == "/auth/me":
-            # google:false -> the dev shell shows the token field, which is
-            # the only path this stub implements.
-            return self._json({"authenticated": True, "via": "token",
-                               "email": "", "providers": [], "google": False})
+            # passkey:true -> the login page offers the passkey button and the
+            # keys page shows its Passkeys section (the real server reports
+            # whether passkeys are configured, not whether any exist).
+            return self._json({"authenticated": SIGNED_IN["on"], "via": "token" if SIGNED_IN["on"] else None,
+                               "email": "", "providers": [], "google": False, "passkey": True})
+
+        if not SIGNED_IN["on"] and (p.startswith("/memory") or p.startswith("/docs")
+                                    or p.startswith("/auth/keys") or p.startswith("/auth/passkeys")):
+            return self._json({"detail": "not signed in"}, 401)
+
+        if p == "/auth/passkeys":
+            return self._json({"passkeys": [dict(k) for k in PASSKEYS]})
+
+        if p == "/auth/keys":
+            return self._json({"keys": [dict(k) for k in KEYS], "grants": [dict(g) for g in GRANTS]})
 
         if p == "/memory":
             return self._json(sorted(STORE))
@@ -414,8 +471,49 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         return super().do_GET()
 
     def do_POST(self):
+        length = int(self.headers.get("content-length", 0) or 0)
+        raw = self.rfile.read(length) if length else b""
         if self.path in ("/auth/login", "/auth/logout"):
-            return self._json({"authenticated": self.path.endswith("login")})
+            SIGNED_IN["on"] = self.path.endswith("login")
+            return self._json({"authenticated": SIGNED_IN["on"]})
+
+        # Passkey routes: shaped like the real contract so the client code runs,
+        # but nothing is verified -- a real authenticator needs the real server.
+        if self.path == "/auth/passkey/login/options":
+            return self._json({"publicKey": {"challenge": b64u(os.urandom(32)), "rpId": "localhost",
+                                             "userVerification": "required", "allowCredentials": [],
+                                             "timeout": 60000}})
+        if self.path == "/auth/passkey/login/verify":
+            return self._json({"detail": "stub: passkey login is not verified here"}, 401)
+        if self.path.startswith("/auth/passkey/register/"):
+            if not self.headers.get("x-memory-actor"):
+                return self._json({"detail": "X-Memory-Actor required"}, 403)
+            if os.environ.get("STUB_STALE") == "1":
+                return self._json({"detail": "recent sign-in required"}, 403)
+            if self.path.endswith("/options"):
+                return self._json({"publicKey": {
+                    "challenge": b64u(os.urandom(32)), "rp": {"id": "localhost", "name": "Memory"},
+                    "user": {"id": b64u(b"stub-user"), "name": "owner", "displayName": "owner"},
+                    "pubKeyCredParams": [{"type": "public-key", "alg": -7}, {"type": "public-key", "alg": -257},
+                                         {"type": "public-key", "alg": -8}],
+                    "authenticatorSelection": {"residentKey": "required", "userVerification": "required"},
+                    "attestation": "none", "timeout": 60000,
+                    "excludeCredentials": [{"type": "public-key", "id": b64u(b"already-registered")}]}})
+            try:
+                name = json.loads(raw or b"{}").get("name", "passkey")
+            except ValueError:
+                name = "passkey"
+            PASSKEYS.append({"id": "pk%d" % (len(PASSKEYS) + 1), "name": name,
+                             "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "last_used": None})
+            return self._json({"id": PASSKEYS[-1]["id"], "name": name, "created": PASSKEYS[-1]["created"]})
+        if self.path == "/auth/keys":
+            try:
+                name = json.loads(raw or b"{}").get("name", "key")
+            except ValueError:
+                name = "key"
+            KEYS.append({"id": "k%d" % (len(KEYS) + 1), "name": name,
+                         "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "last_used": None})
+            return self._json({"id": KEYS[-1]["id"], "name": name, "value": "mem_" + b64u(os.urandom(24))})
         return self._json({"detail": "not found"}, 404)
 
     def do_PUT(self):
@@ -496,6 +594,16 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def do_DELETE(self):
         u = urllib.parse.urlparse(self.path)
         q = urllib.parse.parse_qs(u.query)
+        for prefix, rows in (("/auth/passkeys/", PASSKEYS), ("/auth/keys/", KEYS), ("/auth/grants/", GRANTS)):
+            if u.path.startswith(prefix):
+                if not self.headers.get("x-memory-actor"):
+                    return self._json({"detail": "X-Memory-Actor required"}, 403)
+                rid = u.path[len(prefix):]
+                for row in rows:
+                    if row["id"] == rid:
+                        rows.remove(row)
+                        return self._json({"deleted": rid})
+                return self._json({"detail": "not found"}, 404)
         section = (q.get("section", [""])[0])
         m = re.match(r"^/memory/([a-z0-9-]+)$", u.path)
         if m and m.group(1) in STORE:
@@ -559,4 +667,4 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    http.server.ThreadingHTTPServer(("127.0.0.1", 8123), Handler).serve_forever()
+    http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

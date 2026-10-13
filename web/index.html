@@ -6,7 +6,7 @@
 <meta name="color-scheme" content="light dark">
 <meta name="robots" content="noindex, nofollow">
 <title>Memory</title>
-<link rel="stylesheet" href="/app.css?v=23">
+<link rel="stylesheet" href="/app.css?v=24">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='78' font-size='78'>🧠</text></svg>">
 </head>
 <body>
@@ -15,6 +15,7 @@
 <section id="login" class="login hidden">
   <div class="login-card">
     <h1>Memory</h1>
+    <button id="login-passkey" type="button" class="btn primary block hidden">Sign in with a passkey</button>
     <a id="login-google" class="btn primary block hidden" href="/auth/google">Sign in with Google</a>
     <a id="login-github" class="btn primary block hidden" href="/auth/github">Sign in with GitHub</a>
     <p id="login-oauth-note" class="muted small hidden">Second factor comes from
@@ -37,26 +38,34 @@
     <button id="menu-btn" class="btn icon" title="Categories" aria-label="Categories">☰</button>
     <a class="brand" href="#/">🧠 <span>Memory</span></a>
     <form id="search-form" class="search">
-      <input id="search-input" type="search" placeholder="Search all categories…" spellcheck="false">
+      <input id="search-input" type="search" placeholder="Search all categories…" spellcheck="false" aria-label="Search all categories">
+      <button id="kbd-hint" type="button" class="kbd" title="Quick jump to a category, doc or section" aria-label="Quick jump">Ctrl K</button>
     </form>
-    <a class="btn ghost" href="#/pins" title="Retraction and decision markers">Pins<span id="pins-count" class="pill hidden"></span></a>
-    <a class="btn ghost" href="#/stale" title="Sections due for a freshness check">Stale</a>
-    <a class="btn ghost" href="#/keys" title="MCP access: connect Claude, keys, connected apps">MCP</a>
     <div class="newmenu">
-      <button id="new-btn" class="btn" title="New category or doc">+ New ▾</button>
-      <div id="new-menu" class="dropdown hidden">
-        <a href="#/new">Category</a>
-        <a href="#/newdoc">Doc</a>
+      <button id="new-btn" class="btn" title="New category or doc" aria-haspopup="menu" aria-expanded="false" aria-controls="new-menu">+ New ▾</button>
+      <div id="new-menu" class="dropdown hidden" role="menu" aria-label="New">
+        <a href="#/new" role="menuitem">Category</a>
+        <a href="#/newdoc" role="menuitem">Doc</a>
       </div>
     </div>
-    <button id="logout-btn" class="btn ghost" title="Sign out">Sign out</button>
+    <div class="newmenu">
+      <button id="more-btn" class="btn ghost" title="More" aria-label="More" aria-haspopup="menu" aria-expanded="false" aria-controls="more-menu">⋯</button>
+      <div id="more-menu" class="dropdown hidden" role="menu" aria-label="More">
+        <button id="jump-btn" type="button" role="menuitem">Quick jump <kbd class="kbd">Ctrl K</kbd></button>
+        <a href="#/pins" role="menuitem" title="Retraction and decision markers">Pins<span id="pins-count" class="pill hidden"></span></a>
+        <a href="#/health" role="menuitem" title="Size and freshness of the store">Health</a>
+        <a href="#/keys" role="menuitem" title="MCP access: connect Claude, keys, passkeys">MCP access</a>
+        <button id="logout-btn" type="button" role="menuitem" title="Sign out">Sign out</button>
+      </div>
+    </div>
   </header>
 
   <div id="scrim" class="scrim hidden"></div>
 
   <aside id="sidebar" class="sidebar">
-    <input id="filter" class="filter" type="search" placeholder="Filter categories…" spellcheck="false">
-    <nav id="catlist" class="catlist"></nav>
+    <input id="filter" class="filter" type="search" placeholder="Filter categories…" spellcheck="false" aria-label="Filter categories">
+    <nav id="navtop" class="navtop hidden" aria-label="Pinned and recent"></nav>
+    <nav id="catlist" class="catlist" aria-label="Categories"></nav>
     <div id="store-stats" class="store-stats small muted"></div>
   </aside>
 
@@ -66,8 +75,10 @@
 <div id="modal-root"></div>
 <div id="toast" class="toast hidden"></div>
 
-<script src="/md.js?v=23"></script>
-<script src="/diff.js?v=23"></script>
-<script src="/app.js?v=23"></script>
+<script src="/md.js?v=24"></script>
+<script src="/diff.js?v=24"></script>
+<script src="/nav.js?v=24"></script>
+<script src="/passkey.js?v=24"></script>
+<script src="/app.js?v=24"></script>
 </body>
 </html>
