@@ -76,6 +76,11 @@ survive, then re-run.
 handback copies them the other way before TW starts. Only those names are
 installed from a transfer, each as the instance's own user.
 
+Between timer runs, a `memstate-sync-<inst>.path` unit on the primary fires the
+sync when one of those files changes. Those units are written by hand, one
+`PathChanged=` per file, so adding a name to `STATE_FILES` also means adding
+its line there; until then the new file only travels on the timer.
+
 A copied `.env` becomes the peer unit's `EnvironmentFile`, so it is checked
 line by line against `ENV_KEYS` and refused whole on the first line outside it.
 `MEMORY_RP_ID` and `MEMORY_RP_ORIGIN` are on that list: the passkey relying
