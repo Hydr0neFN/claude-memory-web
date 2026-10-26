@@ -34,6 +34,7 @@ from starlette.concurrency import run_in_threadpool
 import apikeys
 import mcpoauth
 import mcpserver
+import dstokens
 import passes
 import passkeys
 import replflag
@@ -171,6 +172,8 @@ creds = webauth.Credentials()
 keystore = apikeys.KeyStore()
 # Container passes: short-lived, docs-only bearers -- see passes.py.
 passstore = passes.PassStore()
+# Scoped read-only DS tokens: see dstokens.py.
+dstore = dstokens.TokenStore()
 oauth = mcpoauth.Store()
 login_throttle = webauth.Throttle(max_attempts=5, window_sec=300)
 # The Google path is slower and involves a third party, so it gets its own
@@ -1501,6 +1504,85 @@ def revoke_pass(pass_id: str, request: Request):
     return JSONResponse({"revoked": n})
 
 
+# --------------------------------------------------------------------------
+# scoped read-only DS tokens -- see dstokens.py. Issue / renew / revoke need a
+# full key (check_write_auth); a dst_ token itself is accepted only by /mcp, so
+# it can neither renew nor mint.
+# --------------------------------------------------------------------------
+
+
+def dstoken_classes(allow, deny) -> dict:
+    names = sorted(p.stem for p in DATA_DIR.glob("*.md"))
+    by = {"allowed": [], "denied": [], "unclassified": []}
+    for n in names:
+        by[dstokens.classify(n, allow, deny)].append(n)
+    return by
+
+
+@app.post("/auth/dstokens")
+async def issue_dstoken(request: Request):
+    check_write_auth(request)
+    try:
+        data = json.loads(await request.body() or b"{}")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="body must be JSON")
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="body must be a JSON object")
+    try:
+        secret, rec = dstore.issue(data.get("allow"), data.get("deny"), data.get("job"),
+                                   actor(request), data.get("ttl_sec"))
+    except dstokens.TokenError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    by = dstoken_classes(rec["allow"], rec["deny"])
+    sys.stderr.write("memory: issued ds-token %s job=%s ttl=%ds to %s (%d visible, %d denied, "
+                     "%d unclassified)\n" % (rec["id"], rec["job"], rec["ttl_sec"], rec["issuer"],
+                                            len(by["allowed"]), len(by["denied"]),
+                                            len(by["unclassified"])))
+    return JSONResponse(dict(rec, secret=secret, visible=len(by["allowed"]),
+                             denied=len(by["denied"]), unclassified=by["unclassified"]),
+                        headers={"Cache-Control": "no-store"})
+
+
+@app.get("/auth/dstokens")
+def list_dstokens(request: Request):
+    check_auth(request)
+    return JSONResponse(dstore.list())
+
+
+@app.delete("/auth/dstokens")
+def revoke_all_dstokens(request: Request):
+    check_write_auth(request)
+    return JSONResponse({"revoked": dstore.revoke_all()})
+
+
+@app.get("/auth/dstokens/{token_id}")
+def get_dstoken(token_id: str, request: Request):
+    check_auth(request)
+    rec = dstore.get(token_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail="no such token")
+    return JSONResponse(rec)
+
+
+@app.post("/auth/dstokens/{token_id}/renew")
+def renew_dstoken(token_id: str, request: Request):
+    check_write_auth(request)
+    rec = dstore.renew(token_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail="token unknown, expired or revoked")
+    return JSONResponse(rec)
+
+
+@app.delete("/auth/dstokens/{token_id}")
+def revoke_dstoken(token_id: str, request: Request):
+    check_write_auth(request)
+    rec = dstore.revoke(token_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail="token unknown, expired or revoked")
+    sys.stderr.write("memory: revoked ds-token %s\n" % token_id)
+    return JSONResponse({"revoked": 1, "token": rec})
+
+
 # The container-side client for passes. Public on purpose: it is published
 # source (clients/memfiles.py, same as the repo) and holds no secret, and a
 # container fetching it before it has exported its pass is the normal order.
@@ -1643,6 +1725,15 @@ def search(
     partial match is visible as one. mode=and (default) is unchanged.
     """
     check_auth(request)
+    return JSONResponse(do_search(q, limit, full, scope, mode))
+
+
+def do_search(q: str, limit: int, full: int, scope: str, mode: str, keep=None) -> list:
+    """The search itself. `keep(name)` (scoped DS tokens, dstokens.py) drops
+    hits of a category *before* the limit is applied, so a broad query whose
+    first matches sit in hidden categories still fills up from visible ones.
+    Docs hits are only reachable with scope != memory, which scoped callers
+    never pass."""
     if scope not in SEARCH_SCOPES:
         raise HTTPException(status_code=400, detail="invalid scope")
     if mode not in SEARCH_MODES:
@@ -1655,8 +1746,15 @@ def search(
     hits = []
 
     if mode == "rank":
-        for h in rank_index(scope).search(q, limit):
+        idx = rank_index(scope)
+        if keep is not None:
+            # statistics (idf, avgdl) must come from visible units only, or the
+            # scores of visible hits would leak what hidden sections contain
+            idx = searchrank.Index([u for u in idx.units if keep(u.name)])
+        for h in idx.search(q, limit if keep is None else 100000):
             u = h.unit
+            if keep is not None and not keep(u.name):
+                continue
             hit = {
                 "category" if u.kind == "memory" else "doc": u.name,
                 "section": u.section,
@@ -1671,10 +1769,14 @@ def search(
             else:
                 hit["snippet"] = u.lines[h.line].strip()[:SNIPPET_CHARS]
             hits.append(hit)
-        return JSONResponse(hits)
+            if len(hits) >= limit:
+                break
+        return hits
 
     def scan(paths, kind):
         for path in paths:
+            if keep is not None and not keep(path.stem):
+                continue
             lines = path.read_text(encoding="utf-8").splitlines()
             for i, line in enumerate(lines):
                 low = line.lower()
@@ -1697,11 +1799,11 @@ def search(
 
     if scope in ("memory", "all"):
         if scan(sorted(DATA_DIR.glob("*.md")), "memory"):
-            return JSONResponse(hits)
+            return hits
     if scope in ("docs", "all"):
         if scan(sorted(DOCS_DIR.glob("*.md")), "doc"):
-            return JSONResponse(hits)
-    return JSONResponse(hits)
+            return hits
+    return hits
 
 
 @app.get("/memory/pins")
@@ -2033,6 +2135,9 @@ mcp = mcpserver.Server(app, TOKEN, sections_of, VAULT,
                        sorted(READONLY_CATEGORIES))
 
 
+ds_scoped = dstokens.Scoped(mcp, dstore, do_search, mcpserver.ToolError, mcpserver.TOOLS)
+
+
 def public_base(request: Request) -> str:
     """Our own origin as clients see it. MEMORY_PUBLIC_URL pins it; otherwise
     the Host header, which through the tunnel is always the public name."""
@@ -2107,7 +2212,14 @@ async def mcp_post(request: Request):
     origin = request.headers.get("origin")
     if origin and origin.rstrip("/") != public_base(request):
         return JSONResponse({"error": "origin not allowed"}, status_code=403)
-    actor = mcp_actor(request)
+    presented = request.headers.get("authorization", "")[7:].strip()
+    scoped = None
+    if presented.startswith(dstokens.PREFIX):
+        # a scoped DS token: its own handler, never the full tool set
+        scoped = dstore.verify(presented)
+        actor = "ds " + scoped["job"] if scoped else None
+    else:
+        actor = mcp_actor(request)
     if actor is None:
         auth = request.headers.get("authorization", "")
         return mcp_unauthorized(request, "invalid_token" if auth else "")
@@ -2115,6 +2227,18 @@ async def mcp_post(request: Request):
         msg = json.loads(await request.body())
     except Exception:
         return JSONResponse(mcpserver.rpc_error(None, -32700, "parse error"), status_code=400)
+
+    if scoped is not None:
+        handler = ds_scoped
+        if isinstance(msg, list):
+            return JSONResponse(mcpserver.rpc_error(None, -32600, "batches not supported"),
+                                status_code=400)
+        if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0" or "method" not in msg:
+            return JSONResponse(mcpserver.rpc_error(None, -32600, "invalid request"))
+        reply = await handler.handle(msg, scoped) if "id" in msg else None
+        if reply is None:
+            return Response(status_code=202)
+        return JSONResponse(reply)
 
     if isinstance(msg, list):
         if not msg:
