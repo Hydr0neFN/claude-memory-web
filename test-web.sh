@@ -965,6 +965,103 @@ code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Beare
 check "scratch category deleted" 200 "$code"
 rm -f "$JAR" "$HDR" "$BODY"
 
+echo "=== 14. skills ==="
+# A skills file is a set of id-addressed records; a section PUT is always an
+# upsert, and a heading that is not `## msk-<12 hex> <title>` is refused. The
+# domain and the key are both scratch and both cleaned up here.
+SKILLDOM="webui-test-skills"
+SWFILE="${MEMORY_KEYS_FILE:-./apikeys.json}"
+SWBAK=$(mktemp); HADSW=no
+[ -f "$SWFILE" ] && { cp -p "$SWFILE" "$SWBAK"; HADSW=yes; }
+restore_swkeys() {
+  if [ "$HADSW" = yes ]; then cp -p "$SWBAK" "$SWFILE"; else rm -f "$SWFILE"; fi
+  rm -f "$SWBAK"
+}
+trap restore_swkeys EXIT
+SJAR=$(mktemp)
+
+curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $TOKEN" -H "If-Match: *" \
+  "$BASE/skills/$SKILLDOM"
+code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "If-None-Match: *" --data-binary $'## msk-0000000000a1 First skill\n<!-- skill: status=active uses=2 -->\nrefs: [[webui-test-ref]]\nwhen: probing\n\nzzskillsprobe one\n\n## msk-0000000000a2 Second skill\n<!-- skill: status=probation uses=1 -->\nrefs: [[webui-test-ref § part]] · project:global\n\nzzskillsprobe two\n' \
+  "$BASE/skills/$SKILLDOM")
+check "create a skills domain" 200 "$code"
+
+curl -s -D "$HDR" -o "$BODY" -H "Authorization: Bearer $TOKEN" "$BASE/skills/$SKILLDOM"
+SETAG=$(etag_of "$HDR")
+code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "If-Match: $SETAG" --data-binary $'## msk-0000000000a1 First skill renamed\n<!-- skill: status=active uses=3 -->\nrefs: [[webui-test-ref]]\n\nzzskillsprobe one\n' \
+  "$BASE/skills/$SKILLDOM?section=msk-0000000000a1")
+check "section PUT by id" 200 "$code"
+body=$(curl -s -H "Authorization: Bearer $TOKEN" \
+  "$BASE/skills/$SKILLDOM?section=msk-0000000000a1")
+contains "the id still addresses the renamed section" "First skill renamed" "$body"
+
+curl -s -D "$HDR" -o /dev/null -H "Authorization: Bearer $TOKEN" "$BASE/skills/$SKILLDOM"
+SETAG=$(etag_of "$HDR")
+body=$(curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H "If-Match: $SETAG" \
+  --data-binary $'## no id here\n\nx\n' "$BASE/skills/$SKILLDOM?section=msk-0000000000a1")
+code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "If-Match: $SETAG" --data-binary $'## no id here\n\nx\n' \
+  "$BASE/skills/$SKILLDOM?section=msk-0000000000a1")
+check "a bad skill heading is 422" 422 "$code"
+contains "the refusal names the bad line" "no id here" "$body"
+
+body=$(curl -s -H "Authorization: Bearer $TOKEN" \
+  "$BASE/skills/backlinks?ref=webui-test-ref")
+contains "backlinks echo the ref" '"ref":"webui-test-ref"' "$body"
+contains "backlinks name the skill id" 'msk-0000000000a1' "$body"
+body=$(curl -s -H "Authorization: Bearer $TOKEN" \
+  "$BASE/skills/backlinks?ref=webui-test-ref&section=part")
+contains "a section ref matches with &section" 'msk-0000000000a2' "$body"
+
+body=$(curl -s -H "Authorization: Bearer $TOKEN" \
+  "$BASE/memory/search?q=zzskillsprobe&scope=skills")
+contains "scope=skills finds the skill" '"kind":"skill"' "$body"
+contains "the hit names the domain" '"skill":"webui-test-skills"' "$body"
+
+# A skills-writer key reads memory and reads/writes skills; everything else is
+# refused before the route ever runs.
+curl -s -o /dev/null -c "$SJAR" -X POST -H "Content-Type: application/json" \
+  -H "CF-Connecting-IP: 203.0.113.11" \
+  -d "{\"token\":\"$TOKEN\"}" "$BASE/auth/login"
+SWNEW=$(curl -s -b "$SJAR" -H "X-Memory-Actor: test" -H "Content-Type: application/json" \
+  -X POST -d '{"name":"suite-skills","scope":"skills-writer"}' "$BASE/auth/keys")
+contains "a skills-writer key is minted with its scope" '"scope":"skills-writer"' "$SWNEW"
+SWKEY=$(printf '%s' "$SWNEW" | sed -n 's/.*"value":"\([^"]*\)".*/\1/p')
+
+code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $SWKEY" "$BASE/memory/index")
+check "skills-writer reads /memory/index" 200 "$code"
+code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $SWKEY" "$BASE/skills/index")
+check "skills-writer reads /skills/index" 200 "$code"
+curl -s -D "$HDR" -o /dev/null -H "Authorization: Bearer $TOKEN" "$BASE/skills/$SKILLDOM"
+SETAG=$(etag_of "$HDR")
+code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $SWKEY" \
+  -H "If-Match: $SETAG" --data-binary $'## msk-0000000000a2 Second skill\n<!-- skill: status=active uses=1 -->\nrefs: [[webui-test-ref]]\n\nzzskillsprobe two\n' \
+  "$BASE/skills/$SKILLDOM?section=msk-0000000000a2")
+check "skills-writer writes a skill section" 200 "$code"
+
+code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Bearer $SWKEY" \
+  -H "If-Match: *" "$BASE/skills/$SKILLDOM")
+check "skills-writer cannot delete a skill" 403 "$code"
+code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $SWKEY" "$BASE/docs/readme")
+check "skills-writer cannot read /docs" 403 "$code"
+code=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "Authorization: Bearer $SWKEY" \
+  -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","id":1,"method":"ping"}' "$BASE/mcp")
+check "skills-writer cannot use /mcp" 403 "$code"
+code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $SWKEY" "$BASE/auth/keys")
+check "skills-writer cannot manage keys" 403 "$code"
+code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $SWKEY" \
+  -H "If-Match: *" --data-binary x "$BASE/memory/$CAT")
+check "skills-writer cannot write /memory" 403 "$code"
+
+code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Bearer $TOKEN" \
+  -H "If-Match: *" "$BASE/skills/$SKILLDOM")
+check "the skills test domain is deleted" 200 "$code"
+rm -f "$SJAR"
+restore_swkeys
+trap - EXIT
+
 echo "----"
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

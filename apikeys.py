@@ -38,6 +38,9 @@ NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_ .-]{0,39}$")
 # than iterating them. This client iterates, but the file outlives the client.
 RESERVED_NAMES = {"__proto__", "constructor", "prototype"}
 MAX_KEYS = 20
+# What a key may reach. "all" is the historical behaviour; a record from
+# before scopes existed has no "scope" key and is read as "all".
+SCOPES = ("all", "skills-writer")
 
 
 def keys_path() -> Path:
@@ -186,13 +189,17 @@ class KeyStore:
         """Public view: never includes the hash."""
         with self._lock:
             return [{"id": r.get("id"), "name": r.get("name"),
-                     "created": r.get("created"), "last_used": r.get("last_used")}
+                     "created": r.get("created"), "last_used": r.get("last_used"),
+                     "scope": r.get("scope") or "all"}
                     for r in self._load_locked().get("keys", [])
                     if isinstance(r, dict)]
 
-    def create(self, name: str, keyver: int = None):
+    def create(self, name: str, keyver: int = None, scope: str = "all"):
         """(record, secret). The secret is returned once and never stored."""
         name = (name or "").strip()
+        if scope not in SCOPES:
+            raise ValueError("unknown scope %r; choose one of: %s"
+                             % (scope, ", ".join(SCOPES)))
         if not NAME_RE.match(name):
             raise ValueError(
                 "name must be 1-40 characters of ASCII letters, digits, spaces, "
@@ -214,7 +221,7 @@ class KeyStore:
             secret = PREFIX + secrets.token_urlsafe(32)
             rec = {"id": secrets.token_hex(8), "name": name,
                    "hash": hash_secret(secret), "created": now_iso(),
-                   "last_used": None}
+                   "last_used": None, "scope": scope}
             if keyver is not None:
                 rec["kv"] = keyver
             rows.append(rec)

@@ -74,12 +74,21 @@ must be valid UTF-8 or the write is refused `400` — without that check one bad
 body would break `index`, `search` and `pins` for the whole store, since all
 three read every file. `tests/test_etag_crlf.py` holds the contract down.
 
-There are two namespaces. `/memory/{category}` holds facts — short, deduplicated,
+There are three namespaces. `/memory/{category}` holds facts — short, deduplicated,
 one topic each. `/docs/{slug}` holds working documents — handoffs, runbooks,
 audit reports: long, project-scoped, superseded rather than accumulated. Docs
 live in `data/docs/`, which every `/memory` endpoint is blind to because its
 glob is non-recursive. `/memory/search` skips docs unless you pass
 `&scope=docs|all`, so handoff prose never swamps a fact lookup.
+
+A third namespace, `/skills/{domain}`, holds reusable procedures: one
+`data/skills/<domain>.md` file per domain, one `## msk-<12 hex> <title>` section
+per skill. Sections are addressed by id (`?section=msk-<id>`), so renaming a
+skill does not break a caller. `GET /skills/index` lists the parsed metadata
+(status, refs, uses, last use) and `GET /skills/backlinks?ref=<category>` finds
+the skills that reference a category or one of its sections; both are computed
+from the files, never from a second index. `&scope=skills|all` adds skills to
+search, and MCP accepts `namespace="skills"` wherever it accepts memory or docs.
 
 By default search returns every line containing all the terms. `&mode=rank`
 instead ranks whole sections by BM25 with OR semantics, light stemming and CJK
@@ -171,6 +180,11 @@ A signed-in browser can mint named bearer keys on the MCP page (`/#/keys`) —
 one per device or agent. A key reads and writes the store exactly as the master token does, but
 deleting it disturbs nothing else, which is what makes a lost phone answerable
 without rotating the token and signing every browser and agent out at once.
+
+A key can be minted with `"scope": "skills-writer"` instead of the default
+`"all"`: it may read `/memory` and read/write `/skills`, and nothing else (no
+delete, `/docs`, `/mcp` or key management). A record written before scopes
+existed counts as `all`.
 
 Keys cannot mint or delete keys. That is cookie-only, so a leaked key cannot
 issue itself successors that outlive its own revocation. The secret is shown

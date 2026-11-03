@@ -29,9 +29,10 @@
   var state = {
     index: [],
     docs: [],
+    skills: [],
     cat: null,     // active category name, when kind === 'c'
-    doc: null,     // active doc slug, when kind === 'd'
-    kind: null,    // 'c' | 'd' | null (home/search/new)
+    doc: null,     // active doc slug, when kind is 'd' or 's'
+    kind: null,    // 'c' | 'd' | 's' | null (home/search/new)
     body: '',
     etag: null,
     dirty: false,
@@ -40,8 +41,10 @@
   };
 
   // one basePath per namespace -- everything else (etag flow, editor,
-  // history, diff) is identical between the two, so this is the seam.
-  function basePath(kind) { return kind === 'd' ? '/docs/' : '/memory/'; }
+  // history, diff) is identical between them, so this is the seam.
+  function basePath(kind) {
+    return kind === 'd' ? '/docs/' : kind === 's' ? '/skills/' : '/memory/';
+  }
 
   // the full set of category and doc names, for MD.render's opts.known --
   // whatever a [[name]] / [[doc:slug]] points to that does not exist here
@@ -148,6 +151,7 @@
 
   function getCategory(cat, rev) { return getItem('c', cat, rev); }
   function getDoc(slug, rev) { return getItem('d', slug, rev); }
+  function getSkill(name, rev) { return getItem('s', name, rev); }
 
   /* ----------------------------------------------------------------- auth */
 
@@ -257,10 +261,19 @@
     }).catch(function (err) { toast(err.message, true); });
   }
 
-  // wherever the category index is refreshed, the doc index is too -- the
-  // sidebar renders both groups from the same renderSidebar() call. The pins
-  // count rides along: any edit can add or remove a pin marker.
-  function refreshIndexes() { return Promise.all([loadIndex(), loadDocs(), loadPinsCount()]); }
+  function loadSkills() {
+    return apiJSON('/skills/index').then(function (idx) {
+      state.skills = idx;
+      renderSidebar();
+    }).catch(function (err) { toast(err.message, true); });
+  }
+
+  // wherever the category index is refreshed, the doc and skill indexes are
+  // too -- the sidebar renders all groups from the same renderSidebar() call.
+  // The pins count rides along: any edit can add or remove a pin marker.
+  function refreshIndexes() {
+    return Promise.all([loadIndex(), loadDocs(), loadSkills(), loadPinsCount()]);
+  }
 
   // slug -> [category, ...] that reference it via [[doc:slug]]. A doc absent
   // here has no owning category and falls into the "Unattached docs" group.
@@ -308,7 +321,7 @@
    *   K_STARRED ['c:name' | 'd:slug', ...]  the user's pins, in the order added.
    *   K_RECENT  same shape, most recent first, capped at RECENT_MAX.
    */
-  var GROUP_DEFAULT = { pinned: true, recent: true, unattached: false };
+  var GROUP_DEFAULT = { pinned: true, recent: true, unattached: false, skills: true };
 
   function readOverrides() { return Nav.parseOverrides(lsGet(K_TREE)); }
 
@@ -353,6 +366,11 @@
       var d = state.docs.filter(function (x) { return x.doc === name; })[0];
       if (!d) return null;
       return { kind: 'd', name: name, label: d.title || name, href: '#/d/' + encodeURIComponent(name) };
+    }
+    if (kind === 's') {
+      var s = state.skills.filter(function (x) { return x.doc === name; })[0];
+      if (!s) return null;
+      return { kind: 's', name: name, label: s.title || name, href: '#/s/' + encodeURIComponent(name) };
     }
     return null;
   }
@@ -439,7 +457,7 @@
         return d.doc.indexOf(filter) >= 0 || (d.title || '').toLowerCase().indexOf(filter) >= 0;
       });
     }
-    var activeName = state.kind === 'd' ? state.doc : state.cat;
+    var activeName = state.kind === 'c' ? state.cat : state.doc;
     var groups = readGroups();
 
     // The active row's ancestors are open for this render only (nothing is
@@ -500,6 +518,21 @@
       if (uOpen) {
         unattached.forEach(function (d) {
           html.push(docRowHTML(d.doc, d, state.kind === 'd' && d.doc === activeName, 0));
+        });
+      }
+    }
+
+    // Skills are their own flat group, below the memory tree: they share the
+    // reader/editor with docs but are not attached to categories.
+    var skills = Nav.skillRows(state.skills, {
+      active: state.kind === 's' ? state.doc : null, filter: filter
+    });
+    if (skills.length) {
+      var kOpen = !!filter || groups.skills;
+      html.push(groupHeadHTML('skills', 'Skills', skills.length, kOpen));
+      if (kOpen) {
+        skills.forEach(function (k) {
+          html.push(leafRowHTML(k.href, k.label, k.slug, k.active, 0, false));
         });
       }
     }
@@ -581,7 +614,7 @@
   function mainEdit(html) { $('main').innerHTML = '<div class="wrap editing">' + html + '</div>'; }
   function loading() { main('<p class="spin">Loading…</p>'); }
 
-  function outlineHTML(text) {
+  function outlineHTML(text, skillSecs) {
     var secs = MD.sections(text);
     if (!secs.length) return '';
     // wide: a permanent sticky column (summary hidden by CSS). narrow: an
@@ -597,9 +630,20 @@
         var d = MD.daysSince(s.verified);
         date = '<span class="odate' + (d > STALE_DAYS ? ' stale' : '') + '">' + e(s.verified) + '</span>';
       }
+      // A skills section heading starts with its id ('msk-0123456789ab Title'),
+      // which is the key /skills/index uses, so the index's status and uses can
+      // ride along in the outline.
+      var bits = [];
+      var sm = skillSecs && skillSecs[String(s.name).split(/\s+/)[0]];
+      if (sm && sm.status) bits.push(sm.status);
+      if (sm && sm.uses !== null && sm.uses !== undefined) {
+        bits.push(sm.uses + ' use' + (sm.uses === 1 ? '' : 's'));
+      }
+      var meta = bits.length ? '<span class="odate">' + e(bits.join(' · ')) + '</span>' : '';
       // level 2 sits at the outline's base indent; 3 and 4 step in from there
       var indent = (s.level - 2) * 12;
-      return '<a href="#' + s.id + '" style="padding-left:' + (9 + indent) + 'px">' + e(s.name) + ' ' + date + '</a>';
+      return '<a href="#' + s.id + '" style="padding-left:' + (9 + indent) + 'px">' + e(s.name) + ' ' + date +
+        (meta ? ' ' + meta : '') + '</a>';
     }).join('') + '</details>';
   }
 
@@ -748,41 +792,50 @@
 
   /* ------------------------------------------------------------ doc read view */
 
-  function viewDoc(slug, line, heading) {
+  function viewDoc(slug, line, heading, kind) {
+    kind = kind || 'd';
     state.doc = slug;
-    state.kind = 'd';
+    state.kind = kind;
     state.editing = false;
-    touchRecent('d', slug);
+    touchRecent(kind, slug);
     renderSidebar(true);
     loading();
-    getDoc(slug).then(function (r) {
+    getItem(kind, slug).then(function (r) {
       state.body = r.body;
       state.etag = r.etag;
-      var meta = state.docs.filter(function (d) { return d.doc === slug; })[0];
+      var meta = (kind === 's' ? state.skills : state.docs)
+        .filter(function (d) { return d.doc === slug; })[0];
       var size = meta ? meta.bytes : r.body.length;
       var title = meta ? meta.title : slug;
+      // /skills/index carries per-section status and uses; docs do not.
+      var skillSecs = null;
+      if (kind === 's' && meta && meta.sections) {
+        skillSecs = Object.create(null);
+        meta.sections.forEach(function (s) { if (s.id) skillSecs[s.id] = s; });
+      }
 
       main(
         '<div class="vhead"><h1>' + e(title) +
         (title !== slug ? ' <span class="muted small">' + e(slug) + '</span>' : '') + '</h1>' +
-        '<span class="spacer"></span><div class="actions">' + starButtonHTML('d', slug) +
+        '<span class="spacer"></span><div class="actions">' + starButtonHTML(kind, slug) +
         '<button class="btn" data-act="edit">Edit</button>' +
-        '<a class="btn" href="#/d/' + encodeURIComponent(slug) + '/history">History</a>' +
+        '<a class="btn" href="#/' + kind + '/' + encodeURIComponent(slug) + '/history">History</a>' +
         '<button class="btn danger" data-act="delete">Delete</button>' +
         '</div></div>' +
         '<p class="vsub">' + fmtBytes(size) + ' · etag ' +
         '<code>' + e(r.etag.slice(0, 8)) + '</code>' +
         (meta ? ' · changed ' + fmtAgo(meta.mtime) : '') + '</p>' +
-        referencedByHTML(docOwnersOf(state.index)[slug], 'c') +
+        (kind === 's' ? '' : referencedByHTML(docOwnersOf(state.index)[slug], 'c')) +
         '<div class="reading"><article class="md">' +
-        MD.render(r.body, { staleDays: STALE_DAYS, known: knownRefs() }) + '</article>' + outlineHTML(r.body) + '</div>'
+        MD.render(r.body, { staleDays: STALE_DAYS, known: knownRefs() }) + '</article>' +
+        outlineHTML(r.body, skillSecs) + '</div>'
       );
 
       $('main').querySelector('[data-act="edit"]').onclick = function () {
-        location.hash = '#/d/' + encodeURIComponent(slug) + '/edit';
+        location.hash = '#/' + kind + '/' + encodeURIComponent(slug) + '/edit';
       };
-      $('main').querySelector('[data-act="delete"]').onclick = function () { askDelete(slug, 'd'); };
-      wireStar('d', slug);
+      $('main').querySelector('[data-act="delete"]').onclick = function () { askDelete(slug, kind); };
+      wireStar(kind, slug);
 
       if (line) setTimeout(function () { scrollToLine(line); }, 30);
       if (heading) setTimeout(function () { scrollToHeadingId(heading); }, 30);
@@ -797,7 +850,7 @@
   var DOC_TEMPLATE = '# <slug>\n\n## Where things stand\n\n## Next step\n\n## Open questions\n';
 
   function editorHTML(kind, cat, body, isNew) {
-    var label = kind === 'd' ? 'doc' : 'category';
+    var label = kind === 'd' ? 'doc' : kind === 's' ? 'skill' : 'category';
     return '<div class="vhead"><h1>' + (isNew ? 'New ' + label : e(cat)) +
       '<span class="dot hidden" id="dirty"> ●</span></h1>' +
       '<span class="spacer"></span><div class="actions">' +
@@ -981,7 +1034,9 @@
    * background tabs without firing beforeunload, and a failed PUT over a flaky
    * link leaves nothing but a toast. So mirror the text into localStorage as it
    * is typed, and offer it back if it differs from what the server returns. */
-  function draftKey(kind, cat) { return 'mem.draft.' + (kind === 'd' ? 'doc.' : '') + (cat || '__new__'); }
+  function draftKey(kind, cat) {
+    return 'mem.draft.' + (kind === 'd' ? 'doc.' : kind === 's' ? 'skill.' : '') + (cat || '__new__');
+  }
 
   function saveDraft(kind, cat, text) {
     try { localStorage.setItem(draftKey(kind, cat), JSON.stringify({ t: text, at: Date.now() })); }
@@ -1155,20 +1210,21 @@
     });
   }
 
-  function viewDocEdit(slug) {
+  function viewDocEdit(slug, kind) {
+    kind = kind || 'd';
     state.doc = slug;
-    state.kind = 'd';
+    state.kind = kind;
     state.editing = true;
-    touchRecent('d', slug);
+    touchRecent(kind, slug);
     renderSidebar(true);
     loading();
-    getDoc(slug).then(function (r) {
+    (kind === 's' ? getSkill(slug) : getDoc(slug)).then(function (r) {
       state.body = r.body;
       state.etag = r.etag;
-      mainEdit(editorHTML('d', slug, r.body, false));
-      wireEditor('d', slug, false);
+      mainEdit(editorHTML(kind, slug, r.body, false));
+      wireEditor(kind, slug, false);
       setDirty(false);
-      offerDraft('d', slug, r.body);
+      offerDraft(kind, slug, r.body);
     }).catch(function (err) {
       main('<div class="banner bad">' + e(err.message) + '</div>');
     });
@@ -1234,7 +1290,7 @@
           if (isNew) {
             state.suppressRoute = true;
             location.hash = '#/' + kind + '/' + encodeURIComponent(cat);
-            if (kind === 'd') state.doc = cat; else state.cat = cat;
+            if (kind === 'c') state.cat = cat; else state.doc = cat;
             mainEdit(editorHTML(kind, cat, text, false));
             wireEditor(kind, cat, false);
             setDirty(false);
@@ -1290,7 +1346,7 @@
 
   function askDelete(cat, kind) {
     kind = kind || 'c';
-    var label = kind === 'd' ? 'doc' : 'category';
+    var label = kind === 'd' ? 'doc' : kind === 's' ? 'skill' : 'category';
     var m = modal(
       '<h3>Delete ' + label + ' <code>' + e(cat) + '</code>?</h3>' +
       '<p>The file is removed but the deletion is committed, so the content stays ' +
@@ -1319,12 +1375,12 @@
   /* --------------------------------------------------------- history view */
 
   function viewHistory(kind, cat) {
-    if (kind === 'd') { state.doc = cat; } else { state.cat = cat; }
+    if (kind === 'c') { state.cat = cat; } else { state.doc = cat; }
     state.kind = kind;
     state.editing = false;
     renderSidebar(true);
     loading();
-    var label = kind === 'd' ? 'doc' : 'category';
+    var label = kind === 'd' ? 'doc' : kind === 's' ? 'skill' : 'category';
     apiJSON(basePath(kind) + encodeURIComponent(cat) + '/history?limit=100').then(function (revs) {
       main(
         '<div class="vhead"><h1>' + e(cat) + ' <span class="muted">history</span></h1>' +
@@ -1346,7 +1402,7 @@
   }
 
   function viewRev(kind, cat, sha) {
-    if (kind === 'd') { state.doc = cat; } else { state.cat = cat; }
+    if (kind === 'c') { state.cat = cat; } else { state.doc = cat; }
     state.kind = kind;
     state.editing = false;
     renderSidebar(true);
@@ -1539,7 +1595,7 @@
     if (palette || $('app').classList.contains('hidden')) return;
     if ($('modal-root').firstChild) return;      // never stack on another modal
     var opener = document.activeElement;
-    var items = Nav.buildItems(state.index, state.docs, MD.slug);
+    var items = Nav.buildItems(state.index, state.docs, MD.slug, state.skills);
     var byId = Object.create(null);
     items.forEach(function (it) { byId[it.id] = it; });
 
@@ -1789,6 +1845,7 @@
       '<form id="key-new" class="keyform">',
       '  <input id="key-name" type="text" placeholder="Name this key (e.g. phone, laptop)" ' +
       'maxlength="40" spellcheck="false">',
+      Nav.keyScopeSelectHTML('key-scope'),
       '  <button type="submit" class="btn primary">Create key</button>',
       '</form>',
       '<p id="key-err" class="error small hidden"></p>',
@@ -1800,7 +1857,9 @@
       html.push('<table class="keytable"><thead><tr><th>Name</th><th>Created</th>' +
                 '<th>Last used</th><th></th></tr></thead><tbody>');
       rows.forEach(function (k) {
-        html.push('<tr><td>' + e(k.name) + '</td><td class="muted small">' +
+        var scope = k.scope && k.scope !== 'all'
+          ? ' <span class="pill" title="What this key may write">' + e(k.scope) + '</span>' : '';
+        html.push('<tr><td>' + e(k.name) + scope + '</td><td class="muted small">' +
           e((k.created || '').slice(0, 10)) + '</td><td class="muted small">' +
           e(k.last_used ? k.last_used.slice(0, 10) : 'never') +
           '</td><td><button class="btn small danger" data-del="' + e(k.id) +
@@ -1858,7 +1917,7 @@
       api('/auth/keys', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: $('key-name').value })
+        body: JSON.stringify(Nav.keyBody($('key-name').value, $('key-scope').value))
       }).then(function (res) {
         if (!res.ok) {
           return res.text().then(function (t) {
@@ -2124,14 +2183,14 @@
       return viewCategory(cat);
     }
 
-    if (parts[0] === 'd' && parts[1]) {
-      var slug = decodeURIComponent(parts[1]);
-      if (parts[2] === 'edit') return viewDocEdit(slug);
-      if (parts[2] === 'history') return viewHistory('d', slug);
-      if (parts[2] === 'rev' && parts[3]) return viewRev('d', slug, parts[3]);
-      if (parts[2] === 'l' && parts[3]) return viewDoc(slug, parseInt(parts[3], 10));
-      if (parts[2] === 'h' && parts[3]) return viewDoc(slug, null, decodeURIComponent(parts[3]));
-      return viewDoc(slug);
+    // Docs and skills share one reader/editor; only the namespace and the
+    // first hash segment differ, so both routes go through Nav.itemRoute.
+    if ((parts[0] === 'd' || parts[0] === 's') && parts[1]) {
+      var ir = Nav.itemRoute(parts[0], parts);
+      if (ir.view === 'edit') return viewDocEdit(ir.name, ir.kind);
+      if (ir.view === 'history') return viewHistory(ir.kind, ir.name);
+      if (ir.view === 'rev') return viewRev(ir.kind, ir.name, ir.rev);
+      return viewDoc(ir.name, ir.line, ir.heading, ir.kind);
     }
     return viewHome();
   }

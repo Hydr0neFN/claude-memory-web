@@ -49,8 +49,9 @@ same file. Pass a short `note` on every write (it becomes the commit subject).
 """
 
 NS_PROP = {
-    "type": "string", "enum": ["memory", "docs"], "default": "memory",
-    "description": "memory = categories (short facts); docs = long working documents.",
+    "type": "string", "enum": ["memory", "docs", "skills"], "default": "memory",
+    "description": "memory = categories (short facts); docs = long working documents; "
+                   "skills = reusable procedures, one file per domain.",
 }
 NAME_PROP = {"type": "string", "description": "Category name or doc slug, e.g. `protocol`."}
 SECTION_PROP = {
@@ -93,7 +94,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Space-separated terms."},
-                "scope": {"type": "string", "enum": ["memory", "docs", "all"],
+                "scope": {"type": "string", "enum": ["memory", "docs", "skills", "all"],
                           "default": "memory"},
                 "mode": {"type": "string", "enum": ["and", "rank"], "default": "and"},
                 "full": {"type": "boolean", "default": False},
@@ -360,8 +361,8 @@ class Server:
     @staticmethod
     def _base(args: dict) -> str:
         ns = args.get("namespace") or "memory"
-        if ns not in ("memory", "docs"):
-            raise ToolError("namespace must be 'memory' or 'docs'")
+        if ns not in ("memory", "docs", "skills"):
+            raise ToolError("namespace must be 'memory', 'docs' or 'skills'")
         return "/" + ns
 
     def _target(self, args: dict) -> str:

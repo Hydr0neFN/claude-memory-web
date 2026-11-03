@@ -73,7 +73,8 @@ check("no flags: no alert header", call(mw, "GET", "/memory")[1], None)
 # -- READONLY fences vault writes only ----------------------------------------
 touch(ro, "push to nl rejected non-fast-forward at 2026-09-25T03:00Z\nsecond line ignored")
 for method, path in (("PUT", "/memory/x"), ("DELETE", "/memory/x"),
-                     ("PUT", "/docs/y"), ("DELETE", "/docs/y"), ("POST", "/memory")):
+                     ("PUT", "/docs/y"), ("DELETE", "/docs/y"),
+                     ("PUT", "/skills/x"), ("POST", "/memory")):
     st, alert, body = call(mw, method, path)
     check("readonly: %s %s -> 503" % (method, path), st, 503)
 st, alert, body = call(mw, "PUT", "/memory/x")
@@ -82,7 +83,7 @@ check("503 body is json", "detail" in json.loads(body))
 check("only the first line is used", b"second line" in body, False)
 check("alert header derived from READONLY",
       alert, b"READ-ONLY: push to nl rejected non-fast-forward at 2026-09-25T03:00Z")
-for method, path in (("GET", "/memory/x"), ("HEAD", "/docs/y"),
+for method, path in (("GET", "/memory/x"), ("HEAD", "/docs/y"), ("GET", "/skills/x"),
                      ("POST", "/auth/login"), ("POST", "/oauth/token"),
                      ("POST", "/auth/keys"), ("POST", "/mcp"), ("PUT", "/memoryx")):
     check("readonly: %s %s not fenced" % (method, path), call(mw, method, path)[0], 200)

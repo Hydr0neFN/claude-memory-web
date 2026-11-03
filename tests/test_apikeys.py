@@ -213,6 +213,31 @@ rec_old, sec_old = kvs.create("legacy")
 check("key minted without keyver carries no kv", "kv" in rec_old, False)
 check("legacy key survives a keyver bump", bool(kvs.verify(sec_old, 9)), True)
 
+# -- scopes (2026-11-03): "all" is today's key; "skills-writer" is the one
+# narrowed key. A record from before scopes existed has no "scope" key and
+# must keep behaving exactly as it did.
+tmpsc = Path(tempfile.mkdtemp()) / "apikeys.json"
+kcs = apikeys.KeyStore(tmpsc)
+rec_all, sec_all = kcs.create("full")
+check("keys default to scope all", (rec_all.get("scope"), kcs.listing()[0]["scope"]),
+      ("all", "all"))
+rec_sw, sec_sw = kcs.create("skills", None, "skills-writer")
+check("a scoped key records its scope", rec_sw.get("scope"), "skills-writer")
+check("the listing shows the scope",
+      [k["scope"] for k in kcs.listing()], ["all", "skills-writer"])
+check("the scope is on disk", '"scope": "skills-writer"' in tmpsc.read_text(),
+      True)
+expect_value_error("an unknown scope is refused",
+                   lambda: kcs.create("bad", None, "root"))
+tmpsc.write_text(json.dumps({"keys": [
+    {"id": "legacy01", "name": "legacy", "hash": apikeys.hash_secret(sec_all),
+     "created": "2026-01-01T00:00:00Z", "last_used": None},
+]}), encoding="utf-8")
+legacy = kcs.listing()
+check("an old record without scope lists as all", legacy[0]["scope"], "all")
+check("an old record still verifies", (kcs.verify(sec_all) or {}).get("id"), "legacy01")
+check("an old record has no scope key on disk", '"scope"' in tmpsc.read_text(), False)
+
 print("----")
 print("PASS=%d FAIL=%d" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)
