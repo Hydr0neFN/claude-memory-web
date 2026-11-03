@@ -344,8 +344,12 @@ def validate_category(category: str) -> Path:
 # route, and routing is the whole point: read one 5 KB category instead of the
 # ~1 MB store. "Remember to update the roster" drifted it to 48 of 110 entries,
 # so registration is a precondition of creation rather than a convention.
-# Exempt: protocol-* (the roster cannot require itself) and /docs (a separate
-# namespace the roster does not index).
+#
+# The roster may be split into protocol-roster-<domain> sub-files, one per
+# domain, so no single file grows past the point a session can read it whole.
+# A category is listed if the main file or any sub-file names it. protocol-*
+# stays exempt from the gate so those sub-files can themselves be created
+# freely. /docs is exempt too: a separate namespace the roster does not index.
 ROSTER_CATEGORY = "protocol-roster"
 
 
@@ -365,16 +369,30 @@ def require_rostered(category: str) -> None:
     try:
         listed = f"`{category}`" in roster.read_text(encoding="utf-8")
     except OSError:
-        # No roster to check against -- fail open rather than block every
-        # create on a missing file.
+        # No main roster to check against -- fail open rather than block every
+        # create on a missing file. Sub-files are only consulted once this one
+        # has been read.
         return
+    if not listed:
+        # The roster may be split into per-domain sub-files; a name listed in
+        # any one of them counts. An unreadable sub-file is skipped, not fatal.
+        for sub in sorted(DATA_DIR.glob(f"{ROSTER_CATEGORY}-*.md")):
+            if not sub.is_file():
+                continue
+            try:
+                if f"`{category}`" in sub.read_text(encoding="utf-8"):
+                    listed = True
+                    break
+            except OSError:
+                continue
     if not listed:
         raise HTTPException(
             status_code=422,
             detail=(
-                "'%s' is not listed in %s, so nothing would be able to route to "
-                "it. Add its one-line entry under '## Current Categories' first, "
-                "then create the category." % (category, ROSTER_CATEGORY)
+                "'%s' is not listed in %s or its %s-* sub-files, so nothing "
+                "would be able to route to it. Add its one-line entry under "
+                "'## Current Categories' first, then create the category."
+                % (category, ROSTER_CATEGORY, ROSTER_CATEGORY)
             ),
         )
 

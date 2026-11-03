@@ -945,6 +945,16 @@ code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $
 check "/docs is not gated" 200 "$code"
 curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $TOKEN" -H "If-Match: *"   "$BASE/docs/gate-probe-doc"
 
+# A split roster: protocol-* stays exempt so the sub-file itself is creatable,
+# and a category that is listed only in that sub-file is allowed. This name is
+# not a fixture name, so the gate applies to it.
+code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN"   -H "If-None-Match: *" -H "Content-Type: text/plain"   --data-binary '`roster-subfile-probe`' "$BASE/memory/protocol-roster-zztest")
+check "protocol-* sub-file is creatable" 200 "$code"
+code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "Authorization: Bearer $TOKEN"   -H "If-None-Match: *" -H "Content-Type: text/plain"   --data-binary "# x" "$BASE/memory/roster-subfile-probe")
+check "a category listed only in a sub-file is allowed" 200 "$code"
+curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $TOKEN" -H "If-Match: *"   "$BASE/memory/roster-subfile-probe"
+curl -s -o /dev/null -X DELETE -H "Authorization: Bearer $TOKEN" -H "If-Match: *"   "$BASE/memory/protocol-roster-zztest"
+
 # $CAT itself proves the fixture exemption: every section above created it.
 code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "$BASE/memory/$CAT")
 check "exempt fixture category was creatable" 200 "$code"
