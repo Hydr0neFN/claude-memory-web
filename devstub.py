@@ -127,6 +127,30 @@ DOC_HISTORY = [
      "message": "CREATE doc tourplan-handoff via claude-code"},
 ]
 
+# Skills: same file shape as docs, but each '## ' heading is
+# `msk-<id> <title>` and /skills/index adds status/uses/last_used per section.
+SKILLS = {
+    "deploy-checklist": "# deploy checklist\n\n"
+                        "## msk-0123456789ab Deploy to example.com\n<!-- verified: 2026-09-01 -->\n\n"
+                        "- curl https://example.com/health before switching traffic\n\n"
+                        "## msk-0123456789ac Roll back\n\n- point the record back at the old host\n",
+    "mail-triage": "# mail triage\n\n"
+                   "## msk-0123456789ad Sort the inbox\n\n"
+                   "- anything from example.com goes to the demo folder\n\n"
+                   "## msk-0123456789ae Draft the reply\n\n- use the shared signature\n",
+    "release-notes": "# release notes\n\n"
+                     "## msk-0123456789af Summarise changes\n\n"
+                     "- list shipped items only, no internal names\n",
+}
+SKILL_HISTORY = [
+    {"sha": "e" * 40, "short": "eeeeeeee", "date": "2026-08-20T11:00:00+02:00", "bytes": 320,
+     "message": "PUT skill deploy-checklist via memory-web"},
+    {"sha": "f" * 40, "short": "ffffffff", "date": "2026-08-18T09:30:00+02:00", "bytes": 280,
+     "message": "CREATE skill deploy-checklist via claude-code"},
+]
+SKILL_STATUSES = ["active", "draft", "retired"]
+SKILL_SECTION_RE = re.compile(r"^##\s+(msk-[a-z0-9]+)\s+(.*?)\s*$")
+
 
 # sample rows for the keys page, so the Passkeys / Keys / Connected apps
 # sections have something to list and delete
@@ -149,6 +173,32 @@ def blob_sha(text):
     h.update(b"blob %d\0" % len(data))
     h.update(data)
     return h.hexdigest()
+
+
+def file_title(text, fallback):
+    for line in text.splitlines():
+        m = TITLE_RE.match(line)
+        if m:
+            return m.group(1)
+    return fallback
+
+
+def skill_sections(text):
+    """[{id,title,status,refs,uses,last_used}], one per '## msk-...' heading."""
+    out = []
+    for line in text.splitlines():
+        m = SKILL_SECTION_RE.match(line)
+        if not m:
+            continue
+        n = len(out)
+        out.append({
+            "id": m.group(1), "title": m.group(2),
+            "status": SKILL_STATUSES[n % len(SKILL_STATUSES)],
+            "refs": [], "uses": (n + 1) * 3,
+            "last_used": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                       time.gmtime(time.time() - 86400 * (n + 1))),
+        })
+    return out
 
 
 def doc_refs_of(text):
@@ -191,6 +241,20 @@ def find_section_bounds(lines, name):
     headers = section_headers(lines)
     for pos, (i, hname) in enumerate(headers):
         if hname != name:
+            continue
+        end = headers[pos + 1][0] if pos + 1 < len(headers) else len(lines)
+        trimmed_end = end
+        while trimmed_end > i + 1 and lines[trimmed_end - 1].strip() == "":
+            trimmed_end -= 1
+        return i, trimmed_end
+    return None
+
+
+def find_skill_bounds(lines, sid):
+    """find_section_bounds keyed by the msk-<id> heading prefix, not the title."""
+    headers = section_headers(lines)
+    for pos, (i, hname) in enumerate(headers):
+        if hname.split(" ", 1)[0] != sid:
             continue
         end = headers[pos + 1][0] if pos + 1 < len(headers) else len(lines)
         trimmed_end = end
@@ -317,6 +381,24 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_file(self, body, q, bounds_fn=find_section_bounds):
+        """A file body with its etag, honouring ?section= exactly like /docs."""
+        headers = {"ETag": '"%s"' % blob_sha(body)}
+        section = (q.get("section", [""])[0])
+        if section:
+            lines = body.splitlines()
+            bounds = bounds_fn(lines, section)
+            if bounds is None:
+                return self._json(
+                    {"detail": "section '%s' not found; available sections: %s" % (
+                        section, ", ".join(s["name"] for s in sections_of(body)))},
+                    404,
+                )
+            start, end = bounds
+            headers["X-Memory-Section"] = section_header_value(section)
+            return self._text("\n".join(lines[start:end]), headers=headers)
+        return self._text(body, headers=headers)
+
     def do_GET(self):
         u = urllib.parse.urlparse(self.path)
         p, q = u.path, urllib.parse.parse_qs(u.query)
@@ -329,6 +411,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                                "email": "", "providers": [], "google": False, "passkey": True})
 
         if not SIGNED_IN["on"] and (p.startswith("/memory") or p.startswith("/docs")
+                                    or p.startswith("/skills")
                                     or p.startswith("/auth/keys") or p.startswith("/auth/passkeys")):
             return self._json({"detail": "not signed in"}, 401)
 
@@ -468,6 +551,35 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 return self._text("\n".join(lines[start:end]), headers=headers)
             return self._text(body, headers=headers)
 
+        if p == "/skills":
+            return self._json(sorted(SKILLS))
+
+        if p == "/skills/index":
+            out = []
+            for domain, text in sorted(SKILLS.items()):
+                out.append({
+                    "doc": domain, "bytes": len(text.encode("utf-8")),
+                    "mtime": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                           time.gmtime(time.time() - 1800)),
+                    "etag": blob_sha(text), "title": file_title(text, domain),
+                    "sections": skill_sections(text),
+                })
+            return self._json(out)
+
+        m = re.match(r"^/skills/([a-z0-9-]+)/history$", p)
+        if m:
+            return self._json(SKILL_HISTORY if m.group(1) in SKILLS else [])
+
+        m = re.match(r"^/skills/([a-z0-9-]+)$", p)
+        if m:
+            domain = m.group(1)
+            if q.get("rev"):
+                body = SKILLS.get(domain, "") + "\n\n## msk-ffffffffffff Removed in a later revision\n\n- old note\n"
+                return self._text(body, headers={"ETag": '"%s"' % blob_sha(body)})
+            if domain not in SKILLS:
+                return self._json({"detail": "not found"}, 404)
+            return self._send_file(SKILLS[domain], q, find_skill_bounds)
+
         return super().do_GET()
 
     def do_POST(self):
@@ -508,12 +620,19 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._json({"id": PASSKEYS[-1]["id"], "name": name, "created": PASSKEYS[-1]["created"]})
         if self.path == "/auth/keys":
             try:
-                name = json.loads(raw or b"{}").get("name", "key")
+                body = json.loads(raw or b"{}")
             except ValueError:
-                name = "key"
-            KEYS.append({"id": "k%d" % (len(KEYS) + 1), "name": name,
-                         "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "last_used": None})
-            return self._json({"id": KEYS[-1]["id"], "name": name, "value": "mem_" + b64u(os.urandom(24))})
+                body = {}
+            name = body.get("name", "key")
+            row = {"id": "k%d" % (len(KEYS) + 1), "name": name,
+                   "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "last_used": None}
+            # scope is optional; 'all' is the default and is not stored, so the
+            # GET listing only carries a scope for restricted keys.
+            scope = body.get("scope")
+            if scope and scope != "all":
+                row["scope"] = scope
+            KEYS.append(row)
+            return self._json({"id": row["id"], "name": name, "value": "mem_" + b64u(os.urandom(24))})
         return self._json({"detail": "not found"}, 404)
 
     def do_PUT(self):
@@ -525,9 +644,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         m = re.match(r"^/docs/([a-z0-9-]+)$", u.path)
         if m:
             return self._put(m.group(1), DOCS, q)
+        m = re.match(r"^/skills/([a-z0-9-]+)$", u.path)
+        if m:
+            return self._put(m.group(1), SKILLS, q, find_skill_bounds, by_id=True)
         return self._json({"detail": "invalid name"}, 400)
 
-    def _put(self, name, store, q=None):
+    def _put(self, name, store, q=None, bounds_fn=find_section_bounds, by_id=False):
         q = q or {}
         if not self.headers.get("x-memory-actor"):
             return self._json({"detail": "X-Memory-Actor required"}, 403)
@@ -560,8 +682,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             if not heading:
                 return self._json({"detail": "section body must start with a '## ' heading line"}, 400)
             heading_name = heading.group(1)
+            # A skill heading is '## msk-<id> <title>'; the section key is the id.
+            compare_name = heading_name.split(" ", 1)[0] if by_id else heading_name
             expected_name = rename_to if rename_to else section
-            if heading_name != expected_name:
+            if compare_name != expected_name:
                 return self._json(
                     {"detail": "heading '%s' does not match expected '%s'; pass "
                                 "&rename_to=<new-name> for a deliberate rename" % (
@@ -570,7 +694,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 )
             text = store[name]
             lines = text.splitlines()
-            bounds = find_section_bounds(lines, section)
+            bounds = bounds_fn(lines, section)
             if bounds is None:
                 if mode != "upsert":
                     return self._json(
@@ -636,34 +760,40 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._text("OK")
         m = re.match(r"^/docs/([a-z0-9-]+)$", u.path)
         if m and m.group(1) in DOCS:
-            if section:
-                text = DOCS[m.group(1)]
-                lines = text.splitlines()
-                bounds = find_section_bounds(lines, section)
-                if bounds is None:
-                    return self._json(
-                        {"detail": "section '%s' not found; available sections: %s" % (
-                            section, ", ".join(s2["name"] for s2 in sections_of(text)))},
-                        404,
-                    )
-                start, end = bounds
-                head, tail = lines[:start], lines[end:]
-                if head and tail and head[-1] == "" and tail[0] == "":
-                    tail = tail[1:]      # see main.py's section_delete_text
-                new_text = "\n".join(head + tail)
-                if not new_text.strip():
-                    return self._json(
-                        {"detail": "deleting section '%s' would leave doc '%s' empty; "
-                                   "delete the whole doc instead" % (section, m.group(1))},
-                        400,
-                    )
-                if not new_text.endswith("\n"):
-                    new_text += "\n"
-                DOCS[m.group(1)] = new_text
-                return self._text("OK", headers={"ETag": '"%s"' % blob_sha(new_text)})
-            del DOCS[m.group(1)]
-            return self._text("OK")
+            return self._delete_file(DOCS, m.group(1), section, "doc")
+        m = re.match(r"^/skills/([a-z0-9-]+)$", u.path)
+        if m and m.group(1) in SKILLS:
+            return self._delete_file(SKILLS, m.group(1), section, "skill", find_skill_bounds)
         return self._json({"detail": "not found"}, 404)
+
+    def _delete_file(self, store, name, section, label, bounds_fn=find_section_bounds):
+        if not section:
+            del store[name]
+            return self._text("OK")
+        text = store[name]
+        lines = text.splitlines()
+        bounds = bounds_fn(lines, section)
+        if bounds is None:
+            return self._json(
+                {"detail": "section '%s' not found; available sections: %s" % (
+                    section, ", ".join(s["name"] for s in sections_of(text)))},
+                404,
+            )
+        start, end = bounds
+        head, tail = lines[:start], lines[end:]
+        if head and tail and head[-1] == "" and tail[0] == "":
+            tail = tail[1:]      # see main.py's section_delete_text
+        new_text = "\n".join(head + tail)
+        if not new_text.strip():
+            return self._json(
+                {"detail": "deleting section '%s' would leave %s '%s' empty; "
+                           "delete the whole %s instead" % (section, label, name, label)},
+                400,
+            )
+        if not new_text.endswith("\n"):
+            new_text += "\n"
+        store[name] = new_text
+        return self._text("OK", headers={"ETag": '"%s"' % blob_sha(new_text)})
 
 
 if __name__ == "__main__":

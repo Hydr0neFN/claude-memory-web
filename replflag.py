@@ -3,7 +3,7 @@
 Two files in the instance's flag directory (MEMORY_FLAG_DIR, default: the
 parent of DATA_DIR, i.e. next to .env and the json state):
 
-  READONLY  -- present => every write to /memory or /docs is refused with 503
+  READONLY  -- present => every write to /memory, /docs or /skills is refused with 503
                and the file's first line as the reason. Written by the
                replication scripts (memsync-push on a non-fast-forward
                rejection, the NL watchdog while handing back). Cleared only
@@ -34,7 +34,7 @@ import json
 import os
 import re
 
-FENCED_PREFIXES = ("/memory", "/docs")
+FENCED_PREFIXES = ("/memory", "/docs", "/skills")
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 # Header values must be one line of visible ASCII; anything else is replaced.
 UNSAFE_RE = re.compile(r"[^\x20-\x7e]")

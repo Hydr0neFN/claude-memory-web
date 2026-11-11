@@ -50,8 +50,17 @@ load_dotenv(os.environ.get("MEMORY_ENV_FILE") or None)
 TOKEN = os.environ["CLAUDE_MEMORY_TOKEN"]
 DATA_DIR = Path(os.environ.get("MEMORY_DATA_DIR") or (Path(__file__).parent / "data"))
 DOCS_DIR = DATA_DIR / "docs"
+SKILLS_DIR = DATA_DIR / "skills"
 WEB_DIR = Path(__file__).parent / "web"
 CATEGORY_RE = re.compile(r"^[a-z0-9-]+$")
+# A skill heading is `## msk-<12 hex> <title>`: an immutable id and a title a
+# write may change. Section addressing uses the id (see skill_find_bounds), so
+# renaming a skill never breaks a caller that reads it by id.
+SKILL_ID_RE = re.compile(r"^## (msk-[0-9a-f]{12}) (.*)$")
+SKILL_HEADING_RE = re.compile(r"^## msk-[0-9a-f]{12} \S.{0,79}$")
+SKILL_REF_RE = re.compile(r"^msk-[0-9a-f]{12}$")
+SKILL_META_RE = re.compile(r"<!--\s*skill:\s*(.*?)\s*-->")
+SKILL_STATUSES = ("probation", "active", "dormant")
 REV_RE = re.compile(r"^[0-9a-f]{4,40}$")
 SECTION_RE = re.compile(r"^##\s+(.*?)\s*$")
 TITLE_RE = re.compile(r"^#(?!#)\s+(.*?)\s*$")
@@ -95,10 +104,11 @@ SEARCH_LIMIT_DEFAULT = 20
 SEARCH_LIMIT_MAX = 100
 SNIPPET_CHARS = 240
 NOTE_MAX = 60
-SEARCH_SCOPES = ("memory", "docs", "all")
+SEARCH_SCOPES = ("memory", "docs", "skills", "all")
 SEARCH_MODES = ("and", "rank")
 
 DOCS_DIR.mkdir(parents=True, exist_ok=True)
+SKILLS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def clear_stale_index_lock() -> None:
@@ -208,6 +218,22 @@ passkey_throttle = webauth.Throttle(max_attempts=5, window_sec=300)
 # --------------------------------------------------------------------------
 
 
+def key_scope_allows(scope: str, method: str, path: str) -> bool:
+    """Whether a minted key with this scope may make this request.
+
+    Deny by default: a scope names everything it may reach, so a route added
+    later is closed to it without any edit here. 'all' is today's key.
+    """
+    if scope == "all":
+        return True
+    if scope == "skills-writer":
+        if method == "GET" and (path == "/memory" or path.startswith("/memory/")):
+            return True
+        if method in ("GET", "PUT") and (path == "/skills" or path.startswith("/skills/")):
+            return True
+    return False
+
+
 def check_auth(request: Request) -> str:
     """Authorize a read. Returns which credential matched: 'bearer' or 'cookie'.
 
@@ -225,6 +251,29 @@ def check_auth(request: Request) -> str:
         rec = keystore.verify(presented, creds.keyver)
         if rec:
             keystore.touch(rec)
+            # A scoped key is refused here, where every bearer is verified, so
+            # no route can miss the check. Routes that never call check_auth
+            # (/mcp, /auth/*) refuse scoped keys on their own.
+            scope = rec.get("scope") or "all"
+            if not key_scope_allows(scope, request.method, request.url.path):
+                raise HTTPException(
+                    status_code=403,
+                    detail="this key's scope does not allow %s %s"
+                           % (request.method, request.url.path),
+                )
+            if scope == "skills-writer" and request.url.path == "/memory/search":
+                # The one /memory route that can reach another namespace:
+                # ?scope=docs|all would hand this key the docs it may not read.
+                # Only the namespaces it already reads are allowed; an absent
+                # scope is the 'memory' default. Every repeated value must pass.
+                for value in request.query_params.getlist("scope"):
+                    if value.strip().lower() not in ("memory", "skills"):
+                        raise HTTPException(
+                            status_code=403,
+                            detail="this key's scope does not allow %s %s with "
+                                   "scope=%r" % (request.method, request.url.path,
+                                                 value.strip().lower()),
+                        )
             return "bearer"
     if session.read(request.cookies.get(webauth.COOKIE_NAME), creds.keyver):
         return "cookie"
@@ -308,6 +357,7 @@ async def read_capped_body(request: Request, cap: int) -> bytes:
 # rather than let it happen silently.
 RESERVED_CATEGORIES = {"index", "search", "pins"}
 RESERVED_DOCS = {"index"}
+RESERVED_SKILLS = {"index", "backlinks"}
 
 # Categories this instance serves but never lets a client change: a relative's
 # `protocol` is rendered from the owner's rules by replication/memprotocol-sync,
@@ -344,8 +394,12 @@ def validate_category(category: str) -> Path:
 # route, and routing is the whole point: read one 5 KB category instead of the
 # ~1 MB store. "Remember to update the roster" drifted it to 48 of 110 entries,
 # so registration is a precondition of creation rather than a convention.
-# Exempt: protocol-* (the roster cannot require itself) and /docs (a separate
-# namespace the roster does not index).
+#
+# The roster may be split into protocol-roster-<domain> sub-files, one per
+# domain, so no single file grows past the point a session can read it whole.
+# A category is listed if the main file or any sub-file names it. protocol-*
+# stays exempt from the gate so those sub-files can themselves be created
+# freely. /docs is exempt too: a separate namespace the roster does not index.
 ROSTER_CATEGORY = "protocol-roster"
 
 
@@ -365,16 +419,30 @@ def require_rostered(category: str) -> None:
     try:
         listed = f"`{category}`" in roster.read_text(encoding="utf-8")
     except OSError:
-        # No roster to check against -- fail open rather than block every
-        # create on a missing file.
+        # No main roster to check against -- fail open rather than block every
+        # create on a missing file. Sub-files are only consulted once this one
+        # has been read.
         return
+    if not listed:
+        # The roster may be split into per-domain sub-files; a name listed in
+        # any one of them counts. An unreadable sub-file is skipped, not fatal.
+        for sub in sorted(DATA_DIR.glob(f"{ROSTER_CATEGORY}-*.md")):
+            if not sub.is_file():
+                continue
+            try:
+                if f"`{category}`" in sub.read_text(encoding="utf-8"):
+                    listed = True
+                    break
+            except OSError:
+                continue
     if not listed:
         raise HTTPException(
             status_code=422,
             detail=(
-                "'%s' is not listed in %s, so nothing would be able to route to "
-                "it. Add its one-line entry under '## Current Categories' first, "
-                "then create the category." % (category, ROSTER_CATEGORY)
+                "'%s' is not listed in %s or its %s-* sub-files, so nothing "
+                "would be able to route to it. Add its one-line entry under "
+                "'## Current Categories' first, then create the category."
+                % (category, ROSTER_CATEGORY, ROSTER_CATEGORY)
             ),
         )
 
@@ -392,6 +460,21 @@ def validate_doc(slug: str) -> Path:
             ),
         )
     return DOCS_DIR / f"{slug}.md"
+
+
+def validate_skill(domain: str) -> Path:
+    if not CATEGORY_RE.fullmatch(domain):
+        raise HTTPException(status_code=400, detail="invalid skill domain")
+    if domain in RESERVED_SKILLS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "'%s' is a reserved name -- it collides with GET /skills/%s "
+                "and would be unreadable after creation; choose a different "
+                "skill domain" % (domain, domain)
+            ),
+        )
+    return SKILLS_DIR / f"{domain}.md"
 
 
 # --------------------------------------------------------------------------
@@ -895,6 +978,234 @@ def section_delete_text(path, name: str, empty_detail: str) -> str:
     return new_text
 
 
+def validate_skill_headings(data: bytes) -> None:
+    """Every real '## ' heading must be a skill heading, or 422 naming the
+    first line that is not. Fenced headings are left alone, like every other
+    section scanner here. Duplicate ids are refused too: every lookup below
+    stops at the first heading for an id, so a second one would be shadowed
+    but still written."""
+    lines = data.decode("utf-8").splitlines()
+    seen = {}
+    for i, name in section_headers(lines):
+        if not SKILL_HEADING_RE.match(lines[i]):
+            raise HTTPException(
+                status_code=422,
+                detail="line %d is not a valid skill heading: %r (expected "
+                       "'## msk-<12 hex> <title>', title 1-80 characters)"
+                       % (i + 1, lines[i]),
+            )
+        sid = SKILL_ID_RE.match("## " + name).group(1)
+        if sid in seen:
+            raise HTTPException(
+                status_code=422,
+                detail="duplicate skill id %s: lines %d and %d"
+                       % (sid, seen[sid], i + 1),
+            )
+        seen[sid] = i + 1
+
+
+def skill_find_bounds(lines: list, ref: str):
+    """(start, end, name) of the skill section whose heading STARTS with the
+    id `ref`, or None. Same trailing-blank trimming as find_section_bounds, so
+    GET/PUT/DELETE agree on where the section ends. The title may change
+    without breaking a write addressed by id."""
+    headers = section_headers(lines)
+    for pos, (i, hname) in enumerate(headers):
+        if not hname.startswith(ref):
+            continue
+        end = headers[pos + 1][0] if pos + 1 < len(headers) else len(lines)
+        trimmed_end = end
+        while trimmed_end > i + 1 and lines[trimmed_end - 1].strip() == "":
+            trimmed_end -= 1
+        return i, trimmed_end, hname
+    return None
+
+
+def skill_section_response(body: str, ref: str, headers: dict) -> PlainTextResponse:
+    lines = body.splitlines()
+    bounds = skill_find_bounds(lines, ref)
+    if bounds is None:
+        available = [n for _i, n in section_headers(lines)]
+        raise HTTPException(
+            status_code=404,
+            detail="skill section '%s' not found; available sections: %s"
+                   % (ref, ", ".join(available)),
+        )
+    start, end, name = bounds
+    out_headers = dict(headers)
+    out_headers["X-Memory-Section"] = section_header_value(name)
+    return PlainTextResponse("\n".join(lines[start:end]), headers=out_headers)
+
+
+def skill_section_put_text(path, ref: str, raw_body: bytes):
+    """New whole-file text for a skill section upsert, plus the id written.
+
+    Unlike /memory and /docs this is always an upsert: a skills file is a set
+    of independent id-addressed records, so 'append if absent, replace if
+    present' is the only useful meaning of a section PUT. An absent domain is
+    created from the validated block alone (the publisher sends
+    'If-None-Match: *' for one that does not exist yet).
+    """
+    raw_body = normalise_body(raw_body)
+    validate_skill_headings(raw_body)
+    if not SKILL_REF_RE.fullmatch(ref):
+        raise HTTPException(
+            status_code=422,
+            detail="section must be a skill id 'msk-<12 hex>', got %r" % ref,
+        )
+    block_lines = raw_body.decode("utf-8").splitlines()
+    headings = section_headers(block_lines)
+    if len(headings) != 1 or headings[0][0] != 0:
+        # Splicing a block with a second heading would inject another skill
+        # into the file, and one that does not start with a heading is not a
+        # section at all.
+        raise HTTPException(
+            status_code=422,
+            detail="a section body must be exactly one skill section: one "
+                   "'## msk-<12 hex> <title>' heading on its first line",
+        )
+    first = block_lines[0] if block_lines else ""
+    m = SKILL_ID_RE.match(first)
+    if not m:
+        raise HTTPException(
+            status_code=422,
+            detail="section body's first line is not a valid skill heading: %r" % first,
+        )
+    if m.group(1) != ref:
+        raise HTTPException(
+            status_code=422,
+            detail="heading id %s does not match the addressed id %s"
+                   % (m.group(1), ref),
+        )
+    if not path.exists():
+        new_lines = block_lines
+    else:
+        text = path.read_text(encoding="utf-8")
+        lines = text.splitlines()
+        bounds = skill_find_bounds(lines, ref)
+        if bounds is None:
+            new_lines = lines + ([""] if lines and lines[-1] != "" else []) + block_lines
+        else:
+            start, end, _name = bounds
+            new_lines = lines[:start] + block_lines + lines[end:]
+    new_text = "\n".join(new_lines)
+    if not new_text.endswith("\n"):
+        new_text += "\n"
+    return new_text, m.group(1)
+
+
+def skill_section_delete_text(path, ref: str, empty_detail: str) -> str:
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    bounds = skill_find_bounds(lines, ref)
+    if bounds is None:
+        available = [n for _i, n in section_headers(lines)]
+        raise HTTPException(
+            status_code=404,
+            detail="skill section '%s' not found; available sections: %s"
+                   % (ref, ", ".join(available)),
+        )
+    start, end, _name = bounds
+    head, tail = lines[:start], lines[end:]
+    if head and tail and head[-1] == "" and tail[0] == "":
+        tail = tail[1:]
+    new_text = "\n".join(head + tail)
+    if new_text.strip():
+        if not new_text.endswith("\n"):
+            new_text += "\n"
+    elif new_text:
+        new_text = ""
+    if not new_text.strip():
+        raise HTTPException(status_code=400, detail=empty_detail)
+    return new_text
+
+
+def skill_meta_of(lines: list, start: int, end: int) -> dict:
+    """key=value pairs from the `<!-- skill: ... -->` comment, {} if absent.
+    A malformed pair is simply not a pair; every consumer defaults to None."""
+    for line in lines[start + 1 : end]:
+        m = SKILL_META_RE.search(line)
+        if not m:
+            continue
+        meta = {}
+        for part in m.group(1).split():
+            if "=" in part:
+                key, value = part.split("=", 1)
+                meta[key] = value
+        return meta
+    return {}
+
+
+def skill_refs_of(lines: list, start: int, end: int) -> list:
+    """Raw reference targets from the `refs:` line, e.g. 'ai-tooling-agents',
+    'ai-tooling-config § Hooks', 'project:global'. Brackets are stripped; the
+    inner text is returned exactly as written so a caller can match on it."""
+    for line in lines[start + 1 : end]:
+        stripped = line.strip()
+        if not stripped.startswith("refs:"):
+            continue
+        out = []
+        for part in stripped[5:].split("·"):
+            target = part.strip()
+            if target.startswith("[[") and target.endswith("]]"):
+                target = target[2:-2].strip()
+            if target and target not in out:
+                out.append(target)
+        return out
+    return []
+
+
+def skill_section_record(domain: str, lines: list, start: int, end: int, name: str) -> dict:
+    m = SKILL_ID_RE.match("## " + name)
+    sid = m.group(1) if m else None
+    title = m.group(2) if m else name
+    meta = skill_meta_of(lines, start, end)
+    status = meta.get("status")
+    if status not in SKILL_STATUSES:
+        status = None
+    uses = None
+    if meta.get("uses", "").isdigit():
+        uses = int(meta["uses"])
+    last_used = meta.get("last_used")
+    if last_used in (None, "-", ""):
+        last_used = None
+    return {
+        "domain": domain,
+        "id": sid,
+        "title": title,
+        "status": status,
+        "uses": uses,
+        "last_used": last_used,
+        "refs": skill_refs_of(lines, start, end),
+    }
+
+
+def skill_sections_of(text: str, domain: str = "") -> list:
+    lines = text.splitlines()
+    return [
+        skill_section_record(domain, lines, start, end, name)
+        for start, end, name in section_spans(lines)
+        if name
+    ]
+
+
+def skill_records() -> list:
+    """Every skill section in every domain file, parsed for backlinks/index.
+    Computed per request: no extra index file to fall out of step."""
+    out = []
+    for path in sorted(SKILLS_DIR.glob("*.md")):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        lines = text.splitlines()
+        for start, end, name in section_spans(lines):
+            if not name:
+                continue
+            out.append(skill_section_record(path.stem, lines, start, end, name))
+    return out
+
+
 def scan_pins() -> list:
     """Every retraction/decision marker across /memory: explicit
     '<!-- pin: kind -->' comments, plus the legacy prose forms that predate
@@ -1212,18 +1523,31 @@ async def create_key(request: Request):
     require_browser(request)
     require_recent_auth(request)
     try:
-        name = str((await request.json()).get("name") or "")
+        data = await request.json()
     except Exception:
-        name = ""
+        data = {}
+    name = str((data or {}).get("name") or "")
+    # Absent or "all" is today's key; anything else must be a scope we know,
+    # because an unrecognised one would fall through key_scope_allows to the
+    # deny-everything tail rather than granting what the caller asked for.
+    scope = str((data or {}).get("scope") or "all")
+    if scope not in apikeys.SCOPES:
+        raise HTTPException(
+            status_code=422,
+            detail="unknown scope %r; choose one of: %s"
+                   % (scope, ", ".join(apikeys.SCOPES)),
+        )
     try:
-        rec, secret = keystore.create(name, creds.keyver)
+        rec, secret = keystore.create(name, creds.keyver, scope)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    sys.stderr.write("memory: minted api key %s (%s)\n" % (rec["id"], rec["name"]))
+    sys.stderr.write("memory: minted api key %s (%s, scope %s)\n"
+                     % (rec["id"], rec["name"], rec.get("scope") or "all"))
     # The secret appears in this one response and is never recoverable: only its
     # SHA-256 is stored.
     return JSONResponse({"id": rec["id"], "name": rec["name"],
-                         "created": rec["created"], "value": secret})
+                         "created": rec["created"], "scope": rec.get("scope") or "all",
+                         "value": secret})
 
 
 @app.delete("/auth/keys/{key_id}")
@@ -1679,6 +2003,8 @@ def rank_index(scope: str) -> searchrank.Index:
         globbed += [("memory", p) for p in sorted(DATA_DIR.glob("*.md"))]
     if scope in ("docs", "all"):
         globbed += [("doc", p) for p in sorted(DOCS_DIR.glob("*.md"))]
+    if scope in ("skills", "all"):
+        globbed += [("skill", p) for p in sorted(SKILLS_DIR.glob("*.md"))]
     with _rank_lock:
         paths, sig = [], []
         for kind, p in globbed:
@@ -1717,7 +2043,8 @@ def search(
 
     scope=memory (default) searches only /memory, byte-identical to the
     response shape from before docs existed -- no 'kind' key, no doc hits.
-    scope=docs searches only /docs; scope=all searches both, memory first.
+    scope=docs searches only /docs; scope=skills searches only /skills;
+    scope=all searches all three, memory first, then docs, then skills.
 
     mode=rank instead ranks whole sections by BM25 with OR semantics (see
     searchrank.py): one hit per section, best first, each carrying 'score'
@@ -1756,7 +2083,7 @@ def do_search(q: str, limit: int, full: int, scope: str, mode: str, keep=None) -
             if keep is not None and not keep(u.name):
                 continue
             hit = {
-                "category" if u.kind == "memory" else "doc": u.name,
+                {"memory": "category", "doc": "doc", "skill": "skill"}[u.kind]: u.name,
                 "section": u.section,
                 "line": h.line + 1,
                 "score": round(h.score, 3),
@@ -1784,8 +2111,10 @@ def do_search(q: str, limit: int, full: int, scope: str, mode: str, keep=None) -
                     continue
                 if kind == "memory":
                     hit = {"category": path.stem, "section": section_at(lines, i), "line": i + 1}
-                else:
+                elif kind == "doc":
                     hit = {"doc": path.stem, "section": section_at(lines, i), "line": i + 1}
+                else:
+                    hit = {"skill": path.stem, "section": section_at(lines, i), "line": i + 1}
                 if scope != "memory":
                     hit["kind"] = kind
                 if full:
@@ -1802,6 +2131,9 @@ def do_search(q: str, limit: int, full: int, scope: str, mode: str, keep=None) -
             return hits
     if scope in ("docs", "all"):
         if scan(sorted(DOCS_DIR.glob("*.md")), "doc"):
+            return hits
+    if scope in ("skills", "all"):
+        if scan(sorted(SKILLS_DIR.glob("*.md")), "skill"):
             return hits
     return hits
 
@@ -2121,6 +2453,205 @@ async def delete_doc(slug: str, request: Request, section: str = ""):
 
 
 # --------------------------------------------------------------------------
+# /skills — reusable procedures, one file per domain, one '## ' section per
+# skill. Same primitives as /memory and /docs (blob_sha, require_precondition,
+# git_commit), a separate directory so every /memory glob stays blind to it.
+# /skills/index and /skills/backlinks MUST precede /skills/{domain}, or the
+# word is parsed as a domain.
+# --------------------------------------------------------------------------
+
+
+@app.get("/skills")
+def list_skills(request: Request):
+    check_auth(request)
+    return JSONResponse(sorted(p.stem for p in SKILLS_DIR.glob("*.md")))
+
+
+@app.get("/skills/index")
+def skills_index(request: Request):
+    check_auth(request)
+    out = []
+    for path in sorted(SKILLS_DIR.glob("*.md")):
+        raw = path.read_bytes()   # blob sha of disk bytes, same as GET and the write guard
+        text = raw.decode("utf-8")
+        stat = path.stat()
+        out.append(
+            {
+                "domain": path.stem,
+                "bytes": stat.st_size,
+                "mtime": datetime.fromtimestamp(stat.st_mtime, timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "etag": blob_sha(raw),
+                "sections": [
+                    {
+                        "id": rec["id"],
+                        "title": rec["title"],
+                        "status": rec["status"],
+                        "refs": rec["refs"],
+                        "uses": rec["uses"],
+                        "last_used": rec["last_used"],
+                    }
+                    for rec in skill_sections_of(text)
+                ],
+            }
+        )
+    return JSONResponse(out)
+
+
+@app.get("/skills/backlinks")
+def skills_backlinks(request: Request, ref: str = "", section: str = "", all: int = 0):
+    """Skills whose refs name `ref` (the category, or one section of it),
+    plus how many skills reference a `ref-*` child by name. Computed from the
+    files on every call -- there is no second index to drift."""
+    check_auth(request)
+    ref = (ref or "").strip()
+    if not ref:
+        raise HTTPException(status_code=400, detail="ref is required")
+    section = (section or "").strip()
+    matched, children = [], 0
+    for rec in skill_records():
+        if rec["status"] == "dormant" and not all:
+            continue
+        hit, child = False, False
+        for target in rec["refs"]:
+            if target.startswith(ref + "-"):
+                child = True
+            if section:
+                category, _sep, sec = target.partition("§")
+                if category.strip() == ref and sec.strip() == section:
+                    hit = True
+            elif target == ref or target.startswith(ref + " §"):
+                hit = True
+        if child:
+            children += 1
+        if hit:
+            matched.append(rec)
+    matched.sort(key=lambda r: -(r["uses"] or 0))
+    return JSONResponse(
+        {
+            "ref": ref,
+            "skills": [
+                {
+                    "domain": r["domain"],
+                    "id": r["id"],
+                    "title": r["title"],
+                    "status": r["status"],
+                    "uses": r["uses"],
+                }
+                for r in matched[:20]
+            ],
+            "children": children,
+        }
+    )
+
+
+@app.get("/skills/{domain}/history")
+def skill_history(domain: str, request: Request, limit: int = 50):
+    check_auth(request)
+    path = validate_skill(domain)
+    return JSONResponse(history_of("skills/%s.md" % domain, path, limit))
+
+
+@app.get("/skills/{domain}")
+def get_skill(domain: str, request: Request, rev: str = "", section: str = ""):
+    check_auth(request)
+    path = validate_skill(domain)
+
+    if rev:
+        if not REV_RE.fullmatch(rev):
+            raise HTTPException(status_code=400, detail="invalid rev")
+        show = git("show", "%s:skills/%s.md" % (rev, domain), check=False)
+        if show.returncode != 0:
+            raise HTTPException(status_code=404, detail="rev or path not found")
+        headers = {"ETag": '"%s"' % blob_sha(show.stdout.encode("utf-8")),
+                   "X-Memory-Rev": rev}
+        if section:
+            return skill_section_response(show.stdout, section, headers)
+        return PlainTextResponse(show.stdout, headers=headers)
+
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="not found")
+    raw = path.read_bytes()   # see get_category: hash disk bytes, not decoded text
+    body = raw.decode("utf-8")
+    headers = {"ETag": '"%s"' % blob_sha(raw)}
+    if section:
+        return skill_section_response(body, section, headers)
+    return PlainTextResponse(body, headers=headers)
+
+
+@app.put("/skills/{domain}")
+async def put_skill(domain: str, request: Request, section: str = ""):
+    check_write_auth(request)
+    path = validate_skill(domain)
+    raw_body = await request.body()   # see put_category: body before precondition
+
+    def write():
+        require_precondition(path, request)
+
+        if section:
+            existed = path.exists()
+            new_text, sid = skill_section_put_text(path, section, raw_body)
+            path.write_bytes(new_text.encode("utf-8"))   # not write_text: os.linesep would reintroduce CRLF
+            out_body = new_text.encode("utf-8")
+            committed = git_commit(
+                commit_subject("PUT" if existed else "CREATE",
+                               "skill %s#%s" % (domain, sid), request)
+            )
+            return PlainTextResponse(
+                "OK", headers=commit_headers({"ETag": '"%s"' % blob_sha(out_body)}, committed)
+            )
+
+        existed = path.exists()
+        stored = normalise_body(raw_body)
+        validate_skill_headings(stored)
+        path.write_bytes(stored)
+        committed = git_commit(
+            commit_subject("PUT" if existed else "CREATE", "skill %s" % domain, request)
+        )
+        return PlainTextResponse(
+            "OK", headers=commit_headers({"ETag": '"%s"' % blob_sha(stored)}, committed)
+        )
+
+    return await locked_write(write)
+
+
+@app.delete("/skills/{domain}")
+async def delete_skill(domain: str, request: Request, section: str = ""):
+    check_write_auth(request)
+    path = validate_skill(domain)
+
+    def write():
+        if not path.exists():
+            raise HTTPException(status_code=404, detail="not found")
+        require_precondition(path, request)
+
+        if section:
+            new_text = skill_section_delete_text(
+                path, section,
+                "deleting skill section '%s' would leave domain '%s' empty; "
+                "delete the whole domain instead (DELETE /skills/%s with no "
+                "?section)" % (section, domain, domain),
+            )
+            path.write_bytes(new_text.encode("utf-8"))   # not write_text: os.linesep would reintroduce CRLF
+            committed = git_commit(
+                commit_subject("DELETE", "skill %s#%s" % (domain, section), request)
+            )
+            return PlainTextResponse(
+                "OK",
+                headers=commit_headers(
+                    {"ETag": '"%s"' % blob_sha(new_text.encode("utf-8"))}, committed
+                ),
+            )
+
+        path.unlink()
+        committed = git_commit(commit_subject("DELETE", "skill %s" % domain, request))
+        return PlainTextResponse("OK", headers=commit_headers({}, committed))
+
+    return await locked_write(write)
+
+
+# --------------------------------------------------------------------------
 # MCP: /mcp for claude.ai connectors and Claude Code, plus the OAuth 2.1
 # authorization server claude.ai needs to reach it. See mcpserver.py and
 # mcpoauth.py for the why; the routes only translate HTTP.
@@ -2197,6 +2728,13 @@ def mcp_actor(request: Request):
     rec = keystore.verify(presented, creds.keyver)
     if rec:
         keystore.touch(rec)
+        # /mcp is not on any scoped key's list (key_scope_allows has no such
+        # rule); this path does not call check_auth, so refuse here too.
+        if (rec.get("scope") or "all") != "all":
+            raise HTTPException(
+                status_code=403,
+                detail="this key's scope does not allow POST /mcp",
+            )
         return actor_suffix(rec.get("name"))
     grant = oauth.verify_access(presented, creds.keyver)
     if grant and grant.get("resource") == mcp_resource(request):

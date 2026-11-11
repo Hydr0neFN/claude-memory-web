@@ -92,11 +92,11 @@ a { color: var(--accent-ink); }
 .btn.icon { padding: 6px 10px; display: none; }
 .btn.small { padding: 3px 9px; font-size: 13px; }
 
-input, textarea {
+input, textarea, select {
   font: inherit; color: var(--ink); background: var(--card);
   border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px;
 }
-input:focus, textarea:focus { outline: 2px solid var(--accent-line); outline-offset: -1px; }
+input:focus, textarea:focus, select:focus { outline: 2px solid var(--accent-line); outline-offset: -1px; }
 
 /* login ------------------------------------------------------------------ */
 .login { min-height: 100dvh; display: grid; place-items: center; padding: 20px; }
