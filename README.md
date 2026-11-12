@@ -371,6 +371,29 @@ A templated unit (`claude-memory@.service`) must name every per-instance file,
 directory reads the owner's `passkeys.json` next to the code, and a standby
 whose state directory is elsewhere never sees the passkeys replicated to it.
 
+## Forwarding /mcp to another MCP server
+
+`MEMORY_MCP_UPSTREAM` turns this instance into an authenticating proxy: it
+checks `POST /mcp` with the usual token / `mem_` key / OAuth grant, then
+forwards the JSON-RPC body unchanged to a stateless Streamable HTTP MCP server
+and returns that reply unchanged. Unset (the default) leaves `/mcp` local. The
+caller's credentials never leave this instance: the upstream sees only the key
+from `MEMORY_MCP_UPSTREAM_KEY_FILE` (re-read on every call), a fixed
+`User-Agent`, and the actor in `X-Forwarded-Actor`.
+
+| Variable | Default | What |
+|---|---|---|
+| `MEMORY_MCP_UPSTREAM` | unset | upstream `POST` URL; `http://` or `https://`, any other scheme logs one line and means off |
+| `MEMORY_MCP_UPSTREAM_KEY_FILE` | unset | file holding the upstream bearer; read per request, whitespace stripped |
+| `MEMORY_MCP_UPSTREAM_TIMEOUT` | `140` | upstream timeout in seconds, clamped to 1..600 |
+| `MEMORY_CONSENT_LABEL` | the vault name | text the two consent pages print in place of the vault name |
+
+An upstream failure becomes a JSON-RPC error (`-32000`) with 502 (504 on
+timeout, 503 when the key is missing). An upstream 401/403 is never returned
+to the caller as 401, so a connector does not restart the OAuth sign-in; a 3xx
+is not followed. Scoped `dst_` tokens are refused (403) and nothing is
+forwarded for an unauthenticated call. `GET`/`DELETE /mcp` stay 405.
+
 ## Notes
 
 - The static mount must stay the **last** statement in `main.py`. Starlette

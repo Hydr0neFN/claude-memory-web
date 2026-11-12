@@ -16,12 +16,15 @@ import json
 import os
 import re
 import secrets
+import socket
 import subprocess
 import sys
 import asyncio
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -2760,6 +2763,26 @@ async def delete_skill(domain: str, request: Request, section: str = ""):
 # instructions, the list/index tool output and the consent page, so a model
 # or a person can always tell which vault a connector points at.
 VAULT = os.environ.get("MEMORY_INSTANCE_NAME") or "owner"
+
+# Optional /mcp forwarding (README "Forwarding /mcp to another MCP server").
+# Empty or unset MEMORY_MCP_UPSTREAM leaves this instance behaving exactly as
+# it did before; any other scheme is a configuration mistake, not an upstream.
+MCP_UPSTREAM = os.environ.get("MEMORY_MCP_UPSTREAM", "").strip()
+if MCP_UPSTREAM and urllib.parse.urlsplit(MCP_UPSTREAM).scheme not in ("http", "https"):
+    sys.stderr.write("memory: MEMORY_MCP_UPSTREAM is not an http(s) URL; forwarding off\n")
+    MCP_UPSTREAM = ""
+MCP_UPSTREAM_KEY_FILE = os.environ.get("MEMORY_MCP_UPSTREAM_KEY_FILE", "")
+try:
+    MCP_UPSTREAM_TIMEOUT = float(os.environ.get("MEMORY_MCP_UPSTREAM_TIMEOUT") or 140)
+except ValueError:
+    MCP_UPSTREAM_TIMEOUT = 140.0
+MCP_UPSTREAM_TIMEOUT = min(600.0, max(1.0, MCP_UPSTREAM_TIMEOUT))
+# A forwarded body is one JSON-RPC call, not an upload.
+MCP_UPSTREAM_MAX_BODY = 1024 * 1024
+# Replaces the vault name on the two consent pages when this instance fronts
+# someone else's vault; empty means today's text.
+CONSENT_LABEL = os.environ.get("MEMORY_CONSENT_LABEL", "")
+
 mcp = mcpserver.Server(app, TOKEN, sections_of, VAULT,
                        os.environ.get("MEMORY_PUBLIC_URL", "").rstrip("/"),
                        sorted(READONLY_CATEGORIES),
@@ -2844,6 +2867,111 @@ def mcp_actor(request: Request):
     return None
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def mcp_forward_upstream(url: str, key_file: str, actor: str, body: bytes,
+                         timeout: float):
+    """POST `body` upstream; returns (outcome, status, payload).
+
+    Runs in a worker thread. Only our own fixed headers go out: the caller's
+    Authorization, cookies and everything else stop here. No redirects are
+    followed, so a 3xx is just an HTTPError with that status.
+    """
+    try:
+        key = Path(key_file).read_text(encoding="utf-8").strip() if key_file else ""
+    except (OSError, UnicodeError):
+        key = ""
+    if not key:
+        return "nokey", None, b""
+    actor = "".join(c for c in str(actor) if " " <= c <= "~")[:80]
+    request = urllib.request.Request(url, data=body, method="POST", headers={
+        "Authorization": "Bearer " + key,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "claude-memory-mcp-forward/1",
+        "X-Forwarded-Actor": actor,
+    })
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(request, timeout=timeout) as resp:
+            return "status", resp.status, resp.read()
+    except urllib.error.HTTPError as exc:
+        try:
+            exc.close()
+        except Exception:
+            pass
+        return "status", exc.code, b""
+    except urllib.error.URLError as exc:
+        if isinstance(getattr(exc, "reason", None), (socket.timeout, TimeoutError)):
+            return "timeout", None, b""
+        return "error", None, b""
+    except (socket.timeout, TimeoutError):
+        return "timeout", None, b""
+    except Exception:
+        return "error", None, b""
+
+
+async def mcp_forward_post(request: Request):
+    presented = request.headers.get("authorization", "")[7:].strip()
+    if presented.startswith(dstokens.PREFIX):
+        # This instance forwards; scoped tokens are a different server's job.
+        return JSONResponse({"error": "scoped tokens are not accepted on this instance"},
+                            status_code=403)
+    actor = mcp_actor(request)
+    if actor is None:
+        auth = request.headers.get("authorization", "")
+        return mcp_unauthorized(request, "invalid_token" if auth else "")
+    body = await read_capped_body(request, MCP_UPSTREAM_MAX_BODY)
+
+    mid, method = None, "-"
+    try:
+        msg = json.loads(body)
+    except Exception:
+        msg = None
+    if isinstance(msg, dict):
+        if "id" in msg:
+            mid = msg.get("id")
+        if isinstance(msg.get("method"), str):
+            method = "".join(c for c in msg["method"] if " " <= c <= "~")[:120] or "-"
+
+    started = time.monotonic()
+    outcome, status, payload = await run_in_threadpool(
+        mcp_forward_upstream, MCP_UPSTREAM, MCP_UPSTREAM_KEY_FILE, actor,
+        body, MCP_UPSTREAM_TIMEOUT)
+    elapsed = int((time.monotonic() - started) * 1000)
+
+    if outcome == "status" and status == 200:
+        reply = Response(content=payload, status_code=200,
+                         media_type="application/json")
+        word = status
+    elif outcome == "status" and status in (202, 204):
+        reply = Response(status_code=status)
+        word = status
+    else:
+        if outcome == "nokey":
+            code, message, word = 503, "upstream key is not configured", "no-key"
+        elif outcome == "timeout":
+            code, message, word = 504, "upstream timed out", "timeout"
+        elif outcome == "error":
+            code, message, word = 502, "upstream unavailable", "error"
+        elif status in (401, 403):
+            # Never 401: the client would start a fresh OAuth sign-in.
+            code, message, word = 502, "upstream refused the proxy key", status
+        else:
+            code, message, word = 502, "upstream answered HTTP %d" % status, status
+        reply = JSONResponse({"jsonrpc": "2.0", "id": mid,
+                              "error": {"code": -32000, "message": message}},
+                             status_code=code)
+
+    safe_actor = "".join(c for c in str(actor) if " " <= c <= "~")[:80]
+    sys.stderr.write("memory: mcp forward actor=%s method=%s status=%s ms=%d\n"
+                     % (safe_actor, method, word, elapsed))
+    return reply
+
+
 @app.post("/mcp")
 async def mcp_post(request: Request):
     # DNS-rebinding guard from the transport spec: a browser page on another
@@ -2852,6 +2980,8 @@ async def mcp_post(request: Request):
     origin = request.headers.get("origin")
     if origin and origin.rstrip("/") != public_base(request):
         return JSONResponse({"error": "origin not allowed"}, status_code=403)
+    if MCP_UPSTREAM:
+        return await mcp_forward_post(request)
     presented = request.headers.get("authorization", "")[7:].strip()
     scoped = None
     if presented.startswith(dstokens.PREFIX):
@@ -3047,7 +3177,8 @@ def oauth_authorize(request: Request):
             "<b>%s</b> vault</h1>%s"
             "<p style='color:#666'>Or sign in on the <a href='/' target=_blank>main "
             "page</a> with the token, then reload this tab.</p>")
-            % (name, esc(VAULT), buttons or "<p>No sign-in provider is configured.</p>"))
+            % (name, esc(CONSENT_LABEL or VAULT),
+               buttons or "<p>No sign-in provider is configured.</p>"))
 
     hidden = "".join("<input type=hidden name='%s' value='%s'>" % (k, esc(v))
                      for k, v in p.items())
@@ -3060,7 +3191,8 @@ def oauth_authorize(request: Request):
         "<form method=post action='/oauth/authorize'>%s"
         "<button name=decision value=allow style='font-size:1rem;padding:.5rem 1.2rem'>"
         "Allow</button> <button name=decision value=deny style='font-size:1rem;"
-        "padding:.5rem 1.2rem'>Deny</button></form>") % (name, esc(VAULT), dest, who, hidden))
+        "padding:.5rem 1.2rem'>Deny</button></form>")
+        % (name, esc(CONSENT_LABEL or VAULT), dest, who, hidden))
 
 
 @app.post("/oauth/authorize")
