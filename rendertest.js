@@ -395,6 +395,48 @@ check('search: result count is capped',
   Nav.search(Nav.buildItems(Array.from({ length: 100 }, (_, i) => cat('cat-' + i)), [], MD.slug), 'cat', 30).length === 30);
 check('search: nothing matches -> empty', top('qqqzzz').length === 0);
 
+/* --- skills namespace -------------------------------------------------- */
+const SKILLS = [
+  { doc: 'deploy-checklist', title: 'Deploy checklist',
+    sections: [{ id: 'msk-0123456789ab', title: 'Deploy to example.com', status: 'active', uses: 4 }] },
+  { doc: 'mail-triage', title: 'Mail triage', sections: [] }
+];
+const skillItems = Nav.buildItems([], [], MD.slug, SKILLS);
+const srows = Nav.skillRows(SKILLS, {});
+check('skills: the sidebar group lists every domain file',
+  srows.length === 2 && srows[0].href === '#/s/deploy-checklist' && srows[0].label === 'Deploy checklist',
+  JSON.stringify(srows));
+check('skills: the group filters by name or title and marks the active row',
+  Nav.skillRows(SKILLS, { filter: 'triage' }).map(r => r.slug).join() === 'mail-triage' &&
+  Nav.skillRows(SKILLS, { filter: 'deploy' })[0].active === false &&
+  Nav.skillRows(SKILLS, { active: 'deploy-checklist' })[0].active === true);
+
+const sr = Nav.itemRoute('s', ['s', 'deploy-checklist']);
+check('skills: #/s/<domain> opens the same read view as #/d/<slug>',
+  sr.kind === 's' && sr.name === 'deploy-checklist' && sr.view === 'read' &&
+  Nav.itemRoute('d', ['d', 'tourplan-handoff']).view === 'read');
+check('skills: edit, history, rev and heading routes resolve like docs',
+  Nav.itemRoute('s', ['s', 'deploy-checklist', 'edit']).view === 'edit' &&
+  Nav.itemRoute('s', ['s', 'deploy-checklist', 'history']).view === 'history' &&
+  Nav.itemRoute('s', ['s', 'deploy-checklist', 'rev', 'abc123']).rev === 'abc123' &&
+  Nav.itemRoute('s', ['s', 'deploy-checklist', 'h', 'msk-0123456789ab']).heading === 'msk-0123456789ab');
+check('skills: quick jump finds a skill file and its sections',
+  Nav.search(skillItems, 'deploy')[0].href === '#/s/deploy-checklist' &&
+  Nav.search(skillItems, 'example.com')[0].href ===
+    '#/s/deploy-checklist/h/' + encodeURIComponent(MD.slug('Deploy to example.com')));
+
+/* --- key scopes -------------------------------------------------------- */
+check('keys: the mint form offers all (default) and skills-writer',
+  (function () {
+    const h = Nav.keyScopeSelectHTML('key-scope');
+    return /<select id="key-scope"/.test(h) && /value="all" selected/.test(h) &&
+      /value="skills-writer"/.test(h) && !/value="skills-writer" selected/.test(h);
+  })(), Nav.keyScopeSelectHTML('key-scope'));
+check('keys: scope is omitted for all and sent for skills-writer',
+  JSON.stringify(Nav.keyBody('laptop', 'all')) === '{"name":"laptop"}' &&
+  JSON.stringify(Nav.keyBody('bot', 'skills-writer')) === '{"name":"bot","scope":"skills-writer"}' &&
+  JSON.stringify(Nav.keyBody('bot', '')) === '{"name":"bot"}');
+
 /* --- passkey client ---------------------------------------------------- */
 check('b64url: no padding, url-safe alphabet', (function () {
   const raw = new Uint8Array([0xfb, 0xff, 0xfe, 0x00, 0x01]);

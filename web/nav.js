@@ -162,8 +162,9 @@ window.Nav = (function () {
 
   // Everything the quick-jump palette can land on. slugFn turns a section name
   // into the heading id render() gives it (MD.slug), so that this file does not
-  // need to know about the markdown renderer.
-  function buildItems(index, docs, slugFn) {
+  // need to know about the markdown renderer. Skills are a flat namespace that
+  // routes exactly like docs, with 's' in place of 'd'.
+  function buildItems(index, docs, slugFn, skills) {
     var items = [];
     var enc = encodeURIComponent;
     index.forEach(function (c) {
@@ -185,7 +186,70 @@ window.Nav = (function () {
                     href: '#/d/' + enc(d.doc) + '/h/' + enc(slugFn(s.name)), bias: -6 });
       });
     });
+    (skills || []).forEach(function (k) {
+      var title = k.title || k.doc;
+      items.push({ kind: 's', id: 's:' + k.doc, label: title, sub: title !== k.doc ? k.doc : '',
+                   alt: k.doc, href: '#/s/' + enc(k.doc), bias: -3 });
+      (k.sections || []).forEach(function (s) {
+        var nm = s.title || s.name || s.id;
+        items.push({ kind: 's', id: 's:' + k.doc + '#' + nm, label: nm, sub: k.doc,
+                    alt: k.doc + ' ' + nm,
+                    href: '#/s/' + enc(k.doc) + '/h/' + enc(slugFn(nm)), bias: -6 });
+      });
+    });
     return items;
+  }
+
+  /* ---------------------------------------------------------- item routes */
+
+  // '#/d/<name>[/edit|/history|/rev/<sha>|/l/<line>|/h/<id>]' and the skills
+  // twin '#/s/<name>...' describe the same views, so both are parsed here and
+  // app.js only maps the view name onto the function. `parts` is the hash
+  // split on '/' with the empty leading segment dropped.
+  function itemRoute(kind, parts) {
+    var name = decodeURIComponent(parts[1] || '');
+    var sub = parts[2] || '';
+    if (sub === 'edit') return { kind: kind, name: name, view: 'edit' };
+    if (sub === 'history') return { kind: kind, name: name, view: 'history' };
+    if (sub === 'rev' && parts[3]) return { kind: kind, name: name, view: 'rev', rev: parts[3] };
+    if (sub === 'l' && parts[3]) return { kind: kind, name: name, view: 'read', line: parseInt(parts[3], 10) };
+    if (sub === 'h' && parts[3]) {
+      return { kind: kind, name: name, view: 'read', heading: decodeURIComponent(parts[3]) };
+    }
+    return { kind: kind, name: name, view: 'read' };
+  }
+
+  // The rows of the sidebar's Skills group. Skills have no tree: names are flat
+  // (^[a-z0-9-]+$), so a row is just the file and its title.
+  function skillRows(skills, o) {
+    o = o || {};
+    var filter = (o.filter || '').toLowerCase();
+    return (skills || []).filter(function (k) {
+      return !filter || k.doc.indexOf(filter) >= 0 ||
+        String(k.title || '').toLowerCase().indexOf(filter) >= 0;
+    }).map(function (k) {
+      return { slug: k.doc, label: k.title || k.doc, href: '#/s/' + encodeURIComponent(k.doc),
+               active: o.active === k.doc };
+    });
+  }
+
+  /* ------------------------------------------------------------- api keys */
+
+  // 'all' is what a key could always do, so it stays the default and is the one
+  // scope the mint request leaves out -- an older server sees the same body.
+  var KEY_SCOPES = ['all', 'skills-writer'];
+
+  function keyScopeSelectHTML(id) {
+    return '<select id="' + id + '" class="keyscope" aria-label="Key scope">' +
+      KEY_SCOPES.map(function (s) {
+        return '<option value="' + s + '"' + (s === 'all' ? ' selected' : '') + '>' + s + '</option>';
+      }).join('') + '</select>';
+  }
+
+  function keyBody(name, scope) {
+    var body = { name: name };
+    if (scope && scope !== 'all') body.scope = scope;
+    return body;
   }
 
   // Best matches first; ties go to the shorter label, then alphabetical.
@@ -210,6 +274,8 @@ window.Nav = (function () {
   return {
     buildTree: buildTree, defaultOpen: defaultOpen, parseOverrides: parseOverrides,
     filterVisible: filterVisible, rows: rows, subtreeStats: subtreeStats,
-    fuzzy: fuzzy, buildItems: buildItems, search: search
+    fuzzy: fuzzy, buildItems: buildItems, search: search,
+    itemRoute: itemRoute, skillRows: skillRows,
+    KEY_SCOPES: KEY_SCOPES, keyScopeSelectHTML: keyScopeSelectHTML, keyBody: keyBody
   };
 })();

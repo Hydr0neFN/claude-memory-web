@@ -39,6 +39,7 @@ os.environ.update({
     "MEMORY_AUTH_FILE": str(TMP / "auth.json"),
     "MEMORY_KEYS_FILE": str(TMP / "apikeys.json"),
     "MEMORY_OAUTH_FILE": str(TMP / "mcpoauth.json"),
+    "MEMORY_MIN_CLIENT_FILE": str(TMP / "min-client"),
     "MEMORY_FLAG_DIR": str(TMP),
     "MEMORY_INSTANCE_NAME": "dad",
     "MEMORY_PUBLIC_URL": "https://dad.test",   # the OAuth grant's resource is bound to it
