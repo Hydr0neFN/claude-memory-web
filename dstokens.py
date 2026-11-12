@@ -312,6 +312,8 @@ class Scoped:
         props = t["inputSchema"].get("properties", {})
         props.pop("namespace", None)
         props.pop("scope", None)
+        props.pop("prefix", None)
+        props.pop("detail", None)
         if t["name"] == "memory_get":
             props.pop("rev", None)
         t["description"] = DESCRIPTIONS[t["name"]]
