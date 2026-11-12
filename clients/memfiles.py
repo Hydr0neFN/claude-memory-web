@@ -130,7 +130,7 @@ def _get(slug, section=None, rev=None):
     return body, h.get("etag", "")
 
 
-def _put(slug, body, etag, create, note, section=None, upsert=False):
+def _put(slug, body, etag, create, note, section=None, upsert=False, topic=None):
     _, _, vault = _config()
     if vault not in ("yu-i", "pass"):
         raise ToolError("refusing to write: configured vault is %r, not yu-i" % vault)
@@ -142,7 +142,9 @@ def _put(slug, body, etag, create, note, section=None, upsert=False):
     if note:
         # header values are latin-1; the server percent-decodes the note
         headers["X-Memory-Note"] = urllib.parse.quote(note[:60])
-    extra = ["mode=upsert"] if (section and upsert) else None
+    extra = ["mode=upsert"] if (section and upsert) else []
+    if topic:   # handoff docs: the server links the doc under this category
+        extra.append("topic=" + urllib.parse.quote(topic, safe=""))
     status, out, h = _call("PUT", _doc_path(slug, section, extra=extra), body, headers)
     if status == 409:
         raise ToolError("409 conflict: %s changed since etag %s was read (current: %s). "
@@ -323,7 +325,7 @@ def t_doc_put(a):
     elif b"\n## " not in b"\n" + raw:
         warn = " (warning: no '## ' heading, so the doc has no outline)"
     new = _put(a["slug"], raw, a.get("etag"), bool(a.get("create")), a.get("note"),
-               section, bool(a.get("upsert")))
+               section, bool(a.get("upsert")), a.get("topic"))
     return ("wrote docs/%s%s from %s: %d bytes, sha256 %s; new etag %s%s"
             % (a["slug"], "#" + section if section else "", a["file_path"], len(raw),
                _sha(raw), _unquote_etag(new), warn))
@@ -353,7 +355,8 @@ def t_doc_pack(a):
         parts.append(_pack_section(rel, raw))
         report.append("  %s  %d B  %s" % (rel, len(raw), _sha(raw)))
     body = "\n".join(parts).encode("utf-8")
-    new = _put(a["slug"], body, a.get("etag"), bool(a.get("create")), a.get("note"))
+    new = _put(a["slug"], body, a.get("etag"), bool(a.get("create")), a.get("note"),
+               topic=a.get("topic"))
     # read back and prove every file round-trips byte-exact
     back, _ = _get(a["slug"])
     secs, lines = _sections(back.decode("utf-8"))
@@ -408,6 +411,9 @@ _WRITE = {
                                   "outline=true, or a doc_get/doc_unpack result). Omit only with create."),
     "create": dict(_B, description="true = the doc must not exist yet (If-None-Match: *)."),
     "note": dict(_S, description="Short commit caption (<=60 chars)."),
+    "topic": dict(_S, description="Handoff docs only: category that owns the work; the server "
+                                  "links the doc under its '## Working documents'. Required "
+                                  "while no category links the doc."),
 }
 TOOLS = [
     ("doc_put", t_doc_put,
@@ -501,6 +507,7 @@ def cli(argv):
         g.add_argument("--etag", help="whole-file etag of the doc as last read")
         g.add_argument("--create", action="store_true", help="the doc must not exist yet")
         p.add_argument("--note", default="", help="commit caption, <=60 chars")
+        p.add_argument("--topic", help="handoff docs: category to link the doc under")
 
     p = sub.add_parser("get", help="save a doc (or --section / --rev) to a file")
     p.add_argument("slug"); p.add_argument("out_path")

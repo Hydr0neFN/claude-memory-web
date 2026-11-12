@@ -144,6 +144,13 @@ TOOLS = [
                 "upsert": {"type": "boolean", "default": False},
                 "rename_to": {"type": "string",
                               "description": "With section: rename that heading."},
+                "topic": {"type": "string",
+                          "description": "docs namespace, handoff doc only: the "
+                                         "category that owns the work. The server "
+                                         "links the doc under its '## Working "
+                                         "documents' section in the same write. "
+                                         "Required when the handoff doc is not "
+                                         "linked from any category yet."},
                 "note": NOTE_PROP,
             },
             "required": ["name", "content"],
@@ -432,7 +439,8 @@ class Server:
                 extra["x-memory-note"] = urllib.parse.quote(str(args["note"])[:60], safe=" ")
             query = {"section": args.get("section"),
                      "mode": "upsert" if args.get("upsert") else "",
-                     "rename_to": args.get("rename_to")}
+                     "rename_to": args.get("rename_to"),
+                     "topic": args.get("topic")}
             status, hdrs, _ = await self.rest("PUT", path, query, content.encode("utf-8"),
                                               actor=actor, extra=extra)
             new = unquote_etag(hdrs.get("etag", ""))

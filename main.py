@@ -2041,9 +2041,91 @@ def get_doc(slug: str, request: Request, rev: str = "", section: str = ""):
     return PlainTextResponse(body, headers=headers)
 
 
+# --------------------------------------------------------------------------
+# Handoff docs must be bound to a topic. A handoff doc is one whose slug holds
+# "handoff" or whose first '# ' heading does; it is bound when some category
+# links it with [[doc:<slug>]] (the web sidebar nests it there). An unbound
+# handoff is invisible to anyone who browses by topic, so the write is refused
+# unless it names a `topic` category, in which case the same request appends
+# the link to that category's '## Working documents' section: one commit, no
+# dangling link, no unbound window. A bound doc updates without `topic`.
+# --------------------------------------------------------------------------
+
+WORKING_DOCS = "Working documents"
+
+
+def is_handoff_doc(slug: str, text: str) -> bool:
+    if "handoff" in slug:
+        return True
+    for line in text.splitlines():
+        if line.startswith("# "):
+            return "handoff" in line.lower()
+    return False
+
+
+def doc_is_bound(slug: str) -> bool:
+    needle = "[[doc:%s]]" % slug
+    for path in DATA_DIR.glob("*.md"):
+        try:
+            if needle in path.read_text(encoding="utf-8"):
+                return True
+        except (OSError, UnicodeDecodeError):
+            continue
+    return False
+
+
+def handoff_binding(slug: str, text: str, topic: str):
+    """None when the doc may be written as is, else (category path, new category
+    text) to write together with it. Raises 422 for an unbound handoff doc
+    without a usable topic. Pure: writes nothing."""
+    if not is_handoff_doc(slug, text) or doc_is_bound(slug):
+        return None
+    if not topic:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "handoff doc '%s' is not attached to a topic. Every handoff doc must be "
+                "linked from a category. Fix: repeat this write with topic=<category> "
+                "(REST: ?topic=<category>); pick the category that owns the work from "
+                "protocol-roster, never create a new one for this. The server then adds "
+                "'- [[doc:%s]] - <title>' under that category's '## Working documents' "
+                "section in the same request." % (slug, slug)
+            ),
+        )
+    cat_path = validate_category(topic)
+    refuse_readonly(topic)
+    if not cat_path.exists():
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "topic category '%s' does not exist; pass an existing category from "
+                "protocol-roster" % topic
+            ),
+        )
+    lines = text.splitlines()
+    mask = fence_mask(lines)
+    title = slug
+    for i, line in enumerate(lines):
+        m = TITLE_RE.match(line)
+        if m and not mask[i]:
+            title = m.group(1)
+            break
+    bullet = "- [[doc:%s]] - %s" % (slug, title)
+    cat_lines = cat_path.read_text(encoding="utf-8").splitlines()
+    bounds = find_section_bounds(cat_lines, WORKING_DOCS)
+    if bounds is None:
+        gap = [""] if cat_lines and cat_lines[-1].strip() else []
+        new_lines = cat_lines + gap + ["## " + WORKING_DOCS, bullet]
+    else:
+        end = bounds[1]
+        new_lines = cat_lines[:end] + [bullet] + cat_lines[end:]
+    return cat_path, "\n".join(new_lines) + "\n"
+
+
 @app.put("/docs/{slug}")
 async def put_doc(
-    slug: str, request: Request, section: str = "", mode: str = "", rename_to: str = ""
+    slug: str, request: Request, section: str = "", mode: str = "", rename_to: str = "",
+    topic: str = "",
 ):
     rec = check_doc_auth(request, slug, write=True)
     path = validate_doc(slug)
@@ -2064,19 +2146,27 @@ async def put_doc(
                 "doc '%s' does not exist; PUT it whole (without ?section) first, "
                 "then upsert into it" % slug,
             )
+            link = handoff_binding(slug, new_text, topic)
             path.write_bytes(new_text.encode("utf-8"))   # not write_text: os.linesep would reintroduce CRLF
             out_body = new_text.encode("utf-8")
-            committed = git_commit(
-                commit_subject("PUT", "doc %s#%s" % (slug, heading_name), request)
-            )
+            target = "doc %s#%s" % (slug, heading_name)
+            if link:
+                link[0].write_bytes(link[1].encode("utf-8"))
+                target += " (+link in %s)" % topic
+            committed = git_commit(commit_subject("PUT", target, request))
             return PlainTextResponse(
                 "OK", headers=commit_headers({"ETag": '"%s"' % blob_sha(out_body)}, committed)
             )
 
         existed = path.exists()
         stored = normalise_body(body)      # see put_category: hash what we wrote
+        link = handoff_binding(slug, stored.decode("utf-8"), topic)
         path.write_bytes(stored)
-        committed = git_commit(commit_subject("PUT" if existed else "CREATE", "doc %s" % slug, request))
+        target = "doc %s" % slug
+        if link:
+            link[0].write_bytes(link[1].encode("utf-8"))
+            target += " (+link in %s)" % topic
+        committed = git_commit(commit_subject("PUT" if existed else "CREATE", target, request))
 
         return PlainTextResponse(
             "OK", headers=commit_headers({"ETag": '"%s"' % blob_sha(stored)}, committed)
