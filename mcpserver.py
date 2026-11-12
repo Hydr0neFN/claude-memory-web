@@ -168,8 +168,10 @@ TOOLS = [
                        "(from memory_get); omit it only to create a new file. "
                        "upsert=true appends the section if it is absent. A new "
                        "category must already be listed in the `protocol-roster` "
-                       "category, or the write is refused. For a change of a few "
-                       "lines prefer memory_edit.",
+                       "category, or the write is refused. A handoff doc (slug or "
+                       "first heading holds \"handoff\") must be linked from a category: "
+                       "pass topic=<category> and the server links it. For a change of a "
+                       "few lines prefer memory_edit.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -181,6 +183,13 @@ TOOLS = [
                 "upsert": {"type": "boolean", "default": False},
                 "rename_to": {"type": "string",
                               "description": "With section: rename that heading."},
+                "topic": {"type": "string",
+                          "description": "docs namespace, handoff doc only: the "
+                                         "category that owns the work. The server "
+                                         "links the doc under its '## Working "
+                                         "documents' section in the same write. "
+                                         "Required when the handoff doc is not "
+                                         "linked from any category yet."},
                 "note": NOTE_PROP,
             },
             "required": ["name", "content"],
@@ -213,6 +222,13 @@ TOOLS = [
                 "section": SECTION_PROP,
                 "etag": {"type": "string",
                          "description": "Optional; without it the server re-reads."},
+                "topic": {"type": "string",
+                          "description": "docs namespace, handoff doc only: the "
+                                         "category that owns the work. The server "
+                                         "links the doc under its '## Working "
+                                         "documents' section in the same write. "
+                                         "Required when the handoff doc is not "
+                                         "linked from any category yet."},
                 "note": NOTE_PROP,
             },
             "required": ["name"],
@@ -976,7 +992,8 @@ class Server:
                 extra["x-memory-note"] = urllib.parse.quote(str(args["note"])[:60], safe=" ")
             query = {"section": args.get("section"),
                      "mode": "upsert" if args.get("upsert") else "",
-                     "rename_to": args.get("rename_to")}
+                     "rename_to": args.get("rename_to"),
+                     "topic": args.get("topic")}
             try:
                 status, hdrs, _ = await self.rest("PUT", path, query,
                                                   content.encode("utf-8"),
@@ -984,7 +1001,7 @@ class Server:
             except RestError as exc:
                 if self._file_missing(exc) and args.get("section"):
                     raise ToolError(await self._not_found(args, actor))
-                if exc.status == 422 and not etag:
+                if exc.status == 422 and not etag and (args.get("namespace") or "memory") == "memory":
                     raise ToolError(str(exc) + await self._roster_hint(args, actor))
                 raise
             new = unquote_etag(hdrs.get("etag", ""))
@@ -1025,7 +1042,8 @@ class Server:
                 extra = {"if-match": '"%s"' % (given or current),
                          "x-memory-note": urllib.parse.quote(commit_note, safe=" ")}
                 try:
-                    _, put_hdrs, _ = await self.rest("PUT", path, {}, after.encode("utf-8"),
+                    _, put_hdrs, _ = await self.rest("PUT", path, {"topic": args.get("topic")},
+                                                     after.encode("utf-8"),
                                                      actor=actor, extra=extra)
                 except RestError as exc:
                     if self._file_missing(exc):
