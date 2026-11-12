@@ -274,6 +274,16 @@ def check_auth(request: Request) -> str:
                                    "scope=%r" % (request.method, request.url.path,
                                                  value.strip().lower()),
                         )
+            if scope == "skills-writer" and request.url.path == "/memory/recent":
+                # recent defaults to ns=all, which names docs this key may not
+                # read: only an explicit ns=memory passes.
+                values = request.query_params.getlist("ns")
+                if not values or any(v.strip().lower() != "memory" for v in values):
+                    raise HTTPException(
+                        status_code=403,
+                        detail="this key's scope allows %s %s only with ns=memory"
+                               % (request.method, request.url.path),
+                    )
             return "bearer"
     if session.read(request.cookies.get(webauth.COOKIE_NAME), creds.keyver):
         return "cookie"
@@ -355,7 +365,7 @@ async def read_capped_body(request: Request, cap: int) -> bytes:
 # would create data/search.md, but GET /memory/search would forever hit the
 # search endpoint instead of the file. Reject the collision at write time
 # rather than let it happen silently.
-RESERVED_CATEGORIES = {"index", "search", "pins"}
+RESERVED_CATEGORIES = {"index", "search", "pins", "recent"}
 RESERVED_DOCS = {"index"}
 RESERVED_SKILLS = {"index", "backlinks"}
 
@@ -1964,12 +1974,90 @@ def list_categories(request: Request):
     return JSONResponse(sorted(p.stem for p in DATA_DIR.glob("*.md")))
 
 
+@app.get("/memory/recent")
+def recent(request: Request, days: int = 7, ns: str = "all", prefix: str = "",
+           limit: int = 50):
+    """What changed lately, newest first, from one git log over the data dir.
+
+    Each touched *.md file of each commit is one record; the subject written by
+    commit_subject() supplies verb, section, actor and note. The skills tree is
+    skipped (its own index is authoritative). days is clamped to 1-90, limit to
+    1-200, and prefix keeps names that equal it or start with it.
+    """
+    check_auth(request)
+    if ns not in ("memory", "docs", "all"):
+        raise HTTPException(status_code=400, detail="invalid ns")
+    days = max(1, min(days, 90))
+    limit = max(1, min(limit, 200))
+
+    def unparsed(subject):
+        return "", "", "", subject
+
+    def parse_subject(subject):
+        left, sep, right = subject.partition(" via ")
+        if not sep:
+            return unparsed(subject)
+        bits = left.split(" ", 1)
+        if len(bits) != 2:
+            return unparsed(subject)
+        verb, target = bits[0].strip(), bits[1].strip()
+        if target.startswith("doc "):
+            target = target[4:]
+        elif target.startswith("skill "):
+            target = target[6:]
+        _name, _hash, section = target.partition("#")
+        actor_name, dash, note_text = right.partition(" — ")
+        if not dash:
+            actor_name, note_text = right, ""
+        return verb, section, actor_name.strip(), note_text.strip()
+
+    log = git("log", "--since", "%d days ago" % days, "--name-only",
+              "--format=@@@%H%x1f%aI%x1f%s", check=False)
+    if log.returncode != 0:
+        return JSONResponse([])
+
+    out = []
+    commit = None
+    for line in log.stdout.splitlines():
+        if line.startswith("@@@"):
+            fields = line[3:].split("\x1f")
+            sha = fields[0] if fields else ""
+            date = fields[1] if len(fields) > 1 else ""
+            subject = fields[2] if len(fields) > 2 else ""
+            commit = {"sha": sha[:7], "date": date, "subject": subject}
+            continue
+        path = line.strip()
+        if commit is None or not path or not path.endswith(".md"):
+            continue
+        if path.startswith("skills/"):
+            continue
+        kind = "doc" if path.startswith("docs/") else "memory"
+        if ns == "memory" and kind != "memory":
+            continue
+        if ns == "docs" and kind != "doc":
+            continue
+        name = Path(path).stem
+        if prefix and not (name == prefix or name.startswith(prefix)):
+            continue
+        verb, section, actor_name, note_text = parse_subject(commit["subject"])
+        out.append({
+            "date": commit["date"], "kind": kind, "name": name, "section": section,
+            "verb": verb, "actor": actor_name, "note": note_text, "sha": commit["sha"],
+        })
+        if len(out) >= limit:
+            return JSONResponse(out)
+    return JSONResponse(out)
+
+
 @app.get("/memory/index")
-def index(request: Request):
+def index(request: Request, prefix: str = ""):
     """Cheap map of the whole store: sizes, mtimes, and '##' section names."""
     check_auth(request)
     out = []
-    for path in sorted(DATA_DIR.glob("*.md")):
+    paths = sorted(DATA_DIR.glob("*.md"))
+    if prefix:
+        paths = [p for p in paths if p.stem == prefix or p.stem.startswith(prefix)]
+    for path in paths:
         raw = path.read_bytes()   # blob sha of disk bytes, same as GET and the write guard
         text = raw.decode("utf-8")
         stat = path.stat()
@@ -2038,6 +2126,7 @@ def search(
     full: int = 0,
     scope: str = "memory",
     mode: str = "and",
+    prefix: str = "",
 ):
     """AND-match over space-separated terms, case-insensitive.
 
@@ -2052,7 +2141,11 @@ def search(
     partial match is visible as one. mode=and (default) is unchanged.
     """
     check_auth(request)
-    return JSONResponse(do_search(q, limit, full, scope, mode))
+    keep = None
+    if prefix:
+        def keep(name):
+            return name == prefix or name.startswith(prefix)
+    return JSONResponse(do_search(q, limit, full, scope, mode, keep=keep))
 
 
 def do_search(q: str, limit: int, full: int, scope: str, mode: str, keep=None) -> list:
@@ -2311,10 +2404,13 @@ def list_docs(request: Request):
 
 
 @app.get("/docs/index")
-def doc_index(request: Request):
+def doc_index(request: Request, prefix: str = ""):
     check_auth(request)   # not pass-reachable: it would list every doc's sections
     out = []
-    for path in sorted(DOCS_DIR.glob("*.md")):
+    paths = sorted(DOCS_DIR.glob("*.md"))
+    if prefix:
+        paths = [p for p in paths if p.stem == prefix or p.stem.startswith(prefix)]
+    for path in paths:
         raw = path.read_bytes()   # blob sha of disk bytes, same as GET and the write guard
         text = raw.decode("utf-8")
         stat = path.stat()
@@ -2468,10 +2564,13 @@ def list_skills(request: Request):
 
 
 @app.get("/skills/index")
-def skills_index(request: Request):
+def skills_index(request: Request, prefix: str = ""):
     check_auth(request)
     out = []
-    for path in sorted(SKILLS_DIR.glob("*.md")):
+    paths = sorted(SKILLS_DIR.glob("*.md"))
+    if prefix:
+        paths = [p for p in paths if p.stem == prefix or p.stem.startswith(prefix)]
+    for path in paths:
         raw = path.read_bytes()   # blob sha of disk bytes, same as GET and the write guard
         text = raw.decode("utf-8")
         stat = path.stat()
@@ -2663,7 +2762,10 @@ async def delete_skill(domain: str, request: Request, section: str = ""):
 VAULT = os.environ.get("MEMORY_INSTANCE_NAME") or "owner"
 mcp = mcpserver.Server(app, TOKEN, sections_of, VAULT,
                        os.environ.get("MEMORY_PUBLIC_URL", "").rstrip("/"),
-                       sorted(READONLY_CATEGORIES))
+                       sorted(READONLY_CATEGORIES),
+                       find_section_bounds=find_section_bounds,
+                       fence_mask=fence_mask,
+                       section_headers=section_headers)
 
 
 ds_scoped = dstokens.Scoped(mcp, dstore, do_search, mcpserver.ToolError, mcpserver.TOOLS)

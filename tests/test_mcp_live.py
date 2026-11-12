@@ -125,7 +125,7 @@ st, _, _ = req("POST", "/mcp", {"jsonrpc": "2.0", "method": "notifications/initi
 check("notification -> 202", st, 202)
 st, _, out = rpc(TOKEN, "tools/list")
 names = [t["name"] for t in out["result"]["tools"]]
-check("10 tools", len(names), 10)
+check("12 tools", len(names), 12)
 st, _, out = rpc(TOKEN, "nope/nope")
 check("unknown method -> -32601", out["error"]["code"], -32601)
 
@@ -145,7 +145,7 @@ check("index names the vault", text.partition("\n")[0], "vault: " + VAULT)
 err, text = tool(TOKEN, "memory_get", name="../etc/passwd")
 check("path traversal refused", err, True)
 err, text = tool(TOKEN, "memory_get", name="zz-definitely-not-here")
-check("missing -> tool error 404", err and "404" in text, True)
+check("missing -> tool error 404", err and "not found" in text, True)
 
 # -- writes through MCP (a doc, so the roster gate does not apply) ------------
 err, text = tool(TOKEN, "memory_get", name=DOC, namespace="docs")
@@ -172,6 +172,267 @@ err, text = tool(TOKEN, "memory_get", name=DOC, namespace="docs")
 check("content round-trips", "## A\ntwo" in text and "## B\nnew" in text, True)
 err, text = tool(TOKEN, "memory_history", name=DOC, namespace="docs")
 check("history carries the note", "mcp selftest section" in text)
+
+# -- MCP 1.1: lean reads, memory_edit, memory_recent ---------------------------
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import mcpserver  # noqa: E402
+
+
+def rest_path(name, ns="memory"):
+    return ("/memory/" if ns == "memory" else "/docs/") + name
+
+
+def rest_get(name, ns="memory"):
+    return req("GET", rest_path(name, ns),
+               headers={"Authorization": "Bearer " + TOKEN})
+
+
+def rest_put(name, text, ns="memory"):
+    st, h, _ = rest_get(name, ns)
+    pre = {"If-Match": h.get("ETag") or h.get("etag")} if st == 200 else {"If-None-Match": "*"}
+    return req("PUT", rest_path(name, ns), text,
+               headers={"Authorization": "Bearer " + TOKEN,
+                        "Content-Type": "text/plain", **pre})
+
+
+def rest_delete(name, ns="memory"):
+    st, h, _ = rest_get(name, ns)
+    if st == 200:
+        req("DELETE", rest_path(name, ns),
+            headers={"Authorization": "Bearer " + TOKEN,
+                     "If-Match": h.get("ETag") or h.get("etag")})
+    return st
+
+
+FIX_CATS = ["zz-mcp11-alpha", "zz-mcp11-fixture", "zz-mcp11-pins",
+            "zz-mcp11-whole", "protocol-roster-zz-mcp11"]
+FIX_DOCS = ["zz-mcp11-doc"]
+
+
+def cleanup_mcp11():
+    for name in FIX_CATS:
+        rest_delete(name)
+    for name in FIX_DOCS:
+        rest_delete(name, "docs")
+
+
+cleanup_mcp11()   # a previous failed run may have left them behind
+try:
+    rest_put("zz-mcp11-alpha",
+             "# alpha\n\n## One\n<!-- verified: 2020-01-02 -->\nzzneedle alpha\n"
+             "repeat token\n\n## Two\nzzneedle two\nrepeat token\n<!-- verified: never -->\n")
+    rest_put("zz-mcp11-fixture", "# fixture\n\n## A\nzzneedle fixture\n")
+    rest_put("zz-mcp11-pins",
+             "# pins\n\n## Decisions\nuse alpha <!-- pin: decided -->\n"
+             "do not use beta <!-- pin: corrected -->\n")
+    rest_put("protocol-roster-zz-mcp11",
+             "# roster part\n\n## Extra\n- `zz-mcp11-alpha` — alpha fixture description\n")
+    rest_put("zz-mcp11-doc", "# doc\n\n## A\nzzneedle doc\n", "docs")
+
+    st, _, out = rpc(TOKEN, "initialize", {"protocolVersion": "2025-06-18"})
+    check("initialize reports 1.1.0", out["result"]["serverInfo"]["version"], "1.1.0")
+    check("instructions name memory_edit", "memory_edit" in out["result"]["instructions"])
+    st, _, out = rpc(TOKEN, "tools/list")
+    tools = [t["name"] for t in out["result"]["tools"]]
+    check("memory_edit and memory_recent listed",
+          {"memory_edit", "memory_recent"} <= set(tools))
+
+    # -- index ---------------------------------------------------------------
+    err, text = tool(TOKEN, "memory_index")
+    alpha_line = next((l for l in text.splitlines()
+                       if l.startswith("zz-mcp11-alpha ")), "")
+    check("index summary has no JSON", "{" not in text, True)
+    check("index summary line has bytes and sections",
+          "  " in alpha_line and "2 sections" in alpha_line)
+    check("index oldest verified", "oldest-verified 2020-01-02" in alpha_line)
+    check("index small view adds roster description",
+          alpha_line.endswith("— alpha fixture description"))
+
+    err, text = tool(TOKEN, "memory_index", prefix="zz-mcp11")
+    check("index prefix lists sections", "  - One" in text and "  - Two" in text)
+    check("index prefix lists etag", "  - One" in text and "etag " in text)
+
+    capped = mcpserver._cap_total("\n".join("x" * 500 for _ in range(300)))
+    check("index cap marker",
+          capped.endswith("[cut at 60000 chars: narrow with prefix=<name>]"))
+    check("long line is cut at 400",
+          mcpserver._line_cap("y" * 500) == "y" * 400 + " ...")
+
+    # -- pins ----------------------------------------------------------------
+    err, text = tool(TOKEN, "memory_pins")
+    check("pins summary counts", "pins in" in text.splitlines()[0]
+          and "kinds:" in text.splitlines()[0])
+    err, text = tool(TOKEN, "memory_pins", name="zz-mcp11-pins")
+    check("pins name lists the fixture",
+          "zz-mcp11-pins § Decisions :" in text and "use alpha" in text)
+    check("pins marker removed", "<!-- pin" not in text)
+    err, text = tool(TOKEN, "memory_pins", name="zz-mcp11-pins", kind="decided")
+    check("pins kind filter", "use alpha" in text and "do not use beta" not in text)
+    err, text = tool(TOKEN, "memory_pins", name="zz-mcp11-pins", query="BETA")
+    check("pins query is case-insensitive",
+          "do not use beta" in text and "use alpha" not in text)
+    err, text = tool(TOKEN, "memory_pins", name="zz-mcp11-pins", limit=1)
+    check("pins limit prints more", "1 of 2 pins" in text and "[more:" in text)
+    err, text = tool(TOKEN, "memory_pins", name="zz-mcp11-nothing")
+    check("pins empty sentence", text,
+          "0 pins match. memory_pins without arguments shows the counts per category.")
+
+    # -- search --------------------------------------------------------------
+    err, text = tool(TOKEN, "memory_search", query="zzneedle alpha")
+    check("search AND text", text.startswith("1 hits (mode=and)")
+          and "zz-mcp11-alpha § One :" in text)
+    err, text = tool(TOKEN, "memory_search", query="zzneedle", mode="rank")
+    check("search rank text", "(mode=rank)" in text and " score " in text
+          and " matched zzneedle" in text)
+    err, text = tool(TOKEN, "memory_search", query="zzneedle doc", scope="docs",
+                     full=True)
+    check("search full block", "=== doc:zz-mcp11-doc § A ===" in text)
+    err, text = tool(TOKEN, "memory_search", query="zzneedle",
+                     prefix="zz-mcp11-fixture")
+    check("search prefix filter",
+          "zz-mcp11-fixture" in text and "zz-mcp11-alpha" not in text)
+    err, text = tool(TOKEN, "memory_search", query="zzneedle nomatchterm")
+    check("search AND falls back to rank",
+          text.startswith("(no line matched every term; ranked OR search instead)")
+          and "(mode=rank)" in text)
+    err, text = tool(TOKEN, "memory_search", query="zzzznotaterm")
+    check("search zero sentence", text,
+          "0 hits. Try fewer or other terms, mode=rank, or scope=all.")
+
+    # -- memory_edit: replace ------------------------------------------------
+    err, text = tool(TOKEN, "memory_edit", name="zz-mcp11-alpha",
+                     old="zzneedle two", new="zzneedle changed")
+    check("edit replace without etag", err, False)
+    check("edit echo has now reads",
+          "now reads:" in text and "zzneedle changed" in text)
+    new_etag = text.split("new etag: ")[1].split()[0]
+    err, got = tool(TOKEN, "memory_get", name="zz-mcp11-alpha")
+    check("edit returns the etag of the new text", etag_of(got), new_etag)
+    check("edit text changed", "zzneedle changed" in got)
+
+    err, text = tool(TOKEN, "memory_edit", name="zz-mcp11-alpha",
+                     old="not-there", new="x")
+    check("edit 0 matches", text.startswith("0 matches for old in zz-mcp11-alpha."))
+    err, text = tool(TOKEN, "memory_edit", name="zz-mcp11-alpha",
+                     old="repeat token", new="x")
+    check("edit 2 matches lists lines", "2 matches for old (lines " in text)
+    err, text = tool(TOKEN, "memory_edit", name="zz-mcp11-alpha",
+                     old="repeat token", new="one token", section="One")
+    check("edit section narrows to one", err, False)
+    err, got = tool(TOKEN, "memory_get", name="zz-mcp11-alpha")
+    one_part, _, two_part = got.partition("## Two")
+    check("edit section changed only its section",
+          "one token" in one_part and "repeat token" in two_part)
+
+    err, text = tool(TOKEN, "memory_edit", name="zz-mcp11-alpha",
+                     old="repeat token", new="x", etag="0" * 40)
+    check("edit stale etag gives 409", "409" in text)
+    err, text = tool(TOKEN, "memory_edit", name="zz-mcp11-alpha",
+                     old="## Two", new="## Changed")
+    check("edit cannot change a heading", "changes a '## ' heading" in text)
+    err, text = tool(TOKEN, "memory_edit", name="zz-mcp11-alpha",
+                     old="repeat token", new="")
+    check("edit new='' deletes", err, False)
+    err, got = tool(TOKEN, "memory_get", name="zz-mcp11-alpha")
+    check("deleted text is gone", "repeat token" not in got)
+
+    err, text = tool(TOKEN, "memory_edit", name="zz-mcp11-alpha",
+                     namespace="skills", old="a", new="b")
+    check("edit refuses skills", err and "skills" in text)
+    err, text = tool(TOKEN, "memory_edit", name="zz-mcp11-doc", namespace="docs",
+                     old="zzneedle doc", new="zzneedle edited")
+    check("edit works on a doc", err, False
+          and "zzneedle edited" in tool(TOKEN, "memory_get", name="zz-mcp11-doc",
+                                        namespace="docs")[1])
+
+    # -- memory_edit: append -------------------------------------------------
+    err, text = tool(TOKEN, "memory_edit", name="zz-mcp11-alpha", op="append",
+                     section="One", new="appended zz line")
+    check("append ok", err, False)
+    err, got = tool(TOKEN, "memory_get", name="zz-mcp11-alpha")
+    before_two, _, after_two = got.partition("## Two")
+    check("append lands at the end of One",
+          "appended zz line" in before_two and "appended zz line" not in after_two)
+    err, text = tool(TOKEN, "memory_edit", name="zz-mcp11-alpha", op="append",
+                     section="One", new="appended zz line")
+    check("repeated append is idempotent", "no change" in text)
+    # the appended line sits right under the section's last text line, and
+    # the blank line before the next heading is still there
+    err, text = tool(TOKEN, "memory_get", name="zz-mcp11-alpha")
+    body_lines = text.splitlines()
+    at = body_lines.index("appended zz line")
+    check("append: no blank line before the new line", body_lines[at - 1].strip() != "")
+    nxt = [i for i, l in enumerate(body_lines) if i > at and l.startswith("## ")]
+    check("append: blank line kept before the next heading",
+          bool(nxt) and body_lines[nxt[0] - 1].strip() == "" and nxt[0] - at == 2)
+    err, text = tool(TOKEN, "memory_edit", name="zz-mcp11-alpha", op="append",
+                     section="NoSuchSection", new="x")
+    check("append unknown section lists sections",
+          "available sections:" in text and "upsert=true" in text)
+    err, text = tool(TOKEN, "memory_edit", name="zz-mcp11-alpha", op="append",
+                     section="One", new="## Bad\nx")
+    check("append refuses a heading", "changes a '## ' heading" in text)
+
+    # -- format=json ---------------------------------------------------------
+    err, text = tool(TOKEN, "memory_index", prefix="zz-mcp11", format="json")
+    body = "\n".join(l for l in text.splitlines()
+                     if not l.startswith(("vault:", "ALERT:")))
+    index_json = json.loads(body)
+    check("index format=json parses",
+          any(e.get("category") == "zz-mcp11-alpha" for e in index_json))
+    err, text = tool(TOKEN, "memory_search", query="zzneedle", format="json")
+    check("search format=json parses", isinstance(json.loads(text), list))
+    err, text = tool(TOKEN, "memory_pins", format="json")
+    check("pins format=json parses", isinstance(json.loads(text), list))
+
+    # -- recent --------------------------------------------------------------
+    # A section write commits `name#section`, which is what recent reports.
+    err, got = tool(TOKEN, "memory_get", name="zz-mcp11-alpha")
+    tool(TOKEN, "memory_write", name="zz-mcp11-alpha", section="One",
+         content="## One\nmcp11 one\n", etag=etag_of(got), note="mcp11 first note")
+    err, got = tool(TOKEN, "memory_get", name="zz-mcp11-alpha")
+    tool(TOKEN, "memory_write", name="zz-mcp11-alpha", section="One",
+         content="## One\nmcp11 two\n", etag=etag_of(got), note="mcp11 second note")
+    err, text = tool(TOKEN, "memory_recent", days=7, namespace="memory",
+                     prefix="zz-mcp11-alpha")
+    lines = text.splitlines()
+    check("recent head", "changes in the last 7 days" in lines[0])
+    check("recent shows section and note",
+          any("§ One" in l and "mcp11 second note" in l for l in lines))
+    first = next((i for i, l in enumerate(lines) if "mcp11 first note" in l), -1)
+    second = next((i for i, l in enumerate(lines) if "mcp11 second note" in l), -1)
+    check("recent is newest first", 0 < second < first)
+    check("recent prefix filter", not any("zz-mcp11-fixture" in l for l in lines))
+    err, text = tool(TOKEN, "memory_recent", days=7, namespace="docs",
+                     prefix="zz-mcp11")
+    check("recent namespace=docs", "doc:zz-mcp11-doc" in text
+          and "zz-mcp11-alpha" not in text)
+    err, text = tool(TOKEN, "memory_recent", days=999)
+    check("recent days is clamped", err is False and "last 90 days" in text)
+
+    # -- unknown name, roster gate ------------------------------------------
+    err, text = tool(TOKEN, "memory_get", name="zz-mcp11-fixtur")
+    check("unknown name suggests the fixture",
+          "Did you mean:" in text and "zz-mcp11-fixture" in text)
+    err, text = tool(TOKEN, "memory_write", name="mcp11-unlisted-probe",
+                     content="# probe\n")
+    check("422 carries the roster hint",
+          err and "memory_edit name=protocol-roster" in text)
+    check("unlisted probe was not created",
+          rest_get("mcp11-unlisted-probe")[0], 404)
+
+    # -- memory_write still works -------------------------------------------
+    err, text = tool(TOKEN, "memory_write", name="zz-mcp11-whole",
+                     content="# whole\n\n## W\nBody\n", note="mcp11 whole create")
+    check("whole-file write still works", err, False)
+    etag = text.rsplit(" ", 1)[1]
+    err, text = tool(TOKEN, "memory_write", name="zz-mcp11-whole", section="W",
+                     content="## W\nSection body\n", etag=etag)
+    check("section write still works", err, False)
+    err, got = tool(TOKEN, "memory_get", name="zz-mcp11-whole")
+    check("section write round-trips", "Section body" in got)
+finally:
+    cleanup_mcp11()
 
 # -- OAuth: register -> authorize -> token -> use -> refresh --------------------
 st, _, b = req("POST", "/oauth/register", {"redirect_uris": ["https://evil.example/cb"],

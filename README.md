@@ -17,9 +17,10 @@ Vanilla JS, no npm, no CDN, no build. The server needs four Python packages
 ## Connecting Claude (MCP)
 
 `POST /mcp` is a Model Context Protocol server (Streamable HTTP, stateless,
-plain JSON replies) exposing the store as eight tools: `memory_list`,
-`memory_index`, `memory_search`, `memory_get`, `memory_write`,
-`memory_delete`, `memory_history`, `memory_pins`. This is how Claude reaches the
+plain JSON replies) exposing the store as twelve tools: `memory_list`,
+`memory_index`, `memory_search`, `memory_get`, `memory_write`, `memory_edit`,
+`memory_delete`, `memory_history`, `memory_pins`, `memory_recent`,
+`memory_issue_pass`, `memory_revoke_pass`. This is how Claude reaches the
 store; there is no client to install and nothing on the client side to keep
 up to date, since the tools and their instructions come from the server.
 
@@ -280,7 +281,7 @@ described above.
 | `apikeys.py` | `$APP_DIR/apikeys.py` | named revocable bearer keys, minted from the browser |
 | `passkeys.py` | `$APP_DIR/passkeys.py` | passkey (WebAuthn) store and checks; the only module that needs `cryptography` |
 | `requirements.txt` | — | the four runtime packages, for `pip install -r` |
-| `mcpserver.py` | `$APP_DIR/mcpserver.py` | `/mcp`: JSON-RPC dispatch and the eight tools |
+| `mcpserver.py` | `$APP_DIR/mcpserver.py` | `/mcp`: JSON-RPC dispatch and the twelve tools |
 | `mcpoauth.py` | `$APP_DIR/mcpoauth.py` | OAuth 2.1 server for `/mcp`: registration, codes, grants |
 | `web/` | `$APP_DIR/web/` | `index.html`, `app.css`, `app.js`, `md.js`, `diff.js` |
 | `test-web.sh` | `$APP_DIR/test-web.sh` | server test suite, run on the box |
