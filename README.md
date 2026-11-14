@@ -14,6 +14,20 @@ Vanilla JS, no npm, no CDN, no build. The server needs four Python packages
 
 ![no build step](https://img.shields.io/badge/build-none-informational)
 
+## At a glance
+
+- One FastAPI service: a REST API, the `/mcp` MCP server, and a browser UI at
+  `/`.
+- Twelve MCP tools over Streamable HTTP, stateless, plain JSON; nothing to
+  install on the client.
+- Facts in `/memory/{category}`, working documents in `/docs/{slug}`, reusable
+  procedures in `/skills/{domain}`.
+- Every write is a git commit; `?section=<name>` edits one `## ` block, and
+  `&mode=rank` ranks sections by BM25.
+- Agents use a bearer `mem_` key or an OAuth grant; people use GitHub, Google
+  or a passkey.
+- No build step, four Python packages, one Raspberry Pi 4.
+
 ## Connecting Claude (MCP)
 
 `POST /mcp` is a Model Context Protocol server (Streamable HTTP, stateless,
@@ -45,69 +59,10 @@ ETag preconditions, the roster gate and git commits apply unchanged. A write
 takes the `etag` that `memory_get` returned; there is no client-side cache to
 lean on.
 
-`mcpoauth.py` is the authorization server. Registration is open, as the spec
-requires, but a code is only ever redirected to Claude's own callback or a
-loopback URI, only after a signed-in owner clicks Allow, and only to the holder
-of the PKCE verifier. Access tokens last an hour and are accepted by `/mcp`
-alone — never by the REST API. Refresh tokens last 90 days from last use and are
-not rotated (see the module docstring). Grants live in `mcpoauth.json` (mode
-600, hashes only). Set `MEMORY_PUBLIC_URL` if the Host header ever stops being
-the public name.
-
-## What the API is
-
-Underneath the MCP tools and the browser UI is one REST API; both call it, and
-neither reimplements any of its rules. It stores one Markdown file per category,
-guarded by a single bearer token, and git-commits every write so any edit is
-recoverable. Reads are
-`GET /memory/{category}`; writes need `If-Match` with the ETag you read, which
-is the git blob SHA of the body. `main.py` and `webauth.py` here are the whole
-server.
-
-That ETag is the blob SHA of the bytes **on disk**, and every read path — the
-category, the doc, and both index listings — computes it the same way the write
-guard does. Getting this wrong is subtle and unpleasant: hash the *decoded* text
-instead and universal-newline translation applies, so a file stored with CRLF is
-served as LF and hashed over the LF form. A client that faithfully returns the
-ETag it was handed is then refused `409 etag mismatch` forever, with no
-concurrent writer anywhere. Request bodies are therefore normalised to LF, and
-must be valid UTF-8 or the write is refused `400` — without that check one bad
-body would break `index`, `search` and `pins` for the whole store, since all
-three read every file. `tests/test_etag_crlf.py` holds the contract down.
-
-There are three namespaces. `/memory/{category}` holds facts — short, deduplicated,
-one topic each. `/docs/{slug}` holds working documents — handoffs, runbooks,
-audit reports: long, project-scoped, superseded rather than accumulated. Docs
-live in `data/docs/`, which every `/memory` endpoint is blind to because its
-glob is non-recursive. `/memory/search` skips docs unless you pass
-`&scope=docs|all`, so handoff prose never swamps a fact lookup.
-
-A third namespace, `/skills/{domain}`, holds reusable procedures: one
-`data/skills/<domain>.md` file per domain, one `## msk-<12 hex> <title>` section
-per skill. Sections are addressed by id (`?section=msk-<id>`), so renaming a
-skill does not break a caller. `GET /skills/index` lists the parsed metadata
-(status, refs, uses, last use) and `GET /skills/backlinks?ref=<category>` finds
-the skills that reference a category or one of its sections; both are computed
-from the files, never from a second index. `&scope=skills|all` adds skills to
-search, and MCP accepts `namespace="skills"` wherever it accepts memory or docs.
-
-By default search returns every line containing all the terms. `&mode=rank`
-instead ranks whole sections by BM25 with OR semantics, light stemming and CJK
-bigrams (`searchrank.py`, pure Python), so one term the text happens not to use
-no longer empties the result, and each hit lists the terms it `matched`. The
-index is derived from the markdown and rebuilt when a file changes. Dense
-embeddings were considered and deferred: a ~150 MB runtime on a shared Pi buys
-little over BM25 for a ~1 MB corpus whose reader can rephrase its own query.
-
-Both namespaces support `?section=<name>` on GET, PUT and DELETE, addressing a
-single `## ` block: read three lines out of a 20 KB file, or splice three lines
-back in without touching another byte. The locking unit stays the whole file —
-`If-Match` still carries the whole-file ETag — only the *editing* unit becomes
-the section. That matters for LLM callers, which otherwise load an entire
-category to change one line and hand-roll a whole-file patch to write it back.
-A body whose heading does not match the section is a `400`, never an implicit
-rename, because a silent rename would break every existing reference to the old
-name.
+`mcpoauth.py` is the OAuth 2.1 authorization server for `/mcp`; access tokens
+last an hour and are never accepted by the REST API. Registration, PKCE,
+refresh tokens and the grant file are covered in
+[Auth and access](docs/auth.md#mcp-oauth).
 
 ## What the UI does
 
@@ -133,292 +88,47 @@ name.
   keys (each new one comes with its `claude mcp add` command), and the list of
   connected apps with a disconnect button.
 
+## What the API is
+
+One REST API sits underneath the MCP tools and the browser UI. It stores one
+Markdown file per category, git-commits every write, and guards writes with an
+`If-Match` ETag that is the git blob SHA of the body.
+
+[API reference](docs/api.md)
+
 ## Auth
 
-Two ways in, deliberately asymmetric.
+Agents present a bearer credential — a `mem_` key or an OAuth grant — and are
+never asked for a second factor. People sign in with GitHub or Google against an
+allowlist in `auth.json`, or with a passkey; every way in ends at the same
+HttpOnly cookie. Named bearer keys are revocable one at a time.
 
-**Agents** — Claude over MCP — present a bearer credential: a `mem_` key or an
-OAuth grant from the connector flow, never asked for a second factor. Whoever
-holds one can already read and write the whole store, so a second factor at the
-browser door would guard nothing.
+[Auth and access](docs/auth.md)
 
-**People** sign in with GitHub or Google, so a phone can read the store without
-holding the token. The second factor is the one already on that account; an
-allowlist of addresses in `auth.json` is the authorization step, because
-"signed in with GitHub" by itself authorizes anybody with a GitHub account.
-`GET /auth/<provider>` starts an authorization-code handshake and the callback
-exchanges the code over a direct back-channel call to the provider. That is why
-no token signature is verified here and why the whole flow adds no dependency:
-nothing sits between this service and the provider's token endpoint, which is
-the property JWT verification exists to establish.
+## Running and deploying
 
-Either provider, or both, can be configured; a provider with no config or an
-empty allowlist is off, its button hidden and its route answering 503. Two
-differences are load-bearing rather than cosmetic: **GitHub OAuth Apps ignore
-PKCE**, so `code_challenge` is sent only to Google and the GitHub handshake is
-held by the signed state cookie and the client secret alone; and **GitHub
-reports a refused code exchange as HTTP 200 with an `error` body**, so the
-status line cannot be used to tell success from failure. GitHub identity comes
-from `GET /user/emails`, which returns every address on the account, so the
-allowlist is matched against the verified ones.
+No packaging step: scp the files and restart. One code directory can serve
+several fully separate stores, each named by environment variables, and
+`MEMORY_MCP_UPSTREAM` turns `/mcp` into an authenticating proxy when set.
 
-**Or with a passkey**, once one is registered: the phone's own fingerprint or
-PIN, and no third party in the loop at all. See [Passkeys](#passkeys).
+[Operations](docs/operations.md)
 
-All of these end at the same cookie. `POST /auth/login` with the token still
-works and is the way back in when Google is unreachable, when the allowlist is
-wrong, or when there is no browser to run a consent screen.
+## Development
 
-The cookie is HttpOnly and signed with a key derived from the API token, so
-rotating the token logs every browser out and there is no second secret to
-manage. `keyver` in `auth.json` is the same lever without touching the token:
-bump it and every browser session dies while every agent keeps working
-(`manage_auth.py sign-out-everyone`).
+`devstub.py` serves `web/` on `:8123` against a fake API, and `rendertest.js`
+runs 28 checks over `md.js` / `diff.js`. `tests/` holds offline unit tests plus
+the live connector and passkey flows.
 
-### Keys
+[Development](docs/development.md)
 
-A signed-in browser can mint named bearer keys on the MCP page (`/#/keys`) —
-one per device or agent. A key reads and writes the store exactly as the master token does, but
-deleting it disturbs nothing else, which is what makes a lost phone answerable
-without rotating the token and signing every browser and agent out at once.
+## Documentation
 
-A key can be minted with `"scope": "skills-writer"` instead of the default
-`"all"`: it may read `/memory` and read/write `/skills`, and nothing else (no
-delete, `/docs`, `/mcp` or key management). A record written before scopes
-existed counts as `all`.
-
-Keys cannot mint or delete keys. That is cookie-only, so a leaked key cannot
-issue itself successors that outlive its own revocation. The secret is shown
-once and never stored — `apikeys.json` (mode 600, beside `main.py`, never inside
-`data/`) holds only its SHA-256. A 256-bit `secrets.token_urlsafe` needs no slow
-KDF; there is nothing to brute-force.
-
-A key is what Claude Code sends to `/mcp` as `Authorization: Bearer <key>`; the
-page shows the ready `claude mcp add` command next to the new secret.
-
-### Passkeys
-
-A passkey is a key pair the phone or laptop holds and will only use for this
-site after a fingerprint, face or PIN. The service stores the public half and
-nothing else — `passkeys.json` (mode 600, beside `main.py`, never inside
-`data/`) — so there is nothing on the box worth stealing and no second secret
-to back up. Signing in with one ends at the same `mem_session` cookie as every
-other sign-in, and `/auth/me` reports it as `"via": "passkey"`.
-
-Set `MEMORY_RP_ID` to the public hostname (or set `MEMORY_PUBLIC_URL` and leave
-it to that) and restart; the sign-in page then offers it. With neither set,
-passkeys are off: every passkey route answers 503 and `/auth/me` says
-`"passkey": false`. The relying-party id and origin come from configuration and
-never from the `Host` header — a page that proxies this one under another name
-would otherwise have its own origin accepted.
-
-| Route | Who may call |
-|---|---|
-| `POST /auth/passkey/register/options`, `…/register/verify` | a signed-in browser (cookie + `X-Memory-Actor`) whose sign-in is under 15 minutes old |
-| `POST /auth/passkey/login/options`, `…/login/verify` | anyone; 5 failed sign-ins per client per 5 minutes, then 429 on both |
-| `GET /auth/passkeys`, `DELETE /auth/passkeys/{id}` | a signed-in browser (cookie + `X-Memory-Actor`) |
-
-Registering takes a recent sign-in for the same reason minting a key does: a
-passkey outlives the session that created it, so script running in a tab that
-has been signed in for a week cannot quietly add one. A bearer credential can
-never register one. Deleting takes no recent sign-in — the person who has just
-lost a phone should not first have to find another way in.
-
-What is checked, in short: the challenge was issued to this browser (a signed,
-HttpOnly cookie), for this ceremony, within 5 minutes, and is spent on the first
-attempt whether it succeeds or not; the origin and the hash of the RP id match
-exactly; the authenticator says the user was present *and* verified; the
-signature over `authenticatorData || SHA-256(clientDataJSON)` verifies with the
-stored key (ES256, RS256 or Ed25519, the key's type and size pinned to that
-algorithm); and the sign counter has moved forwards unless the authenticator
-keeps none. `userHandle` is ignored. A refused sign-in is one status and one
-body whatever the reason, so the route cannot be used to learn which
-credentials exist, and the sign-in options never name one.
-
-At most 10 passkeys. `keyver` (sign-out-everyone) ends every passkey *session*
-but leaves the passkeys registered, so the owner can sign straight back in —
-which also means a passkey somebody else registered survives it; read the
-list. On the box:
-
-```bash
-sudo -u claudemem $APP_DIR/venv/bin/python $APP_DIR/manage_auth.py passkeys
-sudo -u claudemem $APP_DIR/venv/bin/python $APP_DIR/manage_auth.py passkey-delete <id>
-```
-
-A damaged `passkeys.json` reads as empty: passkey sign-in fails closed, the
-token and every bearer credential keep working, and nothing overwrites the
-file until it is fixed. Like `auth.json`, it is re-read when its bytes change.
-
-### Configuring a provider
-
-For GitHub, register an OAuth App at <https://github.com/settings/developers>
-with the authorization callback URL `https://<your host>/auth/github/callback`;
-the client id and secret are issued immediately. For Google, create an OAuth
-**Web application** client at <https://console.cloud.google.com/apis/credentials>
-with the redirect URI `https://<your host>/auth/google/callback` (this one goes
-through the consent-screen forms first). Then, on the box:
-
-```bash
-sudo -u claudemem $APP_DIR/venv/bin/python $APP_DIR/manage_auth.py \
-     setup github <client-id> https://<your host>/auth/github/callback you@example.com
-```
-
-The address on the allowlist has to be one the provider will report as
-verified — for GitHub that means an address on
-<https://github.com/settings/emails>, not the `users.noreply.github.com` alias.
-
-It prompts for the client secret on the terminal rather than taking it in
-`argv`, and writes `auth.json` mode 600 next to `main.py` — never inside
-`data/`, which is a git repo that keeps every version of every file in it
-forever. No restart is needed: the file is re-read when its contents change.
-
-Leave every provider unconfigured and the service behaves exactly as it did
-before — the login page offers the token field and `/auth/<provider>`
-answers 503.
-
-Cookie-authorized writes must also send `X-Memory-Actor`; a cross-site request
-cannot set a custom header, and the cookie is `SameSite=strict` on top of that.
-The header doubles as the author in the git commit (`PUT infra via memory-web`).
-
-Login is throttled per client IP. FastAPI's own `/docs`, `/redoc` and
-`/openapi.json` are disabled — on a public hostname the schema was the only
-thing readable without auth, and `/docs` is now the working-documents namespace
-described above.
-
-## Files
-
-| Path | Deployed to | What |
+| Topic | English | 繁體中文 |
 |---|---|---|
-| `main.py` | `$APP_DIR/main.py` | the API, plus `/auth/*` and the static mount |
-| `webauth.py` | `$APP_DIR/webauth.py` | HMAC cookie sessions, the OAuth provider table, login throttle |
-| `manage_auth.py` | `$APP_DIR/manage_auth.py` | administers `auth.json`: provider clients, allowlists, `keyver`; lists and deletes passkeys |
-| `apikeys.py` | `$APP_DIR/apikeys.py` | named revocable bearer keys, minted from the browser |
-| `passkeys.py` | `$APP_DIR/passkeys.py` | passkey (WebAuthn) store and checks; the only module that needs `cryptography` |
-| `requirements.txt` | — | the four runtime packages, for `pip install -r` |
-| `mcpserver.py` | `$APP_DIR/mcpserver.py` | `/mcp`: JSON-RPC dispatch and the twelve tools |
-| `mcpoauth.py` | `$APP_DIR/mcpoauth.py` | OAuth 2.1 server for `/mcp`: registration, codes, grants |
-| `web/` | `$APP_DIR/web/` | `index.html`, `app.css`, `app.js`, `md.js`, `diff.js` |
-| `test-web.sh` | `$APP_DIR/test-web.sh` | server test suite, run on the box |
-| `tests/` | `$APP_DIR/tests/` | unit tests: `test_webauth.py` (offline), `test_etag_crlf.py`; `test_passkeys.py` (offline); `test_mcp_live.py` runs the whole connector flow against a live app; `test_passkeys_live.py` does the same for passkeys with a software authenticator; `test_isolation_live.py` proves two instances refuse each other's credentials |
-| `devstub.py` | — | fake backend for local UI work, dev only |
-| `rendertest.js` | — | 28 checks over `md.js` / `diff.js`, dev only |
-| `fixtures/` | — | synthetic corpus the render tests run against |
-
-## Develop
-
-```bash
-python devstub.py     # serves web/ on :8123 with a fake API, no token needed
-node rendertest.js    # markdown + diff checks
-python tests/test_webauth.py   # sessions, keyver, PKCE state, allowlist; no network
-python tests/test_apikeys.py   # minting, verifying, revoking; no network
-python tests/test_passkeys.py  # WebAuthn checks, store, challenge cookie; no network
-```
-
-`devstub.py` fakes the whole API from in-memory fixtures, including a category
-whose writes always `409`, so the conflict UI can be exercised without a server.
-
-Real categories dropped at the top level are picked up as extra render-test
-input and are gitignored — they are personal notes, not test data.
-
-## Deploy
-
-No packaging step; it is scp and a restart. Set these to your own values:
-
-```bash
-PI_HOST=root@your-pi.local          # wherever the service runs
-APP_DIR=/opt/claude-memory          # its install directory
-SVC_USER=claudemem                  # the unprivileged user it runs as
-
-ssh $PI_HOST "mkdir -p /tmp/memweb/web"
-scp main.py webauth.py passkeys.py requirements.txt test-web.sh $PI_HOST:/tmp/memweb/
-scp web/* $PI_HOST:/tmp/memweb/web/
-ssh $PI_HOST "cd $APP_DIR \
-  && cp -a main.py main.py.bak-\$(date +%F) \
-  && $APP_DIR/venv/bin/pip install -q -r /tmp/memweb/requirements.txt \
-  && install -o \$SVC_USER -g \$SVC_USER -m 644 /tmp/memweb/main.py . \
-  && install -o \$SVC_USER -g \$SVC_USER -m 644 /tmp/memweb/webauth.py . \
-  && install -o \$SVC_USER -g \$SVC_USER -m 644 /tmp/memweb/passkeys.py . \
-  && install -o \$SVC_USER -g \$SVC_USER -m 644 /tmp/memweb/web/* web/ \
-  && systemctl restart claude-memory && ./test-web.sh"
-```
-
-Rollback is `cp -a main.py.bak-<date> main.py && systemctl restart claude-memory`.
-Category writes are git-committed in `data/`, so a bad edit is recoverable via
-`/memory/{cat}/history` and `?rev=<sha>`.
-
-Bump the `?v=` query on the `<script>`/`<link>` tags in `index.html` when
-shipping JS or CSS, or browsers will keep serving the old copy.
-
-## Running several instances
-
-One code directory can serve several fully separate stores -- one process per
-user, each on its own port and hostname. Everything an instance owns is named
-by an environment variable; unset, each falls back to the file next to the
-code, which is how a single install has always worked.
-
-| Variable | Default (next to the code) | What |
-|---|---|---|
-| `MEMORY_ENV_FILE` | python-dotenv's upward search | this instance's `.env` |
-| `MEMORY_DATA_DIR` | `data/` | categories, `docs/`, the git history |
-| `MEMORY_AUTH_FILE` | `auth.json` | sign-in providers, allowlists, `keyver` |
-| `MEMORY_KEYS_FILE` | `apikeys.json` | named `mem_` keys |
-| `MEMORY_PASSKEY_FILE` | `passkeys.json` | registered passkeys (public keys only) |
-| `MEMORY_OAUTH_FILE` | `mcpoauth.json` | MCP connector grants |
-| `MEMORY_PUBLIC_URL` | the request's Host | issuer / resource URL for `/mcp`; also the passkey RP id when `MEMORY_RP_ID` is unset |
-| `MEMORY_RP_ID` | the host of `MEMORY_PUBLIC_URL`; neither set = passkeys off | passkey relying-party id: the public hostname, never the Host header |
-| `MEMORY_RP_ORIGIN` | `https://<MEMORY_RP_ID>` (or `MEMORY_PUBLIC_URL`'s origin when the id came from there) | the one origin a passkey ceremony is accepted from |
-| `MEMORY_SESSION_KEY` | derived from `CLAUDE_MEMORY_TOKEN` | cookie-signing secret |
-| `MEMORY_INSTANCE_NAME` | `owner` | whose vault: named in `/mcp` serverInfo and instructions, list/index output, the consent page |
-| `MEMORY_FLAG_DIR` | the parent of `MEMORY_DATA_DIR` | `READONLY` / `ALERT` replication flags (see `replflag.py`) |
-| `MEMORY_NODE` | unset | `X-Memory-Node` on every response, so a watchdog can tell which node the public hostname reaches |
-| `MEMORY_READONLY_CATEGORIES` | unset | comma list of categories every client credential may read but never PUT/DELETE (403); a relative's `protocol`, rendered by `replication/memprotocol-sync` |
-
-Set `MEMORY_ENV_FILE` whenever the code directory also holds another
-instance's `.env`: python-dotenv never overrides a variable that is already
-set, but it fills in every one that is missing, so a second instance would
-otherwise inherit the first one's `MEMORY_PUBLIC_URL` or provider settings.
-Each instance needs its own `CLAUDE_MEMORY_TOKEN`; tokens, cookies, `mem_`
-keys and `mcpa_` tokens from one are refused by every other.
-
-A templated unit (`claude-memory@.service`) must name every per-instance file,
-`MEMORY_PASSKEY_FILE` included: left unset, an instance sharing the code
-directory reads the owner's `passkeys.json` next to the code, and a standby
-whose state directory is elsewhere never sees the passkeys replicated to it.
-
-## Forwarding /mcp to another MCP server
-
-`MEMORY_MCP_UPSTREAM` turns this instance into an authenticating proxy: it
-checks `POST /mcp` with the usual token / `mem_` key / OAuth grant, then
-forwards the JSON-RPC body unchanged to a stateless Streamable HTTP MCP server
-and returns that reply unchanged. Unset (the default) leaves `/mcp` local. The
-caller's credentials never leave this instance: the upstream sees only the key
-from `MEMORY_MCP_UPSTREAM_KEY_FILE` (re-read on every call), a fixed
-`User-Agent`, and the actor in `X-Forwarded-Actor`.
-
-| Variable | Default | What |
-|---|---|---|
-| `MEMORY_MCP_UPSTREAM` | unset | upstream `POST` URL; `http://` or `https://`, any other scheme logs one line and means off |
-| `MEMORY_MCP_UPSTREAM_KEY_FILE` | unset | file holding the upstream bearer; read per request, whitespace stripped |
-| `MEMORY_MCP_UPSTREAM_TIMEOUT` | `140` | upstream timeout in seconds, clamped to 1..600 |
-| `MEMORY_CONSENT_LABEL` | the vault name | text the two consent pages print in place of the vault name |
-
-An upstream failure becomes a JSON-RPC error (`-32000`) with 502 (504 on
-timeout, 503 when the key is missing). An upstream 401/403 is never returned
-to the caller as 401, so a connector does not restart the OAuth sign-in; a 3xx
-is not followed. Scoped `dst_` tokens are refused (403) and nothing is
-forwarded for an unauthenticated call. `GET`/`DELETE /mcp` stay 405.
-
-## Notes
-
-- The static mount must stay the **last** statement in `main.py`. Starlette
-  matches routes in declaration order; a mount at `/` added earlier would
-  swallow `/memory/*`.
-- `md.js` is a deliberate subset renderer, not a Markdown library: it escapes
-  everything first so no note can become live HTML, has no `_underscore_`
-  emphasis (the corpus is full of `snake_case` identifiers), and turns
-  `<!-- verified: DATE -->` into a staleness badge instead of dropping it.
-- `test-web.sh` restarts the service before running so the in-memory login
-  throttle starts empty; the throttle test is last because it burns the window.
+| REST API, namespaces, search | [docs/api.md](docs/api.md) | [docs/api.zh-TW.md](docs/api.zh-TW.md) |
+| Auth, keys, passkeys, providers | [docs/auth.md](docs/auth.md) | [docs/auth.zh-TW.md](docs/auth.zh-TW.md) |
+| Deploy, instances, forwarding | [docs/operations.md](docs/operations.md) | [docs/operations.zh-TW.md](docs/operations.zh-TW.md) |
+| Files, develop, notes | [docs/development.md](docs/development.md) | [docs/development.zh-TW.md](docs/development.zh-TW.md) |
 
 ## Licence
 
