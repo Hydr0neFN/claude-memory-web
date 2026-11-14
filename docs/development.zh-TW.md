@@ -19,7 +19,7 @@
 | `tests/` | `$APP_DIR/tests/` | 單元測試：`test_webauth.py`（離線）、`test_etag_crlf.py`；`test_passkeys.py`（離線）；`test_mcp_live.py` 針對執行中的應用程式測試完整連接器流程；`test_passkeys_live.py` 以軟體驗證器對 passkey 做同樣的事；`test_isolation_live.py` 驗證兩個執行個體會相互拒絕彼此的憑證 |
 | `devstub.py` | — | 本地 UI 開發用的假後端，僅限開發使用 |
 | `rendertest.js` | — | 針對 `md.js` / `diff.js` 的 28 項檢查，僅限開發使用 |
-| `fixtures/` | — | 算繪測試所執行的合成語料庫 |
+| `fixtures/` | — | 供算繪測試使用的合成語料庫 |
 
 ## 開發
 
@@ -33,10 +33,10 @@ python tests/test_passkeys.py  # WebAuthn checks, store, challenge cookie; no ne
 
 `devstub.py` 從記憶體中的測試資料（fixtures）模擬整個 API，包含一個寫入永遠回傳 `409` 的分類，以便在沒有伺服器的情況下測試衝突處理 UI。
 
-放置於最頂層目錄的真實分類會被作為額外的算繪測試輸入，且已被加入 gitignore —— 它們是個人筆記，而非測試資料。
+放在最頂層目錄的真實分類會當作額外的算繪測試輸入，也已加進 gitignore —— 它們是個人筆記，不算測試資料。
 
 ## 備註
 
 - 靜態掛載必須保持為 `main.py` 中的**最後一條**陳述式。Starlette 依宣告順序比對路由；若過早加入掛載於 `/` 的路由，將會吞沒 `/memory/*`。
-- `md.js` 是特意設計的子集算繪器，而非完整的 Markdown 函式庫：它會先跳脫所有內容以確保筆記不會變成可執行的 HTML、不支援 `_underscore_` 強調語法（語料庫中充斥著 `snake_case` 識別碼），並將 `<!-- verified: DATE -->` 轉換為時效性徽章而非直接丟棄。
+- `md.js` 刻意只做 Markdown 的子集算繪，不是完整的函式庫：它會先跳脫所有內容以確保筆記不會變成可執行的 HTML、不支援 `_underscore_` 強調語法（語料庫中充斥著 `snake_case` 識別碼），並將 `<!-- verified: DATE -->` 轉成時效性徽章，不直接丟掉。
 - `test-web.sh` 在執行前會重新啟動服務，使記憶體中的登入速率限制計數器歸零；速率限制測試排在最後，因為它會耗盡該時間視窗的額度。
